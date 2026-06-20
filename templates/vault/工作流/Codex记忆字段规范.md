@@ -1,0 +1,64 @@
+---
+memory_type: workflow
+track: workflow
+project_id: codex-memory-fields
+app_id: {{APP_ID}}
+user_id: {{USER_ID}}
+agent_id: {{AGENT_ID}}
+session_id: ""
+status: active
+sensitivity: normal
+verified_at: 2026-06-20
+keywords:
+  - fields
+  - orthogonal
+---
+
+# Codex 记忆字段规范
+
+## 当前有效摘要
+
+每份正式记忆尽量带 frontmatter。字段不是为了人类好看，而是为了让 Agent 可以稳定过滤和检索。
+
+## 推荐字段
+
+```yaml
+---
+memory_type: project
+track: project
+project_id: example-project
+app_id: codex
+user_id: demo-user
+agent_id: codex
+session_id: ""
+status: active
+sensitivity: normal
+verified_at: 2026-06-20
+keywords:
+  - example
+---
+```
+
+## 字段解释
+
+- `memory_type`：这是什么记忆，例如 `project`、`workflow`、`decision`、`user_profile`、`agent_case`。
+- `track`：属于哪条大轨道，例如 `project`、`workflow`、`user`、`agent`、`decision`。
+- `project_id`：项目或主题标识。
+- `app_id`：记忆来自哪个应用或工作区。
+- `user_id`：用户标识，公开模板用假名。
+- `agent_id`：Agent 标识。
+- `session_id`：可选，会话标识。
+- `status`：`active`、`deprecated`、`candidate`、`archived`。
+- `sensitivity`：`normal`、`private`、`public-template` 等。
+- `verified_at`：最近一次确认日期。
+- `keywords`：搜索关键词。
+
+## 正交过滤
+
+这些字段互相独立，可以组合使用。例如：
+
+```bash
+python3 scripts/codex_memory_index.py --search "部署" --track project --project-id example-app
+```
+
+这会比只全文搜索更省上下文，也更少误召回。

@@ -1,0 +1,19 @@
+# Example config. The current scripts use environment variables by default.
+# You can keep this file as human-readable documentation for your setup.
+
+memory_root = "/path/to/your/Obsidian/Codex记忆"
+state_db = "~/.config/codex-memory/state.sqlite"
+
+user_id = "demo-user"
+agent_id = "codex"
+app_id = "codex"
+
+[closeout]
+ordinary_memory_candidate_pool = false
+ask_before_skill_promotion = true
+run_sqlite_index_after_closeout = true
+
+[privacy]
+commit_real_vault = false
+commit_state_db = false
+commit_env_file = false
