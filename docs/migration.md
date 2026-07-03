@@ -32,6 +32,7 @@ python3 scripts/bootstrap.py --memory-root "$HOME/codex-memory-vault" --write-en
 - 收尾流程
 - 搜索规则
 - 检查脚本
+- closeout/audit 自动化机制
 
 不要迁移：
 
@@ -47,6 +48,7 @@ python3 scripts/bootstrap.py --memory-root "$HOME/codex-memory-vault" --write-en
 source .env
 python3 scripts/codex_agent_evolution.py --init --scan --report
 python3 scripts/codex_memory_index.py --init --scan --report
+python3 scripts/codex_memory_closeout.py --dry-run
 python3 scripts/codex_memory_check.py
 ```
 

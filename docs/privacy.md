@@ -6,6 +6,8 @@
 
 - `.env`
 - SQLite 数据库：`*.sqlite`、`*.db`
+- audit 裁决库：`audit_decisions.sqlite`
+- closeout/audit 运行日志：`logs/*.jsonl`
 - API key、token、cookie、密码
 - Hugging Face token、模型缓存
 - Zvec / LanceDB / Qdrant 等派生向量库
@@ -21,11 +23,12 @@
 - `.env.example` 只放变量名和占位符。
 - 文档里的路径使用 `/path/to/...` 或 `$HOME/...`。
 - 示例项目统一使用 `example-app`、`demo-user` 这类假名。
+- closeout/audit 只能公开脚本，不能公开本地运行产物。
 
 ## 本地检查命令
 
 ```bash
-find . -name "*.sqlite" -o -name "*.db" -o -name ".env" -o -name "*.key" -o -name "*.pem" -o -name "zvec"
+find . -name "*.sqlite" -o -name "*.db" -o -name ".env" -o -name "*.key" -o -name "*.pem" -o -name "zvec" -o -path "*/logs/*.jsonl"
 python3 scripts/codex_memory_check.py
 ```
 

@@ -23,6 +23,7 @@ keywords:
 - 用户画像：`用户记忆/长期画像.md`
 - 字段规范：`工作流/Codex记忆字段规范.md`
 - 收尾规则：`工作流/Codex记忆收尾决策规则.md`
+- 本地脚本：`工作流/Codex记忆本地脚本.md`
 - SQLite 索引：`工作流/Codex记忆SQLite全库索引设计.md`
 - 语义检索：`工作流/Codex记忆语义检索设计.md`
 - Agent 记忆：`agent/README.md`
@@ -37,11 +38,11 @@ keywords:
 
 ## 搜索建议
 
-优先用 SQLite 搜索，再读命中的少量 Markdown：
+优先用统一搜索入口，再读命中的少量 Markdown：
 
 ```bash
-python3 scripts/codex_memory_index.py --search "关键词" --limit 5
-python3 scripts/codex_memory_index.py --search "关键词" --track project
-python3 scripts/codex_memory_index.py --search "关键词" --has-open-loop
-python3 scripts/codex_memory_zvec_index.py --search "只记得大概意思的问题" --limit 5
+python3 scripts/codex_memory_search.py "关键词" --limit 5
+python3 scripts/codex_memory_search.py "关键词" --track project
+python3 scripts/codex_memory_search.py "关键词" --has-open-loop
+python3 scripts/codex_memory_search.py "只记得大概意思的问题" --limit 5
 ```

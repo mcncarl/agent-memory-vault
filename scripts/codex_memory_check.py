@@ -53,6 +53,10 @@ REQUIRED_LOCAL_FILES = [
     SCRIPT_ROOT / "codex_memory_check.py",
     SCRIPT_ROOT / "codex_agent_evolution.py",
     SCRIPT_ROOT / "codex_memory_index.py",
+    SCRIPT_ROOT / "codex_memory_search.py",
+    SCRIPT_ROOT / "codex_memory_closeout.py",
+    SCRIPT_ROOT / "codex_memory_audit.py",
+    SCRIPT_ROOT / "codex_memory_audit_autorun.py",
     SCRIPT_ROOT / "codex_memory_zvec_index.py",
     SCRIPT_ROOT / "codex_memory_retrieval_benchmark.py",
 ]

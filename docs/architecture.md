@@ -17,7 +17,10 @@ SQLite 只负责索引，不负责成为唯一事实源。
 
 - Markdown：保存正式记忆。
 - SQLite：保存文件索引、搜索字段、未闭环事项和 Agent case 状态。
-- 脚本：负责扫描、检查、搜索和生成状态报告。
+- Git：保存修改记录，支持 scoped commit 和回滚。
+- 统一搜索脚本：合并关键词搜索、字段过滤、可选语义召回和手动 rg。
+- closeout 脚本：在任务结束时自动检查、对账、刷新索引、写日志，并可选择提交本轮记忆文件。
+- audit 脚本：定期发现过期、重复、open-loop 噪声和已过时状态，裁决结果存在本地 SQLite 中。
 
 可选语义检索层是：
 
@@ -71,11 +74,26 @@ status: active
 
 查询建议：
 
-1. 关键词、项目名、路径、字段明确时，先用 SQLite。
-2. 表达模糊或 SQLite 召回不足时，再用 Zvec。
-3. Zvec 命中的 chunk 只作为候选，最终仍然回读 Markdown 原文。
+1. 默认使用 `codex_memory_search.py`。
+2. 关键词、项目名、路径、字段明确时，SQLite/FTS 会给出稳定结果。
+3. 表达模糊时，可以启用 Zvec 做语义候选召回。
+4. Zvec 命中的 chunk 只作为候选，最终仍然回读 Markdown 原文。
 
-## 6. Self evolution
+## 6. Closeout and audit loop
+
+closeout 是每次任务结束后的自动整理员。它不替 Agent 判断“什么值得记”，但会把收尾动作压成稳定流程：
+
+- 自动发现记忆库变更文件。
+- 检查是否有敏感内容、结构问题或膨胀文件。
+- 对新文件做写入后查重，发现重复时输出 `MERGE_REQUIRED`。
+- 刷新 SQLite 和可选 Zvec。
+- 必要时刷新 Agent evolution。
+- 检查 audit 是否超过间隔，超过则捎带运行。
+- 记录 closeout 日志，并在允许时只提交本轮记忆文件。
+
+audit 是定期体检。它只产出 findings 和裁决记录，不直接改写 Markdown 事实层。这样可以自动发现问题，又保留人工审计边界。
+
+## 7. Self evolution
 
 普通记忆不设候选池，直接进入正式目录。
 

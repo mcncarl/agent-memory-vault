@@ -35,6 +35,12 @@ templates/vault/
 scripts/
   bootstrap.py           # 从模板创建本地私有 vault
   codex_memory_index.py  # 全库 SQLite 索引和搜索
+  codex_memory_search.py # 统一搜索入口：SQLite + 可选 Zvec + 手动 rg
+  codex_memory_closeout.py
+                          # 任务结束收尾：检查、对账、刷新索引、审计、可选提交
+  codex_memory_audit.py  # 定期体检：过期、重复、open-loop、裁决记录
+  codex_memory_audit_autorun.py
+                          # audit 自动触发器：超过间隔才运行
   codex_memory_zvec_index.py
   codex_memory_retrieval_benchmark.py
   codex_agent_evolution.py
@@ -44,7 +50,7 @@ scripts/
 ## 快速开始
 
 ```bash
-git clone https://github.com/your-name/codex-memory.git
+git clone https://github.com/mcncarl/codex-memory.git
 cd codex-memory
 cp .env.example .env
 ```
@@ -62,10 +68,32 @@ python3 scripts/codex_memory_check.py
 搜索示例：
 
 ```bash
-python3 scripts/codex_memory_index.py --search "项目 收尾" --limit 5
-python3 scripts/codex_memory_index.py --search "偏好" --track user
-python3 scripts/codex_memory_index.py --search "复用流程" --memory-type workflow
+python3 scripts/codex_memory_search.py "项目 收尾" --limit 5
+python3 scripts/codex_memory_search.py "偏好" --track user
+python3 scripts/codex_memory_search.py "复用流程" --memory-type workflow
 ```
+
+任务结束时建议使用统一收尾脚本。它会自动发现记忆库里的变更文件，执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新，并在 audit 超过间隔时顺手跑一次体检。
+
+```bash
+python3 scripts/codex_memory_closeout.py --dry-run
+python3 scripts/codex_memory_closeout.py --commit
+```
+
+写入正式记忆前，可以先让脚本做一次对账，判断应该新建、更新旧文件、跳过、还是需要人工合并：
+
+```bash
+python3 scripts/codex_memory_closeout.py --prewrite "准备写入的记忆摘要"
+```
+
+audit 可以手动运行，也可以由 closeout 捎带触发：
+
+```bash
+python3 scripts/codex_memory_audit.py
+python3 scripts/codex_memory_audit_autorun.py --reason manual --json
+```
+
+可选的 Stop hook 提醒和 macOS `launchd` 周期兜底见 [docs/automation.md](docs/automation.md)。
 
 ## 可选：语义检索
 
@@ -101,7 +129,8 @@ python3 scripts/codex_memory_index.py --init --scan --report
 3. Agent 自我进化单独放在 `agent/`，其中 case 和 skill 候选用于复用经验沉淀。
 4. 用正交字段过滤记忆：`user_id`、`agent_id`、`app_id`、`project_id`、`session_id`、`track`、`memory_type`、`status`。
 5. 语义检索只作为候选召回层，最终答案必须回读 Markdown 原文。
-6. API key、模型缓存、SQLite 和向量库只放本地，永远不写进 Markdown 记忆和公开仓库。
+6. closeout 负责“任务结束后的自动整理”，audit 负责“定期发现要复核、合并或忽略的记忆”，但二者都不自动改写事实层。
+7. API key、模型缓存、SQLite、audit 裁决库和向量库只放本地，永远不写进 Markdown 记忆和公开仓库。
 
 ## 致谢
 

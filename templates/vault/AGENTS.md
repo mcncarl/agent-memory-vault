@@ -10,15 +10,57 @@
 
 不要默认读取整个记忆库。
 
+## 检索规则
+
+优先使用统一搜索脚本，而不是手工猜该读哪个文件：
+
+```bash
+python3 scripts/codex_memory_search.py "查询词" --limit 5
+```
+
+它会先查 SQLite/FTS；启用语义索引时，也可以并行查 Zvec。Zvec 命中只能当作候选线索，最终回答前必须回读 Markdown 原文。
+
 ## 写入规则
+
+正式写入前先做对账，避免重复记忆越写越多：
+
+```bash
+python3 scripts/codex_memory_closeout.py --prewrite "准备写入的记忆摘要"
+```
+
+对账动作只允许这 6 种：
+
+- `ADD`：新建记忆。
+- `UPDATE`：更新已有记忆。
+- `NOOP`：不写。
+- `MARK_OUTDATED`：旧信息过时，但不删除。
+- `MERGE_REQUIRED`：疑似重复或冲突，需要人工合并。
+- `ASK_USER`：涉及敏感、删除、费用、账号、凭证或不确定判断时先问用户。
 
 重要任务结束前执行 memory closeout：
 
-1. 判断是否有稳定事实需要写入。
-2. 普通记忆直接写入正式目录：`用户记忆/`、`项目/`、`工作流/`、`决策/`。
-3. Agent 复用经验写入 `agent/cases/` 或 `agent/case-candidates/`。
-4. 多次复用、可抽象成流程的经验，写入 `agent/skill-candidates/`，正式升级 skill 前需要用户确认。
-5. 写完后运行 SQLite 索引和检查脚本。
+```bash
+python3 scripts/codex_memory_closeout.py --dry-run
+python3 scripts/codex_memory_closeout.py --commit
+```
+
+closeout 会自动发现记忆库变更文件，执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新、audit 捎带触发、closeout 日志写入，并只提交本轮处理过的记忆文件。
+
+如果 closeout 输出 `MERGE_REQUIRED`、`ASK_USER`、删除文件状态、疑似历史脏变更，先停下让用户确认。
+
+普通记忆直接写入正式目录：`用户记忆/`、`项目/`、`工作流/`、`决策/`。Agent 复用经验写入 `agent/cases/` 或 `agent/case-candidates/`。多次复用、可抽象成流程的经验，写入 `agent/skill-candidates/`，正式升级 skill 前需要用户确认。
+
+## Audit 规则
+
+audit 用来发现需要复核、合并或忽略的记忆，不直接改写 Markdown 事实层。
+
+```bash
+python3 scripts/codex_memory_audit.py
+python3 scripts/codex_memory_audit.py --ignore FINDING_ID --note "保留原因"
+python3 scripts/codex_memory_audit_autorun.py --reason closeout --min-interval-days 7
+```
+
+推荐让 closeout 每 7 天捎带检查一次 audit 是否该运行。audit findings 应该由用户或 Agent 明确裁决，避免报告本身变成新的 open-loop 噪声。
 
 ## 字段要求
 
