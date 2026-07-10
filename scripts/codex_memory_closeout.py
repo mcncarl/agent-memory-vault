@@ -427,11 +427,21 @@ def semantic_distance(row: dict[str, Any]) -> float | None:
         return None
 
 
+def raw_semantic_distance(row: dict[str, Any]) -> float | None:
+    details = row.get("source_details")
+    if not isinstance(details, dict):
+        return None
+    try:
+        return float(details.get("zvec_raw_distance"))
+    except (TypeError, ValueError):
+        return None
+
+
 def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
     if any(pattern.search(text) for pattern in ASK_USER_PATTERNS):
-        return "ASK_USER", None, {"similarity": 0.0, "coverage": 0.0, "semantic_distance": None}
+        return "ASK_USER", None, {"similarity": 0.0, "coverage": 0.0, "semantic_distance": None, "raw_semantic_distance": None}
     if not rows:
-        return "ADD", None, {"similarity": 0.0, "coverage": 0.0, "semantic_distance": None}
+        return "ADD", None, {"similarity": 0.0, "coverage": 0.0, "semantic_distance": None, "raw_semantic_distance": None}
     candidates: list[tuple[int, float, float, float, str, dict[str, Any]]] = []
     action_priority = {"NOOP": 4, "UPDATE": 3, "MERGE_REQUIRED": 2, "ADD": 1}
     for row in rows:
@@ -454,7 +464,8 @@ def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str,
         candidates.append((action_priority[action], semantic_quality, row_coverage, similarity, action, row))
     _, _, best_coverage, best_similarity, action, best_row = max(candidates, key=lambda item: item[:4])
     distance = semantic_distance(best_row)
-    return action, best_row, {"similarity": best_similarity, "coverage": best_coverage, "semantic_distance": distance}
+    raw_distance = raw_semantic_distance(best_row)
+    return action, best_row, {"similarity": best_similarity, "coverage": best_coverage, "semantic_distance": distance, "raw_semantic_distance": raw_distance}
 
 
 def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
@@ -470,6 +481,7 @@ def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
             "similarity": round(metrics["similarity"], 4),
             "coverage": round(metrics["coverage"], 4),
             "semantic_distance": round(metrics["semantic_distance"], 4) if metrics["semantic_distance"] is not None else None,
+            "raw_semantic_distance": round(metrics["raw_semantic_distance"], 4) if metrics["raw_semantic_distance"] is not None else None,
         },
         "allowed_actions": sorted(RECONCILE_ACTIONS),
         "candidates": rows,
@@ -500,6 +512,7 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
             similarity = jaccard(source_text, comparison)
             row_coverage = coverage(source_text, comparison)
             distance = semantic_distance(row)
+            raw_distance = raw_semantic_distance(row)
             if similarity >= args.merge_threshold or row_coverage >= args.merge_coverage_threshold or (
                 distance is not None and distance <= args.semantic_merge_threshold
             ):
@@ -510,6 +523,7 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
                         "similarity": round(similarity, 4),
                         "coverage": round(row_coverage, 4),
                         "semantic_distance": round(distance, 4) if distance is not None else None,
+                        "raw_semantic_distance": round(raw_distance, 4) if raw_distance is not None else None,
                         "sources": row.get("sources", []),
                         "path": row.get("path", ""),
                     }

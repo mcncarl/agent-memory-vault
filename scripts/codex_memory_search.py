@@ -256,6 +256,7 @@ def zvec_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]
                 continue
             try:
                 vector_score = float(row.get("vector_score", row.get("score", 0)))
+                reconcile_score = float(row.get("score", vector_score))
             except (TypeError, ValueError):
                 continue
             if vector_score > args.zvec_max_distance:
@@ -275,7 +276,7 @@ def zvec_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]
                 + coverage(args.query, " ".join(str(row.get(key) or "") for key in ("title", "rel_path", "summary")))
                 * 2.0,
                 sources={"zvec"},
-                source_details={"zvec_rank": rank, "zvec_score": vector_score},
+                source_details={"zvec_rank": rank, "zvec_score": reconcile_score, "zvec_raw_distance": vector_score},
             )
             results.append(enrich_from_db(result, conn))
     return results, []
