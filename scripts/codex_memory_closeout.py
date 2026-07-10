@@ -243,6 +243,71 @@ def git_status_entries() -> tuple[list[GitEntry], list[str]]:
     return entries, []
 
 
+def current_git_head() -> tuple[str, list[str]]:
+    result = run_command(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], timeout=30)
+    if not result["ok"]:
+        return "", [f"git rev-parse failed: {str(result['stderr']).strip()}"]
+    return str(result["stdout"]).strip(), []
+
+
+def last_observed_git_head() -> str:
+    if not LOG_PATH.exists():
+        return ""
+    try:
+        lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if item.get("status") != "ok":
+            continue
+        for key in ("git_observed_through", "git_head_after", "commit"):
+            value = str(item.get(key, ""))
+            if value and value != "skipped" and re.fullmatch(r"[0-9a-fA-F]{7,40}", value):
+                return value
+    return ""
+
+
+def git_history_entries(baseline: str, head: str) -> tuple[list[GitEntry], list[str]]:
+    if not baseline or not head or baseline == head:
+        return [], []
+    ancestor = run_command(["git", "-C", str(REPO_ROOT), "merge-base", "--is-ancestor", baseline, head], timeout=30)
+    if ancestor["returncode"] != 0:
+        return [], [f"closeout git baseline is not an ancestor of HEAD: baseline={baseline[:12]} head={head[:12]}"]
+    try:
+        target = str(VAULT_ROOT.relative_to(REPO_ROOT))
+    except ValueError:
+        target = str(VAULT_ROOT)
+    result = run_command(
+        ["git", "-C", str(REPO_ROOT), "-c", "core.quotepath=false", "diff", "--name-status", "-z", f"{baseline}..{head}", "--", target],
+        timeout=60,
+    )
+    if not result["ok"]:
+        return [], [f"git history diff failed: {str(result['stderr']).strip()}"]
+    items = [item for item in str(result["stdout"]).split("\0") if item]
+    entries: list[GitEntry] = []
+    index = 0
+    while index < len(items):
+        status = items[index]
+        index += 1
+        if index >= len(items):
+            break
+        if status.startswith(("R", "C")):
+            if index + 1 >= len(items):
+                break
+            index += 1
+            repo_path = items[index]
+            index += 1
+        else:
+            repo_path = items[index]
+            index += 1
+        entries.append(GitEntry(status=status, repo_path=repo_path, path=(REPO_ROOT / repo_path).resolve()))
+    return entries, []
+
+
 def explicit_entries(paths: list[str]) -> tuple[list[GitEntry], list[str]]:
     entries: list[GitEntry] = []
     warnings: list[str] = []
@@ -610,10 +675,19 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
     info: list[str] = []
     git_entries, git_warnings = git_status_entries()
     warnings.extend(git_warnings)
+    git_head_before, head_warnings = current_git_head()
+    warnings.extend(head_warnings)
+    previous_observed_head = last_observed_git_head()
+    history_entries, history_warnings = git_history_entries(previous_observed_head, git_head_before)
+    warnings.extend(history_warnings)
+    if history_entries:
+        info.append(f"recovered {len(history_entries)} memory file changes from Git history after an external/automatic commit")
     explicit, explicit_warnings = explicit_entries(args.changed_file)
     warnings.extend(explicit_warnings)
 
-    by_path: dict[Path, GitEntry] = {entry.path: entry for entry in git_entries}
+    by_path: dict[Path, GitEntry] = {entry.path: entry for entry in history_entries}
+    for entry in git_entries:
+        by_path[entry.path] = entry
     for entry in explicit:
         by_path[entry.path] = entry
     all_entries = list(by_path.values())
@@ -631,7 +705,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.dry_run:
         warnings.append("dry_run: no index refresh, zvec refresh, or commit will be written")
-    if all_entries:
+    if git_entries:
         info.append(
             "git reports dirty Codex memory files; if some are historical, review dry-run output before committing"
         )
@@ -683,10 +757,28 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         if not commit_step.get("ok"):
             status = "error"
 
+    git_head_after, after_warnings = current_git_head()
+    warnings.extend(after_warnings)
+    dirty_paths = {entry.path for entry in git_entries}
+    can_advance_baseline = (
+        not step_failed and not blocking_reconcile and not deleted_entries and bool(git_head_before)
+        and (not dirty_paths or bool(commit_step.get("commit")) or commit_step.get("detail") == "nothing_staged")
+    )
+    would_observe_through = (
+        str(commit_step.get("commit")) if can_advance_baseline and commit_step.get("commit")
+        else (git_head_before if can_advance_baseline else previous_observed_head)
+    )
+    git_observed_through = previous_observed_head if args.dry_run else would_observe_through
+
     payload = {
         "time": utc_now(),
         "cwd": str(Path.cwd()),
         "mode": "closeout",
+        "git_previous_observed_head": previous_observed_head,
+        "git_head_before": git_head_before,
+        "git_head_after": git_head_after,
+        "git_observed_through": git_observed_through,
+        "git_would_observe_through": would_observe_through,
         "changed_files": [entry.repo_path for entry in all_entries],
         "processed_files": [relative_to_vault(path) for path in process_files],
         "deleted_files_skipped": [entry.repo_path for entry in deleted_entries],

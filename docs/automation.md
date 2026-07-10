@@ -27,6 +27,8 @@ python3 scripts/codex_memory_audit_autorun.py \
 
 If the last successful audit is recent, autorun exits with `skipped_recent`.
 
+If another tool auto-commits the vault before closeout runs, closeout compares the last successful `git_observed_through` value with current `HEAD` and processes those committed file changes as well. This lets Obsidian Git keep its backup schedule without stealing the memory pipeline's indexing baseline.
+
 ## Stop Hook Reminder
 
 Codex Stop is turn-scoped, so the hook must stay quiet and idempotent:

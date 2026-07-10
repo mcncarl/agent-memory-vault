@@ -77,7 +77,7 @@ python3 scripts/codex_memory_search.py "偏好" --track user
 python3 scripts/codex_memory_search.py "复用流程" --memory-type workflow
 ```
 
-任务结束时建议使用统一收尾脚本。它会自动发现记忆库里的变更文件，执行结构检查、字面与语义双重对账、SQLite 刷新、可选 Zvec 补漏/清理、Agent evolution 刷新，并在 audit 超过间隔时顺手跑一次体检。并发 closeout 会被文件锁拦住，避免数据库和 Git 基线互相踩踏。
+任务结束时建议使用统一收尾脚本。它会自动发现未提交变更，也会追踪“上次成功 closeout 观察到的提交”之后的 Git 历史，因此 Obsidian Git 等工具提前自动提交也不会造成漏处理。随后执行结构检查、字面与语义双重对账、SQLite 刷新、可选 Zvec 补漏/清理、Agent evolution 刷新，并在 audit 超过间隔时顺手跑一次体检。并发 closeout 会被文件锁拦住，避免数据库和 Git 基线互相踩踏。
 
 ```bash
 python3 scripts/codex_memory_closeout.py --dry-run
