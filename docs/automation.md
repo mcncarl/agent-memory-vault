@@ -3,7 +3,7 @@
 Codex Memory can run without background automation. The recommended automated setup is layered:
 
 1. `closeout` piggyback: every important task-end closeout checks whether audit is due.
-2. Optional Stop hook reminder: the Agent runtime only reminds when memory files changed or audit is overdue.
+2. Optional Stop hook: only reminds when memory files changed and the index is stale; it also lets the seven-day gate run audit when due.
 3. Optional macOS `launchd` fallback: runs audit weekly even if no Agent session happens.
 
 Automation should only produce reminders, reports, logs, and local audit decisions. It should not directly rewrite Markdown facts.
@@ -29,10 +29,10 @@ If the last successful audit is recent, autorun exits with `skipped_recent`.
 
 ## Stop Hook Reminder
 
-Use a Stop hook only as a reminder. Keep it quiet:
+Codex Stop is turn-scoped, so the hook must stay quiet and idempotent:
 
 - Remind only when Markdown files under the memory vault changed and the SQLite index is older than those files.
-- Remind only when audit has not run in the configured interval.
+- Call `codex_memory_audit_autorun.py`; its interval gate decides whether a real audit is due.
 - Stamp each session or day so the same reminder is not repeated constantly.
 - Do not write memories, run commits, or edit Markdown from the hook.
 
@@ -46,10 +46,37 @@ on Stop:
       if this session was not reminded:
         notify: run codex_memory_closeout.py --dry-run
 
-  if audit has not succeeded in the last 7 days:
-    if today was not reminded:
-      notify: closeout will run audit, or run audit_autorun manually
+  run audit_autorun with a 7-day interval gate
 ```
+
+Codex reads `~/.codex/hooks.json`. Enable hooks in `~/.codex/config.toml`:
+
+```toml
+[features]
+hooks = true
+```
+
+Example `Stop` entry (merge it with existing hooks instead of overwriting unrelated entries):
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/zsh -lc 'set -a; source /path/to/codex-memory/.env; set +a; exec python3 /path/to/codex-memory/scripts/codex_memory_stop_hook.py'",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The command sources the private `.env` so the hook sees the real vault and state database. It inherits stdin, so `codex_memory_stop_hook.py` can read the event JSON. After changing a hook command, review the updated hook in Codex if the client asks you to trust the new hash.
 
 ## macOS launchd Fallback
 
@@ -72,10 +99,19 @@ Create `~/Library/LaunchAgents/com.example.codex-memory-audit.plist`:
     <string>/path/to/codex-memory/scripts/codex_memory_audit_autorun.py</string>
     <string>--reason</string>
     <string>launchd</string>
-    <string>--force</string>
     <string>--notify</string>
     <string>--json</string>
   </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CODEX_MEMORY_ROOT</key>
+    <string>/path/to/private-memory-vault</string>
+    <key>CODEX_MEMORY_CONFIG_ROOT</key>
+    <string>/path/to/codex-memory-config</string>
+    <key>CODEX_MEMORY_STATE_DB</key>
+    <string>/path/to/codex-memory-config/state.sqlite</string>
+  </dict>
 
   <key>StartCalendarInterval</key>
   <dict>
@@ -124,6 +160,9 @@ Typical findings mean:
 
 - `stale_verified_at`: the memory may need review because its verification date is old.
 - `missing_verified_at`: the memory lacks an explicit verification date.
-- `open_loop_count`: one file has too many unresolved hints or risks.
+- `open_loop_count`: one file has too many true unresolved items; `next_hint` is navigation and is not mixed into this count.
+- `risk_count`: one file has several risks that may need validity review.
+- `weak_verification_coverage`: many files only have mtime fallback instead of explicit review evidence.
+- `large_memory_file`: current facts and historical change logs may need to be split.
 - `duplicate_title`: two or more files may overlap.
 - `outdated_status`: a file is intentionally old and should not be treated as current truth.

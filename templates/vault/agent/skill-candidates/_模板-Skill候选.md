@@ -16,6 +16,7 @@ evidence_count: 2
 risk_flags: []
 last_seen: 2026-06-20
 verified_at: 2026-06-20
+review_after_days: 30
 keywords:
   - skill
   - candidate

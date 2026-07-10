@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import re
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +32,7 @@ STATE_DB = Path(
 LOG_PATH = Path(
     os.path.expandvars(os.environ.get("CODEX_MEMORY_CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))
 ).expanduser().resolve()
+LOCK_PATH = CONFIG_ROOT / "locks" / "closeout.lock"
 
 
 def find_default_git_root() -> Path:
@@ -62,10 +66,12 @@ RECONCILE_ACTIONS = {
     "ASK_USER",
 }
 ASK_USER_PATTERNS = [
-    re.compile(r"(?i)(api[_-]?key|token|secret|password|cookie|credential)"),
     re.compile(r"(?i)sk-[A-Za-z0-9][A-Za-z0-9_-]{16,}"),
-    re.compile(r"(操控|操作|打开|登录|读取|导出|发送|回复|群发).{0,12}微信|微信.{0,12}(操控|操作|打开|登录|读取|导出|发送|回复|群发)"),
-    re.compile(r"(删除|删掉|移到废纸篓|移入废纸篓|永久删除|清空).{0,12}(文件|目录|记忆|仓库|vault)|rm\s+-rf|unlink"),
+    re.compile(r"(?i)gh[pousr]_[A-Za-z0-9]{30,}"),
+    re.compile(
+        r"(?im)^\s*(?:api[_-]?key|access[_-]?token|secret|password|cookie|credential)\s*[:=]\s*"
+        r"[\"']?(?!redacted\b|example\b|placeholder\b|your[_-]|<)[A-Za-z0-9_./+=-]{20,}"
+    ),
 ]
 
 
@@ -126,6 +132,7 @@ def run_command(
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     started_at = utc_now()
+    started = time.monotonic()
     try:
         completed = subprocess.run(
             command,
@@ -142,6 +149,7 @@ def run_command(
             "stderr": completed.stderr,
             "started_at": started_at,
             "finished_at": utc_now(),
+            "duration_ms": round((time.monotonic() - started) * 1000),
             "ok": completed.returncode == 0,
         }
     except subprocess.TimeoutExpired as exc:
@@ -152,6 +160,7 @@ def run_command(
             "stderr": f"timeout after {timeout}s",
             "started_at": started_at,
             "finished_at": utc_now(),
+            "duration_ms": round((time.monotonic() - started) * 1000),
             "ok": False,
         }
     except OSError as exc:
@@ -162,8 +171,28 @@ def run_command(
             "stderr": str(exc),
             "started_at": started_at,
             "finished_at": utc_now(),
+            "duration_ms": round((time.monotonic() - started) * 1000),
             "ok": False,
         }
+
+
+@contextlib.contextmanager
+def closeout_lock(timeout: float = 15.0):
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as handle:
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"another memory closeout is still running: {LOCK_PATH}")
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def decode_status_line(line: str) -> GitEntry | None:
@@ -323,14 +352,23 @@ def search_memory(query: str, limit: int = 8, no_zvec: bool = True) -> tuple[lis
     return rows, [str(item) for item in warnings]
 
 
-def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None, dict[str, float]]:
+def semantic_distance(row: dict[str, Any]) -> float | None:
+    details = row.get("source_details")
+    if not isinstance(details, dict):
+        return None
+    try:
+        return float(details.get("zvec_score"))
+    except (TypeError, ValueError):
+        return None
+
+
+def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
     if any(pattern.search(text) for pattern in ASK_USER_PATTERNS):
-        return "ASK_USER", None, {"similarity": 0.0, "coverage": 0.0}
+        return "ASK_USER", None, {"similarity": 0.0, "coverage": 0.0, "semantic_distance": None}
     if not rows:
-        return "ADD", None, {"similarity": 0.0, "coverage": 0.0}
-    best_similarity = 0.0
-    best_coverage = 0.0
-    best_row: dict[str, Any] | None = None
+        return "ADD", None, {"similarity": 0.0, "coverage": 0.0, "semantic_distance": None}
+    candidates: list[tuple[int, float, float, float, str, dict[str, Any]]] = []
+    action_priority = {"NOOP": 4, "UPDATE": 3, "MERGE_REQUIRED": 2, "ADD": 1}
     for row in rows:
         comparison = " ".join(
             str(row.get(key, ""))
@@ -338,15 +376,20 @@ def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str,
         )
         similarity = jaccard(text, comparison)
         row_coverage = coverage(text, comparison)
-        if (row_coverage, similarity) > (best_coverage, best_similarity):
-            best_similarity = similarity
-            best_coverage = row_coverage
-            best_row = row
-    if best_similarity >= 0.45 or best_coverage >= 0.55:
-        return "UPDATE", best_row, {"similarity": best_similarity, "coverage": best_coverage}
-    if best_similarity >= 0.28 or best_coverage >= 0.35:
-        return "MERGE_REQUIRED", best_row, {"similarity": best_similarity, "coverage": best_coverage}
-    return "ADD", best_row, {"similarity": best_similarity, "coverage": best_coverage}
+        distance = semantic_distance(row)
+        if similarity >= 0.80 or row_coverage >= 0.90:
+            action = "NOOP"
+        elif similarity >= 0.45 or row_coverage >= 0.55 or (distance is not None and distance <= 0.32):
+            action = "UPDATE"
+        elif similarity >= 0.28 or row_coverage >= 0.35 or (distance is not None and distance <= 0.55):
+            action = "MERGE_REQUIRED"
+        else:
+            action = "ADD"
+        semantic_quality = 1.0 - distance if distance is not None else -1.0
+        candidates.append((action_priority[action], semantic_quality, row_coverage, similarity, action, row))
+    _, _, best_coverage, best_similarity, action, best_row = max(candidates, key=lambda item: item[:4])
+    distance = semantic_distance(best_row)
+    return action, best_row, {"similarity": best_similarity, "coverage": best_coverage, "semantic_distance": distance}
 
 
 def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
@@ -361,6 +404,7 @@ def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
         "recommendation_metrics": {
             "similarity": round(metrics["similarity"], 4),
             "coverage": round(metrics["coverage"], 4),
+            "semantic_distance": round(metrics["semantic_distance"], 4) if metrics["semantic_distance"] is not None else None,
         },
         "allowed_actions": sorted(RECONCILE_ACTIONS),
         "candidates": rows,
@@ -389,12 +433,18 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
                 for key in ("title", "rel_path", "summary", "hit")
             )
             similarity = jaccard(source_text, comparison)
-            if similarity >= args.merge_threshold:
+            row_coverage = coverage(source_text, comparison)
+            distance = semantic_distance(row)
+            if similarity >= args.merge_threshold or row_coverage >= args.merge_coverage_threshold or (
+                distance is not None and distance <= args.semantic_merge_threshold
+            ):
                 candidates.append(
                     {
                         "rel_path": row.get("rel_path", ""),
                         "title": row.get("title", ""),
                         "similarity": round(similarity, 4),
+                        "coverage": round(row_coverage, 4),
+                        "semantic_distance": round(distance, 4) if distance is not None else None,
                         "sources": row.get("sources", []),
                         "path": row.get("path", ""),
                     }
@@ -413,12 +463,19 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
 
 
 def run_check(files: list[Path], args: argparse.Namespace) -> dict[str, Any]:
-    command = [PYTHON, str(CHECK_SCRIPT)]
+    command = [PYTHON, str(CHECK_SCRIPT), "--json"]
     for path in files:
         command.extend(["--changed-file", str(path)])
-    if args.dry_run:
-        return {"ok": True, "skipped": False, "detail": "dry_run_check_still_executed", **run_command(command, timeout=180)}
-    return run_command(command, timeout=180)
+    result = run_command(command, timeout=180)
+    try:
+        payload = json.loads(str(result.get("stdout", "")))
+    except json.JSONDecodeError:
+        result["detail"] = "check_returned_non_json"
+        return result
+    result["check_payload"] = payload
+    result["advisories"] = payload.get("advisories", []) if isinstance(payload, dict) else []
+    result["detail"] = str(payload.get("status", "")) if isinstance(payload, dict) else ""
+    return result
 
 
 def run_index(args: argparse.Namespace) -> dict[str, Any]:
@@ -432,7 +489,7 @@ def run_zvec(files: list[Path], args: argparse.Namespace) -> dict[str, Any]:
         return {"ok": True, "skipped": True, "detail": "skip_zvec"}
     if args.dry_run:
         return {"ok": True, "skipped": True, "detail": "dry_run"}
-    command = [ZVEC_PYTHON, str(ZVEC_SCRIPT), "--json"]
+    command = [ZVEC_PYTHON, str(ZVEC_SCRIPT), "--prune", "--json"]
     for path in files:
         command.extend(["--changed-file", str(path)])
     if len(command) == 2:
@@ -542,6 +599,8 @@ def short_step(step: dict[str, Any]) -> dict[str, Any]:
         "skipped": bool(step.get("skipped", False)),
         "returncode": step.get("returncode"),
         "detail": step.get("detail", ""),
+        "duration_ms": step.get("duration_ms"),
+        "advisory_count": len(step.get("advisories", [])) if isinstance(step.get("advisories"), list) else 0,
         "stderr": str(step.get("stderr", "")).strip()[:500],
     }
 
@@ -578,6 +637,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     check_step = run_check(process_files, args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
+    advisories = list(check_step.get("advisories", [])) if isinstance(check_step.get("advisories"), list) else []
     reconcile_findings, reconcile_warnings = postwrite_reconcile(process_entries, args)
     warnings.extend(reconcile_warnings)
     index_step = run_index(args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
@@ -633,6 +693,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         "reconcile_findings": reconcile_findings,
         "info": info,
         "warnings": warnings,
+        "advisories": advisories,
         "steps": {
             "check": short_step(check_step),
             "sqlite": short_step(index_step),
@@ -699,6 +760,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zvec-timeout", type=int, default=240, help="Seconds before Zvec refresh times out.")
     parser.add_argument("--reconcile-all", action="store_true", help="Run postwrite reconcile on all changed files, not only new files.")
     parser.add_argument("--merge-threshold", type=float, default=0.42, help="Similarity threshold for MERGE_REQUIRED.")
+    parser.add_argument("--merge-coverage-threshold", type=float, default=0.35, help="Coverage threshold for MERGE_REQUIRED.")
+    parser.add_argument("--semantic-merge-threshold", type=float, default=0.32, help="Semantic distance threshold for postwrite MERGE_REQUIRED.")
+    parser.add_argument("--lock-timeout", type=float, default=15.0, help="Seconds to wait for another closeout process.")
     parser.add_argument("--skip-audit", action="store_true", help="Skip the weekly audit piggyback check.")
     parser.add_argument("--audit-interval-days", type=int, default=7, help="Run audit from closeout when the last successful audit is older than this.")
     parser.add_argument("--audit-limit", type=int, default=50, help="Maximum audit findings stored by closeout piggyback.")
@@ -718,7 +782,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    payload = run_prewrite(args) if args.prewrite else run_closeout(args)
+    if args.prewrite:
+        payload = run_prewrite(args)
+    else:
+        try:
+            with closeout_lock(args.lock_timeout):
+                payload = run_closeout(args)
+        except TimeoutError as exc:
+            payload = {
+                "time": utc_now(), "mode": "closeout", "status": "error",
+                "warnings": [], "advisories": [], "error": str(exc), "steps": {},
+            }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

@@ -32,8 +32,10 @@ DEFAULT_DEVICE = os.environ.get("CODEX_MEMORY_EMBEDDING_DEVICE", "cpu")
 DEFAULT_LIMIT = 5
 CHUNK_MAX_CHARS = 1400
 CHUNK_OVERLAP_CHARS = 160
-EXCLUDED_MEMORY_TYPES = {"directory_index", "routing", "template"}
-EXCLUDED_STATUS = {"archived", "deleted", "draft"}
+CHUNK_POLICY_VERSION = "2"
+HISTORY_SECTION_PATTERNS = ("已过时", "历史信息", "旧方案", "废弃", "不再使用")
+EXCLUDED_MEMORY_TYPES = {"directory_index", "routing", "template", "agent_case_candidate", "skill_candidate"}
+EXCLUDED_STATUS = {"archived", "deleted", "draft", "obsolete", "outdated", "deprecated", "stale"}
 
 
 @dataclass
@@ -128,8 +130,28 @@ def compact_excerpt(text: str, limit: int = 220) -> str:
     return text[:limit] + ("..." if len(text) > limit else "")
 
 
+def current_fact_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    skipping = False
+    skip_level = 7
+    for raw_line in strip_frontmatter(text).splitlines():
+        heading_match = re.match(r"^(#{1,6})\s+(.+?)\s*$", raw_line)
+        if heading_match:
+            level = len(heading_match.group(1))
+            heading = heading_match.group(2)
+            if skipping and level <= skip_level:
+                skipping = False
+            if any(pattern in heading for pattern in HISTORY_SECTION_PATTERNS):
+                skipping = True
+                skip_level = level
+                continue
+        if not skipping:
+            lines.append(raw_line)
+    return lines
+
+
 def chunk_body(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> list[str]:
-    paragraphs = [line.strip() for line in strip_frontmatter(text).splitlines()]
+    paragraphs = [line.strip() for line in current_fact_lines(text)]
     paragraphs = [line for line in paragraphs if line and not line.startswith("---")]
     chunks: list[str] = []
     current = ""
@@ -222,7 +244,14 @@ def connect(state_db: Path = STATE_DB) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -268,11 +297,13 @@ def init_db(conn: sqlite3.Connection) -> None:
           last_error TEXT DEFAULT '',
           embedding_model TEXT,
           embedding_dim INTEGER,
+          chunk_policy_version TEXT DEFAULT '1',
           updated_at TEXT NOT NULL
         );
         """
     )
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_vector_schema_version", "1"))
+    ensure_column(conn, "memory_vector_index_state", "chunk_policy_version", "TEXT DEFAULT '1'")
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_vector_schema_version", "2"))
     conn.commit()
 
 
@@ -550,9 +581,9 @@ def mark_state(
         """
         INSERT INTO memory_vector_index_state (
           path, rel_path, doc_sha256, status, chunk_count, last_error,
-          embedding_model, embedding_dim, updated_at
+          embedding_model, embedding_dim, chunk_policy_version, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
           rel_path=excluded.rel_path,
           doc_sha256=excluded.doc_sha256,
@@ -561,9 +592,10 @@ def mark_state(
           last_error=excluded.last_error,
           embedding_model=excluded.embedding_model,
           embedding_dim=excluded.embedding_dim,
+          chunk_policy_version=excluded.chunk_policy_version,
           updated_at=excluded.updated_at
         """,
-        (str(doc.path), doc.rel_path, doc.sha256, status, chunk_count, error[:800], model, dim, utc_now()),
+        (str(doc.path), doc.rel_path, doc.sha256, status, chunk_count, error[:800], model, dim, CHUNK_POLICY_VERSION, utc_now()),
     )
 
 
@@ -614,7 +646,7 @@ def refresh_doc(
     force: bool = False,
 ) -> tuple[str, int, str]:
     current = conn.execute(
-        "SELECT doc_sha256, status, embedding_model, embedding_dim FROM memory_vector_index_state WHERE path=?",
+        "SELECT doc_sha256, status, embedding_model, embedding_dim, chunk_policy_version FROM memory_vector_index_state WHERE path=?",
         (str(doc.path),),
     ).fetchone()
     if (
@@ -624,6 +656,7 @@ def refresh_doc(
         and current["status"] == "indexed"
         and current["embedding_model"] == model
         and int(current["embedding_dim"] or 0) == dim
+        and str(current["chunk_policy_version"] or "1") == CHUNK_POLICY_VERSION
     ):
         return ("unchanged", 0, "")
 
@@ -727,6 +760,45 @@ def vector_rows(conn: sqlite3.Connection, scored_ids: list[tuple[str, float]], q
     return deduped
 
 
+def parity_report(conn: sqlite3.Connection, vault_root: Path) -> dict[str, object]:
+    eligible_docs = load_index_docs(conn, vault_root)
+    eligible = {str(doc.path): doc.rel_path for doc in eligible_docs}
+    rows = conn.execute("SELECT path, rel_path, status, chunk_count, last_error FROM memory_vector_index_state").fetchall()
+    indexed = {str(row["path"]): row for row in rows if row["status"] == "indexed" and str(row["path"]) in eligible}
+    all_state_paths = {str(row["path"]) for row in rows}
+    missing = sorted(eligible[path] for path in eligible.keys() - indexed.keys())
+    stale = sorted(all_state_paths - eligible.keys())
+    errors = [
+        {"rel_path": str(row["rel_path"] or row["path"]), "error": str(row["last_error"] or "")[:300]}
+        for row in rows if row["status"] == "error"
+    ]
+    chunk_count = int(conn.execute("SELECT COUNT(*) FROM memory_vector_chunks").fetchone()[0])
+    return {
+        "eligible_docs": len(eligible), "indexed_docs": len(indexed), "chunk_count": chunk_count,
+        "missing_docs": missing, "stale_paths": stale, "errors": errors,
+        "parity_ok": not missing and not stale and not errors,
+    }
+
+
+def prune_ineligible(conn: sqlite3.Connection, store: ZvecStore, vault_root: Path) -> tuple[int, int, list[str]]:
+    eligible_paths = {str(doc.path) for doc in load_index_docs(conn, vault_root)}
+    rows = conn.execute("SELECT path FROM memory_vector_index_state UNION SELECT path FROM memory_vector_chunks").fetchall()
+    stale_paths = sorted(str(row[0]) for row in rows if str(row[0]) not in eligible_paths)
+    deleted_chunks = 0
+    errors: list[str] = []
+    for raw_path in stale_paths:
+        ids = old_chunk_ids(conn, Path(raw_path))
+        try:
+            if ids:
+                store.replace_chunks([], [], ids)
+            conn.execute("DELETE FROM memory_vector_chunks WHERE path=?", (raw_path,))
+            conn.execute("DELETE FROM memory_vector_index_state WHERE path=?", (raw_path,))
+            deleted_chunks += len(ids)
+        except Exception as exc:
+            errors.append(f"{raw_path}: {exc}")
+    return len(stale_paths), deleted_chunks, errors
+
+
 def print_scan_result(result: dict[str, object], as_json: bool) -> None:
     if as_json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -784,8 +856,15 @@ def run_indexing(args: argparse.Namespace, sqlite_index: Any, conn: sqlite3.Conn
         "docs_skipped": 0,
         "docs_error": 0,
         "chunks_indexed": 0,
+        "pruned_docs": 0,
+        "pruned_chunks": 0,
         "errors": errors,
     }
+    if args.prune:
+        pruned_docs, pruned_chunks, prune_errors = prune_ineligible(conn, store, vault_root)
+        stats["pruned_docs"] = pruned_docs
+        stats["pruned_chunks"] = pruned_chunks
+        errors.extend(prune_errors)
     if deduped:
         try:
             preflight = embedder.embed_query("embedding preflight")
@@ -812,6 +891,7 @@ def run_indexing(args: argparse.Namespace, sqlite_index: Any, conn: sqlite3.Conn
                 cast_errors.append(f"{doc.rel_path}: {detail}")
     if stats["errors"]:
         stats["status"] = "partial_error" if int(stats["docs_indexed"]) or int(stats["docs_unchanged"]) else "error"
+    stats["parity"] = parity_report(conn, vault_root)
     print_scan_result(stats, args.json)
     return 0 if not stats["errors"] else 2
 
@@ -836,6 +916,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build and query the optional Zvec semantic index for Codex memory.")
     parser.add_argument("--init", action="store_true", help="Create SQLite vector tables and Zvec collection.")
     parser.add_argument("--scan", action="store_true", help="Incrementally index eligible Markdown docs from the SQLite memory index.")
+    parser.add_argument("--prune", action="store_true", help="Remove deleted, renamed, or no-longer-eligible vector rows.")
+    parser.add_argument("--report", action="store_true", help="Report Markdown/SQLite/Zvec parity without embedding work.")
     parser.add_argument("--changed-file", action="append", default=[], help="Refresh one changed Markdown file. Repeatable.")
     parser.add_argument("--search", help="Semantic search query.")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="Maximum search results.")
@@ -852,7 +934,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if not (args.init or args.scan or args.changed_file or args.search):
+    if not (args.init or args.scan or args.prune or args.report or args.changed_file or args.search):
         args.init = True
     sqlite_index = load_sqlite_index()
     state_db = Path(args.state_db).expanduser().resolve()
@@ -863,7 +945,7 @@ def main() -> int:
             init_db(conn)
             if args.init:
                 store.init()
-                if not (args.scan or args.changed_file or args.search):
+                if not (args.scan or args.prune or args.report or args.changed_file or args.search):
                     payload = {
                         "status": "ok",
                         "state_db": str(state_db),
@@ -874,8 +956,11 @@ def main() -> int:
                     }
                     print(json.dumps(payload, ensure_ascii=False, indent=2) if args.json else "\n".join(f"{k}={v}" for k, v in payload.items()))
             exit_code = 0
-            if args.scan or args.changed_file:
+            if args.scan or args.prune or args.changed_file:
                 exit_code = max(exit_code, run_indexing(args, sqlite_index, conn, store))
+            if args.report:
+                report = parity_report(conn, Path(sqlite_index.VAULT_ROOT))
+                print(json.dumps(report, ensure_ascii=False, indent=2) if args.json else "\n".join(f"{k}={v}" for k, v in report.items()))
             if args.search:
                 exit_code = max(exit_code, run_search(args, conn, store))
             return exit_code

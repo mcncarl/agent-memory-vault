@@ -58,6 +58,7 @@ audit 用来发现需要复核、合并或忽略的记忆，不直接改写 Mark
 python3 scripts/codex_memory_audit.py
 python3 scripts/codex_memory_audit.py --ignore FINDING_ID --note "保留原因"
 python3 scripts/codex_memory_audit_autorun.py --reason closeout --min-interval-days 7
+python3 scripts/codex_memory_doctor.py
 ```
 
 推荐让 closeout 每 7 天捎带检查一次 audit 是否该运行。audit findings 应该由用户或 Agent 明确裁决，避免报告本身变成新的 open-loop 噪声。
@@ -78,6 +79,7 @@ session_id: ""
 status: active
 sensitivity: normal
 verified_at: 2026-06-20
+review_after_days: 90
 keywords:
   - example
 ---
@@ -88,4 +90,5 @@ keywords:
 - 不要把 API key、token、cookie、密码写入 Markdown。
 - 不要把私密原始聊天全文写入公开仓库。
 - 不要把 SQLite 数据库提交到 Git。
+- 搜索日志只保存查询哈希、长度、来源和耗时，不保存新的查询原文。
 - 对外分享前必须脱敏。

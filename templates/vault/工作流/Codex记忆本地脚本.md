@@ -25,6 +25,8 @@ keywords:
 - `codex_memory_closeout.py`：任务结束收尾，负责检查、对账、刷新索引、捎带 audit 和可选 scoped commit。
 - `codex_memory_audit.py`：定期体检，发现过期记忆、重复标题、open-loop 噪声和已过时状态。
 - `codex_memory_audit_autorun.py`：audit 自动触发器，只在超过设定间隔时运行。
+- `codex_memory_doctor.py`：统一体检 Markdown、SQLite、FTS、INDEX、Zvec、验证来源和自动化状态。
+- `codex_memory_stop_hook.py`：Stop 事件节流提醒；到期 audit 仍由 7 天闸门决定是否执行。
 - `codex_agent_evolution.py`：Agent case 和 skill 候选状态统计。
 - `codex_memory_check.py`：结构、frontmatter、SQLite、泄密风险检查。
 - `codex_memory_zvec_index.py`：可选 Zvec 语义索引和搜索。
@@ -58,10 +60,12 @@ python3 scripts/codex_memory_closeout.py --dry-run
 python3 scripts/codex_memory_closeout.py --commit
 python3 scripts/codex_memory_audit.py
 python3 scripts/codex_memory_audit_autorun.py --reason manual --json
+python3 scripts/codex_memory_doctor.py
 python3 scripts/codex_agent_evolution.py --init --scan --report
 python3 scripts/codex_memory_check.py
 python3 scripts/codex_memory_zvec_index.py --init
-python3 scripts/codex_memory_zvec_index.py --scan
+python3 scripts/codex_memory_zvec_index.py --scan --prune
+python3 scripts/codex_memory_zvec_index.py --report
 python3 scripts/codex_memory_zvec_index.py --search "只记得大概意思的问题" --limit 5
 python3 scripts/codex_memory_retrieval_benchmark.py --limit 5
 ```

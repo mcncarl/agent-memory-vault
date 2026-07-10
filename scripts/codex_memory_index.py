@@ -7,6 +7,7 @@ import hashlib
 import os
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +40,8 @@ class MemoryDoc:
     status: str
     sensitivity: str
     verified_at: str
+    verified_at_source: str
+    review_after_days: int
     mtime: float
     size_bytes: int
     line_count: int
@@ -152,14 +155,37 @@ def extract_summary(text: str) -> str:
     return compact_lines(body[:12], 500)
 
 
-def extract_verified_at(text: str, meta: dict[str, object], mtime: float) -> str:
+def extract_verified_at(text: str, meta: dict[str, object], mtime: float) -> tuple[str, str]:
     frontmatter_value = as_text(meta.get("verified_at"))
     if frontmatter_value:
-        return frontmatter_value
+        return frontmatter_value, "frontmatter"
     match = re.search(r"最近验证[:：]\s*(\d{4}-\d{2}-\d{2})", text)
     if match:
-        return match.group(1)
-    return dt.datetime.fromtimestamp(mtime).date().isoformat()
+        return match.group(1), "summary"
+    return dt.datetime.fromtimestamp(mtime).date().isoformat(), "mtime_fallback"
+
+
+def infer_review_after_days(path: Path, title: str, memory_type: str, status: str, meta: dict[str, object]) -> int:
+    explicit = as_text(meta.get("review_after_days"))
+    if explicit:
+        try:
+            return max(1, min(int(explicit), 3650))
+        except ValueError:
+            pass
+    haystack = f"{path.as_posix()} {title}"
+    if status == "candidate" or memory_type in {"agent_case_candidate", "skill_candidate", "open_loop"}:
+        return 30
+    if "产品调研" in haystack or "竞品调研" in haystack:
+        return 30
+    return {
+        "project": 90,
+        "workflow": 180,
+        "user_profile": 365,
+        "decision": 365,
+        "routing": 365,
+        "directory_index": 365,
+        "template": 365,
+    }.get(memory_type, 180)
 
 
 def infer_from_path(path: Path, meta: dict[str, object]) -> tuple[str, str, str, str]:
@@ -232,6 +258,7 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
     rel_path = path.relative_to(VAULT_ROOT).as_posix()
     title = title_from_markdown(text, path)
     memory_type, track, project_id, status = infer_from_path(path, meta)
+    verified_at, verified_at_source = extract_verified_at(text, meta, stat.st_mtime)
     summary = extract_summary(text)
     next_hint = compact_lines(section_lines(text, ["下次优先看"]), 500)
     stale_info = compact_lines(section_lines(text, ["已过时信息"]), 500)
@@ -253,7 +280,9 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
             session_id=as_text(meta.get("session_id")),
             status=status,
             sensitivity=as_text(meta.get("sensitivity"), "private" if track == "user" else "normal"),
-            verified_at=extract_verified_at(text, meta, stat.st_mtime),
+            verified_at=verified_at,
+            verified_at_source=verified_at_source,
+            review_after_days=infer_review_after_days(path, title, memory_type, status, meta),
             mtime=stat.st_mtime,
             size_bytes=stat.st_size,
             line_count=text.count("\n") + 1,
@@ -276,7 +305,14 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(STATE_DB)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -302,6 +338,8 @@ def init_db(conn: sqlite3.Connection) -> None:
           status TEXT DEFAULT 'active',
           sensitivity TEXT DEFAULT 'normal',
           verified_at TEXT,
+          verified_at_source TEXT DEFAULT 'mtime_fallback',
+          review_after_days INTEGER DEFAULT 180,
           mtime REAL NOT NULL,
           size_bytes INTEGER NOT NULL,
           line_count INTEGER NOT NULL,
@@ -340,6 +378,10 @@ def init_db(conn: sqlite3.Connection) -> None:
           query TEXT NOT NULL,
           result_count INTEGER NOT NULL,
           used_paths TEXT,
+          query_sha256 TEXT,
+          query_length INTEGER,
+          sources TEXT,
+          duration_ms INTEGER,
           created_at TEXT NOT NULL
         );
 
@@ -350,7 +392,13 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_memory_docs_session ON memory_docs(session_id);
         """
     )
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "2"))
+    ensure_column(conn, "memory_docs", "verified_at_source", "TEXT DEFAULT 'mtime_fallback'")
+    ensure_column(conn, "memory_docs", "review_after_days", "INTEGER DEFAULT 180")
+    ensure_column(conn, "memory_search_log", "query_sha256", "TEXT")
+    ensure_column(conn, "memory_search_log", "query_length", "INTEGER")
+    ensure_column(conn, "memory_search_log", "sources", "TEXT")
+    ensure_column(conn, "memory_search_log", "duration_ms", "INTEGER")
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "3"))
     conn.commit()
 
 
@@ -365,11 +413,11 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
         """
         INSERT INTO memory_docs (
           path, rel_path, sha256, title, memory_type, track, project_id, app_id,
-          user_id, agent_id, session_id, status, sensitivity, verified_at, mtime,
-          size_bytes, line_count, summary, next_hint, stale_info, has_open_loop,
+          user_id, agent_id, session_id, status, sensitivity, verified_at, verified_at_source,
+          review_after_days, mtime, size_bytes, line_count, summary, next_hint, stale_info, has_open_loop,
           open_loop_count, indexed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
           rel_path=excluded.rel_path,
           sha256=excluded.sha256,
@@ -384,6 +432,8 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
           status=excluded.status,
           sensitivity=excluded.sensitivity,
           verified_at=excluded.verified_at,
+          verified_at_source=excluded.verified_at_source,
+          review_after_days=excluded.review_after_days,
           mtime=excluded.mtime,
           size_bytes=excluded.size_bytes,
           line_count=excluded.line_count,
@@ -409,6 +459,8 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
             doc.status,
             doc.sensitivity,
             doc.verified_at,
+            doc.verified_at_source,
+            doc.review_after_days,
             doc.mtime,
             doc.size_bytes,
             doc.line_count,
@@ -454,8 +506,25 @@ def scan(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_doc_count", str(len(files))))
 
 
+def query_chunks(raw_query: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9_.+-]+|[\u3400-\u9fff]+", raw_query.strip())
+
+
+def lexical_terms(raw_query: str, limit: int = 18) -> list[str]:
+    terms: list[str] = []
+    for chunk in query_chunks(raw_query):
+        if re.fullmatch(r"[\u3400-\u9fff]+", chunk):
+            if len(chunk) <= 6:
+                terms.append(chunk)
+            gram_size = 2 if len(chunk) <= 8 else 3
+            terms.extend(chunk[index : index + gram_size] for index in range(len(chunk) - gram_size + 1))
+        else:
+            terms.append(chunk.lower())
+    return list(dict.fromkeys(term for term in terms if term))[:limit]
+
+
 def fts_query(raw_query: str) -> str:
-    terms = [term for term in re.split(r"\s+", raw_query.strip()) if term]
+    terms = query_chunks(raw_query)
     if not terms:
         return '""'
     escaped = [term.replace('"', '""') for term in terms[:8]]
@@ -534,7 +603,7 @@ def score_row(row: sqlite3.Row, terms: list[str]) -> int:
 
 
 def dedupe_and_rank(rows: list[sqlite3.Row], query: str, limit: int) -> list[sqlite3.Row]:
-    terms = [term for term in re.split(r"\s+", query.strip()) if term]
+    terms = lexical_terms(query)
     by_path: dict[str, sqlite3.Row] = {}
     for row in rows:
         by_path.setdefault(row["path"], row)
@@ -581,7 +650,7 @@ def search(
         rows = []
 
     seen = {row["path"] for row in rows}
-    terms = [term for term in re.split(r"\s+", query.strip()) if term]
+    terms = lexical_terms(query)
     if terms:
         like_parts: list[str] = []
         params: list[object] = []
@@ -643,6 +712,7 @@ def print_search(
     status: str,
     has_open_loop: bool,
 ) -> None:
+    started = time.monotonic()
     rows = search(
         conn,
         query,
@@ -680,7 +750,7 @@ def print_search(
             f"{row['memory_type']} track={row['track']} project_id={row['project_id']} "
             f"user_id={row['user_id']} agent_id={row['agent_id']} app_id={row['app_id']} status={row['status']}"
         )
-        print(f"   verified_at: {row['verified_at']}")
+        print(f"   verified_at: {row['verified_at']} source={row['verified_at_source']}")
         print(f"   summary: {str(row['summary'] or '')[:220]}")
         hit = str(row["hit"] or "").replace("\n", " ")
         print(f"   hit: {hit[:220]}")
@@ -691,9 +761,23 @@ def print_search(
             ).fetchall()
             for kind, item in loops:
                 print(f"   open_loop[{kind}]: {item[:180]}")
+    digest = sha256_text(query)
     conn.execute(
-        "INSERT INTO memory_search_log(query, result_count, used_paths, created_at) VALUES (?, ?, ?, ?)",
-        (query, len(rows), ",".join(row["rel_path"] for row in rows), utc_now()),
+        """
+        INSERT INTO memory_search_log(
+          query, result_count, used_paths, query_sha256, query_length, sources, duration_ms, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            f"[redacted:{digest[:12]}]",
+            len(rows),
+            ",".join(row["rel_path"] for row in rows),
+            digest,
+            len(query),
+            "sqlite",
+            round((time.monotonic() - started) * 1000),
+            utc_now(),
+        ),
     )
 
 

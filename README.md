@@ -41,6 +41,9 @@ scripts/
   codex_memory_audit.py  # 定期体检：过期、重复、open-loop、裁决记录
   codex_memory_audit_autorun.py
                           # audit 自动触发器：超过间隔才运行
+  codex_memory_doctor.py  # 全链路体检：Markdown/SQLite/FTS/Zvec/Git/自动化
+  codex_memory_stop_hook.py
+                          # Stop 事件节流提醒 + 到期 audit
   codex_memory_zvec_index.py
   codex_memory_retrieval_benchmark.py
   codex_agent_evolution.py
@@ -63,6 +66,7 @@ source .env
 python3 scripts/codex_agent_evolution.py --init --scan --report
 python3 scripts/codex_memory_index.py --init --scan --report
 python3 scripts/codex_memory_check.py
+python3 scripts/codex_memory_doctor.py
 ```
 
 搜索示例：
@@ -73,7 +77,7 @@ python3 scripts/codex_memory_search.py "偏好" --track user
 python3 scripts/codex_memory_search.py "复用流程" --memory-type workflow
 ```
 
-任务结束时建议使用统一收尾脚本。它会自动发现记忆库里的变更文件，执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新，并在 audit 超过间隔时顺手跑一次体检。
+任务结束时建议使用统一收尾脚本。它会自动发现记忆库里的变更文件，执行结构检查、字面与语义双重对账、SQLite 刷新、可选 Zvec 补漏/清理、Agent evolution 刷新，并在 audit 超过间隔时顺手跑一次体检。并发 closeout 会被文件锁拦住，避免数据库和 Git 基线互相踩踏。
 
 ```bash
 python3 scripts/codex_memory_closeout.py --dry-run
@@ -93,7 +97,14 @@ python3 scripts/codex_memory_audit.py
 python3 scripts/codex_memory_audit_autorun.py --reason manual --json
 ```
 
-可选的 Stop hook 提醒和 macOS `launchd` 周期兜底见 [docs/automation.md](docs/automation.md)。
+全链路健康检查：
+
+```bash
+python3 scripts/codex_memory_doctor.py
+python3 scripts/codex_memory_doctor.py --repair-derived  # 只重建派生索引，不改 Markdown
+```
+
+可选的 Stop hook 与 macOS `launchd` 周期兜底见 [docs/automation.md](docs/automation.md)。
 
 ## 可选：语义检索
 
@@ -112,7 +123,8 @@ python3 -m venv "$HOME/.config/codex-memory/.venv"
 ```bash
 python3 scripts/codex_memory_index.py --init --scan --report
 "$HOME/.config/codex-memory/.venv/bin/python" scripts/codex_memory_zvec_index.py --init
-"$HOME/.config/codex-memory/.venv/bin/python" scripts/codex_memory_zvec_index.py --scan
+"$HOME/.config/codex-memory/.venv/bin/python" scripts/codex_memory_zvec_index.py --scan --prune
+"$HOME/.config/codex-memory/.venv/bin/python" scripts/codex_memory_zvec_index.py --report
 "$HOME/.config/codex-memory/.venv/bin/python" scripts/codex_memory_zvec_index.py --search "只记得大概意思的问题"
 ```
 
@@ -131,6 +143,8 @@ python3 scripts/codex_memory_index.py --init --scan --report
 5. 语义检索只作为候选召回层，最终答案必须回读 Markdown 原文。
 6. closeout 负责“任务结束后的自动整理”，audit 负责“定期发现要复核、合并或忽略的记忆”，但二者都不自动改写事实层。
 7. API key、模型缓存、SQLite、audit 裁决库和向量库只放本地，永远不写进 Markdown 记忆和公开仓库。
+8. `verified_at` 必须区分真实复核与文件 mtime 回退；不同记忆类型用 `review_after_days` 设置不同复核周期。
+9. 统一搜索会同时合并关键词与语义结果，所有筛选在合并后再次执行，并用距离阈值拒绝“硬凑出来”的无关近邻。
 
 ## 致谢
 

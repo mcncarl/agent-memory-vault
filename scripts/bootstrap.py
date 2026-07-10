@@ -132,9 +132,10 @@ def main() -> int:
     print("  python3 scripts/codex_memory_index.py --init --scan --report")
     print("  python3 scripts/codex_memory_closeout.py --dry-run")
     print("  python3 scripts/codex_memory_check.py")
+    print("  python3 scripts/codex_memory_doctor.py")
     print("optional_semantic_retrieval:")
     print("  python3 -m pip install -r requirements-vector.txt")
-    print("  python3 scripts/codex_memory_zvec_index.py --init --scan")
+    print("  python3 scripts/codex_memory_zvec_index.py --init --scan --prune")
     return 0
 
 

@@ -21,6 +21,10 @@ STATE_DB = Path(
 AUDIT_DB = Path(
     os.path.expandvars(os.environ.get("CODEX_MEMORY_AUDIT_DB", str(CONFIG_ROOT / "audit_decisions.sqlite")))
 ).expanduser().resolve()
+REPO_ROOT = Path(__file__).resolve().parents[1]
+VAULT_ROOT = Path(
+    os.path.expandvars(os.environ.get("CODEX_MEMORY_ROOT", str(REPO_ROOT / "templates" / "vault")))
+).expanduser().resolve()
 
 
 @dataclass
@@ -61,6 +65,7 @@ def stable_id(kind: str, *parts: object) -> str:
 def connect_state() -> sqlite3.Connection:
     conn = sqlite3.connect(STATE_DB)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 
@@ -68,6 +73,7 @@ def connect_audit() -> sqlite3.Connection:
     AUDIT_DB.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(AUDIT_DB)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=10000")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS audit_decisions (
@@ -95,17 +101,34 @@ def severity_rank(value: str) -> int:
     return {"high": 3, "medium": 2, "low": 1}.get(value, 0)
 
 
-def add_stale_findings(conn: sqlite3.Connection, findings: list[Finding], days: int) -> None:
-    cutoff = today() - dt.timedelta(days=days)
+def add_stale_findings(conn: sqlite3.Connection, findings: list[Finding], fallback_days: int) -> None:
     rows = conn.execute(
         """
-        SELECT rel_path, title, status, verified_at, memory_type, track
+        SELECT rel_path, title, status, verified_at, verified_at_source,
+               review_after_days, memory_type, track
         FROM memory_docs
         WHERE status IN ('active', 'candidate')
+          AND memory_type NOT IN ('routing', 'directory_index', 'template')
         ORDER BY rel_path
         """
     ).fetchall()
+    weak_rows = [row for row in rows if str(row["verified_at_source"] or "") == "mtime_fallback"]
+    if weak_rows:
+        findings.append(
+            Finding(
+                id=stable_id("weak_verification_coverage"),
+                kind="weak_verification_coverage",
+                severity="medium",
+                rel_path="",
+                title="Verification provenance",
+                message=f"{len(weak_rows)} memories only have file mtime, not an explicit fact review date.",
+                detail={"count": len(weak_rows), "total": len(rows), "sample_paths": [str(row["rel_path"]) for row in weak_rows[:10]]},
+            )
+        )
     for row in rows:
+        source = str(row["verified_at_source"] or "mtime_fallback")
+        if source == "mtime_fallback":
+            continue
         verified = parse_date(str(row["verified_at"] or ""))
         if verified is None:
             findings.append(
@@ -120,28 +143,29 @@ def add_stale_findings(conn: sqlite3.Connection, findings: list[Finding], days: 
                 )
             )
             continue
+        review_days = int(row["review_after_days"] or fallback_days)
+        cutoff = today() - dt.timedelta(days=review_days)
         if verified < cutoff:
             findings.append(
                 Finding(
-                    id=stable_id("stale_verified_at", row["rel_path"], verified.isoformat(), days),
+                    id=stable_id("stale_verified_at", row["rel_path"]),
                     kind="stale_verified_at",
                     severity="low",
                     rel_path=row["rel_path"],
                     title=row["title"],
-                    message=f"verified_at={verified.isoformat()}，超过 {days} 天未复核。",
-                    detail={"verified_at": verified.isoformat(), "days": days, "status": row["status"]},
+                    message=f"Explicit review date {verified.isoformat()} exceeds the {review_days}-day policy.",
+                    detail={"verified_at": verified.isoformat(), "verified_at_source": source, "review_after_days": review_days, "status": row["status"]},
                 )
             )
 
 
-def add_open_loop_findings(conn: sqlite3.Connection, findings: list[Finding], threshold: int) -> None:
+def add_open_loop_findings(conn: sqlite3.Connection, findings: list[Finding], threshold: int, risk_threshold: int) -> None:
     rows = conn.execute(
         """
-        SELECT d.rel_path, d.title, COUNT(*) AS loop_count,
-               GROUP_CONCAT(DISTINCT o.kind) AS kinds
+        SELECT d.rel_path, d.title, COUNT(*) AS loop_count
         FROM memory_open_loops o
         JOIN memory_docs d ON d.path = o.path
-        WHERE o.status='open'
+        WHERE o.status='open' AND o.kind='open_loop'
         GROUP BY d.path, d.rel_path, d.title
         HAVING loop_count >= ?
         ORDER BY loop_count DESC, d.rel_path
@@ -151,13 +175,37 @@ def add_open_loop_findings(conn: sqlite3.Connection, findings: list[Finding], th
     for row in rows:
         findings.append(
             Finding(
-                id=stable_id("open_loop_count", row["rel_path"], row["loop_count"]),
+                id=stable_id("open_loop_count", row["rel_path"]),
                 kind="open_loop_count",
                 severity="medium",
                 rel_path=row["rel_path"],
                 title=row["title"],
-                message=f"open-loop/risk/next-hint 合计 {row['loop_count']} 条，建议人工分流或压缩。",
-                detail={"count": row["loop_count"], "kinds": row["kinds"] or ""},
+                message=f"{row['loop_count']} true open-loop items need review.",
+                detail={"count": row["loop_count"], "kind": "open_loop"},
+            )
+        )
+    risk_rows = conn.execute(
+        """
+        SELECT d.rel_path, d.title, COUNT(*) AS risk_count
+        FROM memory_open_loops o
+        JOIN memory_docs d ON d.path = o.path
+        WHERE o.status='open' AND o.kind='risk'
+        GROUP BY d.path, d.rel_path, d.title
+        HAVING risk_count >= ?
+        ORDER BY risk_count DESC, d.rel_path
+        """,
+        (risk_threshold,),
+    ).fetchall()
+    for row in risk_rows:
+        findings.append(
+            Finding(
+                id=stable_id("risk_count", row["rel_path"]),
+                kind="risk_count",
+                severity="medium",
+                rel_path=row["rel_path"],
+                title=row["title"],
+                message=f"{row['risk_count']} risk items need validity review.",
+                detail={"count": row["risk_count"], "kind": "risk"},
             )
         )
 
@@ -171,6 +219,8 @@ def add_duplicate_title_findings(conn: sqlite3.Connection, findings: list[Findin
                GROUP_CONCAT(title, ' || ') AS titles
         FROM memory_docs
         WHERE title IS NOT NULL AND trim(title) != ''
+          AND memory_type NOT IN ('directory_index', 'template')
+          AND rel_path NOT LIKE '%/README.md'
         GROUP BY normalized_title
         HAVING item_count > 1
         ORDER BY item_count DESC, normalized_title
@@ -180,7 +230,7 @@ def add_duplicate_title_findings(conn: sqlite3.Connection, findings: list[Findin
         title = str(row["titles"]).split(" || ", 1)[0]
         findings.append(
             Finding(
-                id=stable_id("duplicate_title", row["normalized_title"], row["paths"]),
+                id=stable_id("duplicate_title", row["normalized_title"]),
                 kind="duplicate_title",
                 severity="low",
                 rel_path="",
@@ -214,6 +264,73 @@ def add_outdated_findings(conn: sqlite3.Connection, findings: list[Finding]) -> 
         )
 
 
+def add_large_file_findings(conn: sqlite3.Connection, findings: list[Finding], line_limit: int, byte_limit: int) -> None:
+    rows = conn.execute(
+        """
+        SELECT rel_path, title, line_count, size_bytes
+        FROM memory_docs
+        WHERE memory_type NOT IN ('template', 'directory_index')
+          AND (line_count > ? OR size_bytes > ?)
+        ORDER BY size_bytes DESC, line_count DESC
+        """,
+        (line_limit, byte_limit),
+    ).fetchall()
+    for row in rows:
+        findings.append(
+            Finding(
+                id=stable_id("large_memory_file", row["rel_path"]),
+                kind="large_memory_file",
+                severity="low",
+                rel_path=row["rel_path"],
+                title=row["title"],
+                message=f"File has {row['line_count']} lines / {row['size_bytes']} bytes; review current facts versus history.",
+                detail={"line_count": row["line_count"], "size_bytes": row["size_bytes"]},
+            )
+        )
+
+
+def add_index_parity_findings(conn: sqlite3.Connection, findings: list[Finding]) -> None:
+    doc_count = int(conn.execute("SELECT COUNT(*) FROM memory_docs").fetchone()[0])
+    fts_count = int(conn.execute("SELECT COUNT(DISTINCT path) FROM memory_fts").fetchone()[0])
+    if doc_count != fts_count:
+        findings.append(
+            Finding(
+                id=stable_id("sqlite_fts_parity"), kind="sqlite_fts_parity", severity="high",
+                rel_path="", title="SQLite/FTS parity",
+                message=f"SQLite has {doc_count} docs but FTS has {fts_count}.",
+                detail={"memory_docs": doc_count, "fts_docs": fts_count},
+            )
+        )
+    tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "memory_vector_index_state" not in tables:
+        return
+    eligible_count = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM memory_docs
+            WHERE memory_type NOT IN ('routing','directory_index','template','agent_case_candidate','skill_candidate')
+              AND status NOT IN ('archived','deleted','obsolete','outdated','deprecated','stale')
+              AND sensitivity NOT IN ('secret','credential')
+              AND rel_path NOT LIKE '%/README.md'
+              AND rel_path NOT GLOB '*/_模板*'
+            """
+        ).fetchone()[0]
+    )
+    vector_count = int(conn.execute("SELECT COUNT(*) FROM memory_vector_index_state WHERE status='indexed'").fetchone()[0])
+    state_count = int(conn.execute("SELECT COUNT(*) FROM memory_vector_index_state").fetchone()[0])
+    if state_count == 0:
+        return
+    if eligible_count != vector_count:
+        findings.append(
+            Finding(
+                id=stable_id("zvec_parity"), kind="zvec_parity", severity="high",
+                rel_path="", title="Zvec parity",
+                message=f"Expected {eligible_count} semantic docs but found {vector_count} indexed docs.",
+                detail={"eligible_docs": eligible_count, "indexed_docs": vector_count},
+            )
+        )
+
+
 def load_decisions(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
     rows = conn.execute("SELECT * FROM audit_decisions").fetchall()
     return {row["finding_id"]: row for row in rows}
@@ -221,7 +338,7 @@ def load_decisions(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
 
 def decision_hides(row: sqlite3.Row) -> bool:
     decision = str(row["decision"])
-    if decision in {"ignored", "resolved"}:
+    if decision in {"ack", "ignored", "resolved"}:
         return True
     if decision == "snoozed":
         snooze_until = parse_date(str(row["snooze_until"] or ""))
@@ -247,9 +364,11 @@ def collect_findings(args: argparse.Namespace) -> list[Finding]:
     findings: list[Finding] = []
     with connect_state() as conn:
         add_stale_findings(conn, findings, args.stale_days)
-        add_open_loop_findings(conn, findings, args.open_loop_threshold)
+        add_open_loop_findings(conn, findings, args.open_loop_threshold, args.risk_threshold)
         add_duplicate_title_findings(conn, findings)
         add_outdated_findings(conn, findings)
+        add_large_file_findings(conn, findings, args.large_file_line_limit, args.large_file_byte_limit)
+        add_index_parity_findings(conn, findings)
     findings.sort(key=lambda item: (severity_rank(item.severity), item.kind, item.rel_path), reverse=True)
     with connect_audit() as audit_conn:
         decisions = load_decisions(audit_conn)
@@ -314,8 +433,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Audit Codex memory for stale facts, noisy loops, and duplicates.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--limit", type=int, default=50, help="Maximum visible findings.")
-    parser.add_argument("--stale-days", type=int, default=120, help="Flag active memories older than this many days.")
+    parser.add_argument("--stale-days", type=int, default=180, help="Fallback review period.")
     parser.add_argument("--open-loop-threshold", type=int, default=4, help="Flag docs with at least this many open-loop indexed items.")
+    parser.add_argument("--risk-threshold", type=int, default=3, help="Flag docs with at least this many risk items.")
+    parser.add_argument("--large-file-line-limit", type=int, default=180, help="Advisory line threshold.")
+    parser.add_argument("--large-file-byte-limit", type=int, default=24576, help="Advisory byte threshold.")
     parser.add_argument("--include-acknowledged", action="store_true", help="Show findings already ignored/resolved/snoozed.")
     parser.add_argument("--list-decisions", action="store_true", help="List audit decisions.")
     parser.add_argument("--ack", default="", help="Mark a finding as acknowledged.")
@@ -326,6 +448,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--note", default="", help="Optional decision note.")
     args = parser.parse_args()
     args.limit = max(args.limit, 1)
+    args.stale_days = max(args.stale_days, 1)
+    args.open_loop_threshold = max(args.open_loop_threshold, 1)
+    args.risk_threshold = max(args.risk_threshold, 1)
+    args.large_file_line_limit = max(args.large_file_line_limit, 1)
+    args.large_file_byte_limit = max(args.large_file_byte_limit, 1)
     if args.snooze and not parse_date(args.until):
         parser.error("--snooze requires --until YYYY-MM-DD")
     decision_count = sum(bool(value) for value in (args.ack, args.ignore, args.resolve, args.snooze))
@@ -345,7 +472,13 @@ def main() -> int:
     if args.list_decisions:
         payload["decisions"] = list_decisions()
     else:
-        payload["findings"] = [finding.to_dict() for finding in collect_findings(args)]
+        findings = collect_findings(args)
+        payload["findings"] = [finding.to_dict() for finding in findings]
+        payload["summary"] = {
+            "total": len(findings),
+            "by_severity": {severity: sum(1 for item in findings if item.severity == severity) for severity in ("high", "medium", "low")},
+            "by_kind": {kind: sum(1 for item in findings if item.kind == kind) for kind in sorted({item.kind for item in findings})},
+        }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

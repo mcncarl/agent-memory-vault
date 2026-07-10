@@ -9,6 +9,7 @@ session_id: ""
 status: active
 sensitivity: normal
 verified_at: 2026-06-20
+review_after_days: 180
 keywords:
   - fields
   - orthogonal
@@ -51,6 +52,8 @@ keywords:
 - `status`：`active`、`deprecated`、`candidate`、`archived`。
 - `sensitivity`：`normal`、`private`、`public-template` 等。
 - `verified_at`：最近一次确认日期。
+- `review_after_days`：建议多久后重新核验。常见默认值：候选 30 天、项目 90 天、工作流 180 天、长期偏好/决策 365 天。
+- 索引会额外记录 `verified_at_source`：来自 frontmatter、摘要中的“最近验证”，或仅是文件 mtime 回退。mtime 不能冒充事实已复核。
 - `keywords`：搜索关键词。
 
 ## 正交过滤

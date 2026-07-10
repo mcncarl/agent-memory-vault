@@ -28,6 +28,7 @@ keywords:
 - SQLite：关键词搜索、字段过滤、正交检索、状态索引。
 - Embedding model：把 Markdown chunk 和查询文本变成向量。
 - Zvec：保存向量，返回意思最接近的 chunk 和 Markdown 路径。
+- 统一搜索：并行合并 FTS 与 Zvec，统一执行筛选，并丢弃超过距离阈值的无关近邻。
 
 ## 什么时候使用
 
@@ -40,7 +41,8 @@ keywords:
 ```bash
 python3 scripts/codex_memory_index.py --init --scan --report
 python3 scripts/codex_memory_zvec_index.py --init
-python3 scripts/codex_memory_zvec_index.py --scan
+python3 scripts/codex_memory_zvec_index.py --scan --prune
+python3 scripts/codex_memory_zvec_index.py --report
 python3 scripts/codex_memory_zvec_index.py --search "只记得大概意思的问题" --limit 5
 python3 scripts/codex_memory_retrieval_benchmark.py --limit 5
 ```
@@ -50,6 +52,7 @@ python3 scripts/codex_memory_retrieval_benchmark.py --limit 5
 - Zvec 是本地嵌入式向量数据库，不需要单独后台服务。
 - Embedding 模型会占用本机磁盘和运行内存；具体取决于模型大小。
 - 模型缓存、向量库、SQLite、`.env` 和任何 token 都不要提交到公开仓库。
+- “已过时信息/旧方案”等历史段落默认不进入当前事实向量；Markdown 原文仍完整保留。
 
 ## 下次优先看
 
