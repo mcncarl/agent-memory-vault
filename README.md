@@ -4,7 +4,7 @@
 
 这个仓库只包含模板、脚本和假示例，不应该包含你的真实记忆、真实路径、API key、私人项目名或聊天原文。
 
-`Agent Memory Vault` 是原 `Codex Memory` 的平台中立后继名称。新配置使用 `AGENT_MEMORY_*`、新脚本使用 `agent_memory_*`；旧环境变量和脚本名在迁移窗口内继续转发到新实现。
+所有运行入口都使用平台中立命名：配置使用 `AGENT_MEMORY_*`，脚本使用 `agent_memory_*`，统一命令为 `memoryctl`。仓库不提供旧名称兼容脚本或环境变量回退。
 
 ## 它解决什么问题
 

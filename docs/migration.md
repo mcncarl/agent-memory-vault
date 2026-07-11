@@ -1,6 +1,6 @@
 # Migration Guide
 
-## 从 Codex Memory 名称迁移
+## 平台中立命名
 
 Agent Memory Vault 使用平台中立命名：
 
@@ -9,7 +9,7 @@ Agent Memory Vault 使用平台中立命名：
 - 统一命令：`memoryctl`。
 - 默认本地状态目录：`$HOME/.config/agent-memory`。
 
-迁移窗口内，旧 `CODEX_MEMORY_*` 变量只作回退，旧 `codex_memory_*` 和 `codex_agent_evolution.py` 只是转发包装。新名优先级高于旧名；如果两者同时存在，脚本使用新名。确认 Hook、定时任务和自定义脚本都已转向新入口后，再在后续主版本删除兼容包装。
+当前版本只接受上述新名称，不提供旧环境变量回退或转发包装。升级现有安装时，必须同步修改环境变量、Hook、定时任务和自定义脚本；升级完成后执行测试和 `doctor`，确认没有旧入口消费者。
 
 这份指南用于把一个已经在使用的私人 Agent 记忆系统，整理成可复用模板。
 

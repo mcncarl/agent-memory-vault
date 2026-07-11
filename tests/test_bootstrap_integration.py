@@ -51,9 +51,6 @@ class BootstrapIntegrationTests(unittest.TestCase):
                     "AGENT_MEMORY_STATE_DB": str(state_db),
                 }
             )
-            for key in tuple(env):
-                if key.startswith("CODEX_MEMORY_"):
-                    env.pop(key)
 
             evolution = run(
                 [sys.executable, str(SCRIPT_ROOT / "agent_memory_evolution.py"), "--init", "--scan", "--report"],

@@ -33,4 +33,4 @@ keywords:
 
 ## 验证方式
 
-- `codex_agent_evolution.py --scan --report` 能统计到本文件。
+- `agent_memory_evolution.py --scan --report` 能统计到本文件。

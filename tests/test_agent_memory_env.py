@@ -14,24 +14,21 @@ from agent_memory_env import env_value
 
 
 class AgentMemoryEnvironmentTests(unittest.TestCase):
-    def test_new_name_has_priority(self) -> None:
+    def test_agent_memory_value_is_used(self) -> None:
         with mock.patch.dict(
             "os.environ",
-            {
-                "AGENT_MEMORY_ROOT": "/new/vault",
-                "CODEX_MEMORY_ROOT": "/legacy/vault",
-            },
+            {"AGENT_MEMORY_ROOT": "/agent/vault"},
             clear=True,
         ):
-            self.assertEqual(env_value("ROOT", "/default"), "/new/vault")
+            self.assertEqual(env_value("ROOT", "/default"), "/agent/vault")
 
-    def test_legacy_name_remains_a_fallback(self) -> None:
+    def test_empty_value_uses_default(self) -> None:
         with mock.patch.dict(
-            "os.environ", {"CODEX_MEMORY_ROOT": "/legacy/vault"}, clear=True
+            "os.environ", {"AGENT_MEMORY_ROOT": ""}, clear=True
         ):
-            self.assertEqual(env_value("ROOT", "/default"), "/legacy/vault")
+            self.assertEqual(env_value("ROOT", "/default"), "/default")
 
-    def test_default_is_used_when_both_are_absent(self) -> None:
+    def test_default_is_used_when_value_is_absent(self) -> None:
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertEqual(env_value("ROOT", "/default"), "/default")
 
