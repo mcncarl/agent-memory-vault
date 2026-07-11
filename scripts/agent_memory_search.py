@@ -48,6 +48,7 @@ class SearchResult:
     verified_at_source: str = ""
     user_id: str = ""
     agent_id: str = ""
+    agent_scope: str = "shared"
     app_id: str = ""
     session_id: str = ""
     has_open_loop: int = 0
@@ -63,7 +64,7 @@ class SearchResult:
         self.source_details.update(other.source_details)
         for attr in (
             "title", "memory_type", "track", "project_id", "status", "verified_at",
-            "verified_at_source", "user_id", "agent_id", "app_id", "session_id", "summary", "hit",
+            "verified_at_source", "user_id", "agent_id", "agent_scope", "app_id", "session_id", "summary", "hit",
         ):
             if not getattr(self, attr) and getattr(other, attr):
                 setattr(self, attr, getattr(other, attr))
@@ -80,6 +81,7 @@ class SearchResult:
             "verified_at_source": self.verified_at_source,
             "user_id": self.user_id,
             "agent_id": self.agent_id,
+            "agent_scope": self.agent_scope or "shared",
             "app_id": self.app_id,
             "session_id": self.session_id,
             "summary": self.summary,
@@ -144,6 +146,7 @@ def row_to_result(row: sqlite3.Row, rank: int, query: str) -> SearchResult:
         verified_at_source=str(row["verified_at_source"] or ""),
         user_id=str(row["user_id"] or ""),
         agent_id=str(row["agent_id"] or ""),
+        agent_scope=str(row["agent_scope"] or "shared"),
         app_id=str(row["app_id"] or ""),
         session_id=str(row["session_id"] or ""),
         has_open_loop=int(row["has_open_loop"] or 0),
@@ -159,7 +162,7 @@ def enrich_from_db(result: SearchResult, conn: sqlite3.Connection) -> SearchResu
     row = conn.execute(
         """
         SELECT path, rel_path, title, memory_type, track, project_id, status,
-               verified_at, verified_at_source, user_id, agent_id, app_id,
+               verified_at, verified_at_source, user_id, agent_id, agent_scope, app_id,
                session_id, has_open_loop, summary
         FROM memory_docs
         WHERE path=? OR rel_path=?
@@ -180,6 +183,7 @@ def enrich_from_db(result: SearchResult, conn: sqlite3.Connection) -> SearchResu
     result.verified_at_source = result.verified_at_source or str(row["verified_at_source"] or "")
     result.user_id = result.user_id or str(row["user_id"] or "")
     result.agent_id = result.agent_id or str(row["agent_id"] or "")
+    result.agent_scope = str(row["agent_scope"] or "shared")
     result.app_id = result.app_id or str(row["app_id"] or "")
     result.session_id = result.session_id or str(row["session_id"] or "")
     result.has_open_loop = int(row["has_open_loop"] or 0)
@@ -353,7 +357,7 @@ def merge_results(result_groups: list[list[SearchResult]]) -> list[SearchResult]
 
 
 def result_matches_filters(result: SearchResult, args: argparse.Namespace) -> bool:
-    if args.agent_scope and (result.agent_id or "shared") not in {"shared", args.agent_scope}:
+    if args.agent_scope and (result.agent_scope or "shared") not in {"shared", args.agent_scope}:
         return False
     for value, actual in (
         (args.track, result.track),
@@ -398,6 +402,38 @@ def log_search(query: str, rows: list[SearchResult], duration_ms: int) -> None:
             )
     except sqlite3.Error:
         return
+
+
+def redact_legacy_search_logs() -> dict[str, int]:
+    """Irreversibly remove legacy query text while retaining useful metadata."""
+    with connect() as conn:
+        memory_index.init_db(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT id, query, query_sha256, query_length
+            FROM memory_search_log
+            WHERE query NOT LIKE '[redacted:%'
+            ORDER BY id
+            """
+        ).fetchall()
+        for row in rows:
+            query = str(row["query"] or "")
+            digest = str(row["query_sha256"] or "") or hashlib.sha256(query.encode("utf-8")).hexdigest()
+            length = int(row["query_length"] or len(query))
+            conn.execute(
+                """
+                UPDATE memory_search_log
+                SET query=?, query_sha256=?, query_length=?
+                WHERE id=?
+                """,
+                (f"[redacted:{digest[:12]}]", digest, length, int(row["id"])),
+            )
+        conn.commit()
+        remaining = int(
+            conn.execute("SELECT COUNT(*) FROM memory_search_log WHERE query NOT LIKE '[redacted:%'").fetchone()[0]
+        )
+    return {"redacted": len(rows), "remaining_raw": remaining}
 
 
 def run_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]]:
@@ -468,9 +504,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--has-open-loop", action="store_true", help="Only return docs with open loops.")
     parser.add_argument("--include-inactive", action="store_true", help="Include candidate/outdated statuses.")
     parser.add_argument("--include-supporting", action="store_true", help="Include templates and directory indexes.")
+    parser.add_argument(
+        "--redact-legacy-logs",
+        action="store_true",
+        help="Irreversibly redact legacy raw search queries while retaining hashes and lengths.",
+    )
     args = parser.parse_args()
     args.query = args.search or args.query
-    if not args.query:
+    if not args.query and not args.redact_legacy_logs:
         parser.error("query is required")
     args.limit = max(args.limit, 1)
     return args
@@ -478,6 +519,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.redact_legacy_logs:
+        payload = redact_legacy_search_logs()
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(f"redacted={payload['redacted']} remaining_raw={payload['remaining_raw']}")
+        return 0
     rows, warnings = run_search(args)
     if args.json:
         print(json.dumps({"query": args.query, "results": [row.to_dict() for row in rows], "warnings": warnings}, ensure_ascii=False, indent=2))

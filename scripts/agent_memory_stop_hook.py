@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_memory_env import env_value
+from agent_memory_claim import active_claim_rows, all_active_claim_rows
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +67,14 @@ def session_key(payload: dict[str, object], actor: str) -> str:
         value = payload.get(key)
         if value:
             return str(value)
+    keys = {
+        "codex": ("AGENT_MEMORY_SESSION_ID", "CODEX_THREAD_ID"),
+        "claude": ("AGENT_MEMORY_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"),
+    }.get(actor, ("AGENT_MEMORY_SESSION_ID",))
+    for key in keys:
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
     return f"{payload.get('cwd') or actor}|{time.strftime('%Y-%m-%d')}"
 
 
@@ -145,8 +155,38 @@ def historical_paths() -> list[Path]:
     return list(dict.fromkeys(path for path in paths if path is not None))
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def stale_index_paths(paths: list[Path]) -> list[Path]:
+    if not paths or not STATE_DB.exists():
+        return paths
+    try:
+        with sqlite3.connect(STATE_DB, timeout=5) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+            rows = conn.execute("SELECT path, sha256 FROM memory_docs").fetchall()
+    except (OSError, sqlite3.Error):
+        return paths
+    indexed = {str(Path(str(path)).resolve()): str(digest) for path, digest in rows}
+    stale: list[Path] = []
+    for path in paths:
+        try:
+            current = file_sha256(path)
+        except OSError:
+            continue
+        if indexed.get(str(path.resolve())) != current:
+            stale.append(path)
+    return stale
+
+
 def pending_paths() -> list[Path]:
-    return list(dict.fromkeys([*historical_paths(), *dirty_paths()]))
+    candidates = list(dict.fromkeys([*historical_paths(), *dirty_paths()]))
+    return stale_index_paths(candidates)
 
 
 def notify(message: str) -> None:
@@ -168,6 +208,7 @@ def run_closeout(payload: dict[str, object], actor: str, timeout: int) -> dict[s
         "stop-hook",
         "--session-id",
         session_key(payload, actor),
+        "--claimed-only",
         "--lock-timeout",
         "60",
     ]
@@ -186,6 +227,8 @@ def run_closeout(payload: dict[str, object], actor: str, timeout: int) -> dict[s
 
 def failure_reason(result: dict[str, Any]) -> str:
     parts = [str(result["error"])] if result.get("error") else []
+    if result.get("ownership_error"):
+        parts.append(str(result["ownership_error"]))
     findings = result.get("reconcile_findings")
     if isinstance(findings, list) and findings:
         parts.append(f"reconcile_findings={len(findings)}")
@@ -229,9 +272,24 @@ def main() -> int:
     args = parse_args()
     payload = read_payload()
     paths = pending_paths()
-    if args.auto_closeout and paths:
+    raw_session_id = session_key(payload, args.actor)
+    current_claims = active_claim_rows(raw_session_id, args.actor)
+    if args.auto_closeout and current_claims:
         result = run_closeout(payload, args.actor, args.timeout)
         return 0 if result.get("status") == "ok" else report_failure(args.protocol, result)
+    if args.auto_closeout and paths:
+        all_claimed_paths = {Path(row["path"]).resolve() for row in all_active_claim_rows()}
+        unclaimed = [path for path in paths if path.resolve() not in all_claimed_paths]
+        if unclaimed:
+            result = {
+                "status": "error",
+                "ownership_error": (
+                    f"{len(unclaimed)} changed memory file(s) are not claimed by any session; "
+                    f"run memoryctl --actor {args.actor} claim --file <path> for files owned by this session"
+                ),
+                "unclaimed_files": [str(path) for path in unclaimed],
+            }
+            return report_failure(args.protocol, result)
     if not args.auto_closeout and paths:
         state_mtime = STATE_DB.stat().st_mtime if STATE_DB.exists() else 0
         if historical_paths() or max(path.stat().st_mtime for path in paths) > state_mtime:

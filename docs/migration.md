@@ -11,11 +11,13 @@ Agent Memory Vault 使用平台中立命名：
 
 当前版本只接受上述新名称，不提供旧环境变量回退或转发包装。升级现有安装时，必须同步修改环境变量、Hook、定时任务和自定义脚本；升级完成后执行测试和 `doctor`，确认没有旧入口消费者。
 
+核心脚本应只从这个 Git 仓库维护，再用 `scripts/install_runtime.py` 安装到本机固定 Runtime。`runtime-manifest.json` 记录源码提交和每个核心文件 hash；私人 `agent-memory.toml`、模型、数据库和宿主适配器不会进入公开仓库。
+
 这份指南用于把一个已经在使用的私人 Agent 记忆系统，整理成可复用模板。
 
 ## 接入 Claude Code 而不复制 vault
 
-保留现有 Markdown、Git 基线、SQLite、Zvec、closeout 日志和 audit 调度器。新增一个薄的 `~/.claude/CLAUDE.md`，通过绝对路径导入 vault 的 `AGENTS.md`，再让 Claude 使用 `memoryctl --actor claude` 搜索和收尾。
+保留现有 Markdown、Git 基线、SQLite、Zvec、closeout 日志和 audit 调度器。新增一个薄的 `~/.claude/CLAUDE.md`，通过绝对路径导入 vault 的 `AGENTS.md`，再让 Claude 使用 `memoryctl --actor claude` 搜索、认领和收尾。
 
 关闭 Claude Code auto-memory，或明确把它限定为非正式草稿；不要把 auto-memory 目录重定向到正式 vault。旧文件缺少 `agent_scope` 时按 `shared` 处理，只有宿主特有 Agent case 才标 `codex` 或 `claude`。
 

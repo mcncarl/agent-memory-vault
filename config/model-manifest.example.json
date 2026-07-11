@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "model_id": "google/embeddinggemma-300m",
+  "revision": "pinned-hugging-face-commit",
+  "root": "/absolute/path/to/managed/model/snapshot",
+  "embedding_dim": 768,
+  "files": {
+    "config.json": {"size": 0, "sha256": "replace-after-download"},
+    "model.safetensors": {"size": 0, "sha256": "replace-after-download"},
+    "modules.json": {"size": 0, "sha256": "replace-after-download"},
+    "tokenizer.json": {"size": 0, "sha256": "replace-after-download"}
+  }
+}

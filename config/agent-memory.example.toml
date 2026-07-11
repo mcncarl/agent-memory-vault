@@ -1,5 +1,5 @@
-# Example config. The current scripts use environment variables by default.
-# You can keep this file as human-readable documentation for your setup.
+# Copy to <runtime>/config/agent-memory.toml after installing the runtime.
+# AGENT_MEMORY_* environment variables override matching values in this file.
 
 memory_root = "/path/to/your/agent-memory-vault"
 git_root = "/path/to/git-root-containing-the-vault"
@@ -9,6 +9,7 @@ audit_db = "~/.config/agent-memory/audit_decisions.sqlite"
 closeout_log = "~/.config/agent-memory/logs/closeout.jsonl"
 audit_run_log = "~/.config/agent-memory/logs/audit_runs.jsonl"
 audit_report = "~/.config/agent-memory/reports/latest-audit.json"
+invariants_file = "~/.config/agent-memory/config/system-invariants.json"
 python = "python3"
 
 user_id = "demo-user"
@@ -29,6 +30,11 @@ embedding_model = "google/embeddinggemma-300m"
 embedding_dim = 768
 embedding_device = "cpu"
 python = "python3"
+lock_path = "~/.config/agent-memory/locks/zvec.lock"
+require_local_model = false
+model_revision = ""
+model_manifest = "~/.config/agent-memory/models/embeddinggemma-300m/model-manifest.json"
+dependency_lock = "~/.config/agent-memory/requirements-vector.lock"
 run_vector_index_after_closeout = false
 
 [privacy]

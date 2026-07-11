@@ -3,7 +3,7 @@
 Agent Memory Vault can run without background automation. The recommended automated setup is layered:
 
 1. `closeout` piggyback: every important task-end closeout checks whether audit is due.
-2. Optional Stop hook: reminder mode is safest; shared Claude/Codex setups can opt into full closeout only when pending memory changes exist.
+2. Optional Stop hook: shared Claude/Codex setups run full closeout only for files claimed by the current session.
 3. Optional macOS `launchd` fallback: runs audit weekly even if no Agent session happens.
 
 Automation should only produce reminders, reports, logs, and local audit decisions. It should not directly rewrite Markdown facts.
@@ -40,10 +40,12 @@ Reminder mode:
 - Stamp each session or day so the same reminder is not repeated constantly.
 - Do not let the hook invent or rewrite memory facts.
 
-Automatic closeout mode is appropriate when the Agent has already written formal memory before stopping:
+Automatic closeout mode is appropriate when the Agent has already written and claimed formal memory before stopping:
 
-- Gate on dirty Markdown or Git history after `git_observed_through`.
-- Run complete closeout only when the gate is true; otherwise stay silent.
+- Claude must run `agent_memory_session_hook.py` from `SessionStart`. It writes the hook payload's real `session_id` to `CLAUDE_ENV_FILE`, so later Bash calls to `memoryctl claim` and the Stop payload use the same ownership key. It also clears an inherited `CODEX_THREAD_ID` inside Claude Bash commands.
+- After each formal write, run `memoryctl --actor codex|claude claim --file <path>`.
+- Gate on active claims for the current session. Dirty files claimed by another session stay untouched.
+- If dirty memory is not claimed by any session, block silent completion and ask the Agent to claim or resolve it.
 - Pass `--actor codex` or `--actor claude` so logs and commits remain attributable.
 - Claude Stop may return `decision: block` when closeout fails. Codex Stop can request continuation by exiting with code `2` and writing a non-empty continuation prompt to stderr.
 - Claude SessionEnd can be a short non-blocking fallback. Codex currently has no direct SessionEnd equivalent.
@@ -53,15 +55,43 @@ Automatic closeout mode is appropriate when the Agent has already written formal
 Pseudo-flow:
 
 ```text
+on Claude SessionStart:
+  export the payload session_id through CLAUDE_ENV_FILE
+
 on Stop:
   read hook input JSON
-  if memory vault has dirty Markdown files:
-    if state.sqlite is older than the changed files:
-      if this session was not reminded:
-        notify: run agent_memory_closeout.py --dry-run
+  resolve the host session id
+  if this session has active file claims:
+    run claimed-only closeout
+  else if every pending file belongs to another active session:
+    stay silent
+  else if unclaimed pending memory exists:
+    block and request claim/review
 
   run audit_autorun with a 7-day interval gate
 ```
+
+Claude SessionStart example:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /path/to/agent-memory-vault/scripts/agent_memory_session_hook.py --actor claude",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+This uses Claude Code's official `CLAUDE_ENV_FILE` mechanism. Merge it with existing `SessionStart` groups instead of replacing unrelated hooks.
 
 Automatic closeout example:
 
@@ -81,7 +111,7 @@ Some provider switchers and configuration managers regenerate `~/.claude/setting
 - If the manager keeps a live rollback copy, update that copy too; otherwise the next recovery can restore a hook-free file.
 - Keep unrelated hooks when merging.
 - After restarting or switching providers, verify that the live settings still contain `agent_memory_stop_hook.py`.
-- Use Claude debug logs or the `/hooks` browser to confirm that `Stop` and `SessionEnd` matchers are actually loaded. A file existing on disk is not sufficient evidence.
+- Use Claude debug logs or the `/hooks` browser to confirm that `SessionStart`, `Stop`, and `SessionEnd` are actually loaded. A file existing on disk is not sufficient evidence.
 
 For tools such as CC Switch, the practical source of truth may be the switcher's own database-backed common configuration. Treat the generated `~/.claude/settings.json` as an output of that manager.
 

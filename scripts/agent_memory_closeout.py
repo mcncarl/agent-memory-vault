@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_memory_env import env_value
+from agent_memory_claim import active_claim_rows, complete_claim_paths
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -779,7 +780,35 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         by_path[entry.path] = entry
     for entry in explicit:
         by_path[entry.path] = entry
-    all_entries = list(by_path.values())
+    discovered_entries = list(by_path.values())
+    claim_rows = active_claim_rows(args.session_id, args.actor) if args.claimed_only else []
+    claimed_paths = {Path(row["path"]).resolve() for row in claim_rows}
+    unclaimed_entries: list[GitEntry] = []
+    ownership_error = ""
+    if args.claimed_only:
+        if not args.session_id:
+            ownership_error = "claimed-only closeout requires --session-id"
+        elif not claimed_paths:
+            ownership_error = (
+                "no active memory claims for this session; claim each changed file with "
+                f"memoryctl --actor {args.actor} claim --file <path>"
+            )
+        unclaimed_entries = [entry for entry in discovered_entries if entry.path not in claimed_paths]
+        selected = {entry.path: entry for entry in discovered_entries if entry.path in claimed_paths}
+        for path in claimed_paths:
+            try:
+                repo_path = path.relative_to(REPO_ROOT).as_posix()
+            except ValueError:
+                continue
+            selected.setdefault(
+                path,
+                GitEntry(status="M" if path.exists() else "D", repo_path=repo_path, path=path),
+            )
+        all_entries = list(selected.values())
+        if unclaimed_entries:
+            info.append(f"excluded {len(unclaimed_entries)} files owned by other or unclaimed sessions")
+    else:
+        all_entries = discovered_entries
 
     deleted_entries = [entry for entry in all_entries if entry.is_deleted]
     for entry in deleted_entries:
@@ -799,14 +828,20 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
             "git reports dirty Agent Memory files; if some are historical, review dry-run output before committing"
         )
 
-    check_step = run_check(process_files, args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
+    check_step = run_check(process_files, args) if process_files and not ownership_error else {
+        "ok": not bool(ownership_error),
+        "skipped": True,
+        "detail": ownership_error or "no_changed_files",
+    }
     advisories = list(check_step.get("advisories", [])) if isinstance(check_step.get("advisories"), list) else []
-    reconcile_findings, reconcile_warnings = postwrite_reconcile(process_entries, args)
+    reconcile_findings, reconcile_warnings = (
+        postwrite_reconcile(process_entries, args) if not ownership_error else ([], [])
+    )
     warnings.extend(reconcile_warnings)
-    index_step = run_index(args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
-    zvec_step = run_zvec(process_files, args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
-    agent_step = run_agent_evolution(process_files, args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
-    audit_step = run_audit_autorun(args)
+    index_step = run_index(args) if process_files and not ownership_error else {"ok": not bool(ownership_error), "skipped": True, "detail": ownership_error or "no_changed_files"}
+    zvec_step = run_zvec(process_files, args) if process_files and not ownership_error else {"ok": not bool(ownership_error), "skipped": True, "detail": ownership_error or "no_changed_files"}
+    agent_step = run_agent_evolution(process_files, args) if process_files and not ownership_error else {"ok": not bool(ownership_error), "skipped": True, "detail": ownership_error or "no_changed_files"}
+    audit_step = run_audit_autorun(args) if not ownership_error else {"ok": False, "skipped": True, "detail": ownership_error}
     audit_payload = audit_step.get("audit_payload") if isinstance(audit_step.get("audit_payload"), dict) else {}
     if audit_payload:
         audit_status = str(audit_payload.get("status", ""))
@@ -824,7 +859,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         info.append(f"audit autorun failed: {str(audit_step.get('stderr', '')).strip()[:300]}")
 
     blocking_reconcile = bool(reconcile_findings)
-    step_failed = not all(
+    step_failed = bool(ownership_error) or not all(
         bool(step.get("ok"))
         for step in (check_step, index_step, zvec_step, agent_step)
     )
@@ -846,11 +881,19 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         if not commit_step.get("ok"):
             status = "error"
 
+    claim_step: dict[str, Any] = {"ok": True, "skipped": True, "detail": "ownership_not_enabled"}
+    if args.claimed_only:
+        claim_step = {"ok": True, "skipped": True, "detail": "claims_retained"}
+        if status == "ok" and not args.dry_run and commit_step.get("ok"):
+            completed = complete_claim_paths(args.session_id, args.actor, process_files)
+            claim_step = {"ok": True, "skipped": False, "detail": f"completed={completed}"}
+
     git_head_after, after_warnings = current_git_head()
     warnings.extend(after_warnings)
     dirty_paths = {entry.path for entry in git_entries}
+    unclaimed_history = [entry for entry in history_entries if entry.path in {item.path for item in unclaimed_entries}]
     can_advance_baseline = (
-        not step_failed and not blocking_reconcile and not deleted_entries and bool(git_head_before)
+        not step_failed and not blocking_reconcile and not deleted_entries and not unclaimed_history and bool(git_head_before)
         and (not dirty_paths or bool(commit_step.get("commit")) or commit_step.get("detail") == "nothing_staged")
     )
     would_observe_through = (
@@ -865,6 +908,8 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         "actor": args.actor,
         "trigger": args.trigger,
         "session_hash": session_hash(args.session_id),
+        "ownership_mode": "claimed_only" if args.claimed_only else "global",
+        "ownership_error": ownership_error,
         "cwd": str(Path.cwd()),
         "mode": "closeout",
         "git_previous_observed_head": previous_observed_head,
@@ -873,6 +918,8 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         "git_observed_through": git_observed_through,
         "git_would_observe_through": would_observe_through,
         "changed_files": [entry.repo_path for entry in all_entries],
+        "claimed_files": sorted(row["rel_path"] for row in claim_rows),
+        "unclaimed_files": sorted(entry.repo_path for entry in unclaimed_entries),
         "processed_files": [relative_to_vault(path) for path in process_files],
         "deleted_files_skipped": [entry.repo_path for entry in deleted_entries],
         "reconcile_findings": reconcile_findings,
@@ -886,6 +933,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
             "agent_evolution": short_step(agent_step),
             "audit": short_step(audit_step),
             "commit": short_step(commit_step),
+            "claims": short_step(claim_step),
         },
         "commit": commit_step.get("commit", "skipped"),
         "status": status,
@@ -948,6 +996,11 @@ def parse_args() -> argparse.Namespace:
         help="How this closeout run was triggered.",
     )
     parser.add_argument("--session-id", default="", help="Optional session id; only a one-way hash is logged.")
+    parser.add_argument(
+        "--claimed-only",
+        action="store_true",
+        help="Process only files actively claimed by this actor and session.",
+    )
     parser.add_argument("--skip-zvec", action="store_true", help="Skip Zvec refresh.")
     parser.add_argument("--no-zvec", action="store_true", help="Skip Zvec during prewrite/postwrite reconcile search.")
     parser.add_argument("--zvec-timeout", type=int, default=240, help="Seconds before Zvec refresh times out.")

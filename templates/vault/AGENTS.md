@@ -38,6 +38,14 @@ python3 scripts/memoryctl --actor <codex|claude> prewrite "准备写入的记忆
 - `MERGE_REQUIRED`：疑似重复或冲突，需要人工合并。
 - `ASK_USER`：涉及敏感、删除、费用、账号、凭证或不确定判断时先问用户。
 
+每次新建或修改正式记忆后，立即把文件认领到当前 Agent 会话：
+
+```bash
+python3 scripts/memoryctl --actor <codex|claude> claim --file "/absolute/path/to/memory.md"
+```
+
+Codex 会自动使用 `CODEX_THREAD_ID`；Claude Code 必须通过 `SessionStart` 运行 `agent_memory_session_hook.py --actor claude`，把官方 Hook payload 的真实 `session_id` 写入 `CLAUDE_ENV_FILE`，供后续 Bash 命令使用。Stop Hook 只处理当前会话认领的文件，其他会话的脏文件会明确排除。
+
 重要任务结束前执行 memory closeout：
 
 ```bash
@@ -45,7 +53,7 @@ python3 scripts/memoryctl --actor <codex|claude> closeout --dry-run
 python3 scripts/memoryctl --actor <codex|claude> closeout
 ```
 
-closeout 会自动发现记忆库变更文件，执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新、audit 捎带触发、closeout 日志写入，并只提交本轮处理过的记忆文件。
+在 Agent 会话内，`memoryctl closeout` 会按当前会话的认领账本执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新、audit 捎带触发、closeout 日志写入，并只提交本会话认领的文件。只有人工维护时才使用 `--global` 做全库收尾。
 
 如果 closeout 输出 `MERGE_REQUIRED`、`ASK_USER`、删除文件状态、疑似历史脏变更，先停下让用户确认。
 

@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+from agent_memory_env import env_value
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -14,11 +17,25 @@ COMMANDS = {
     "closeout": SCRIPT_ROOT / "agent_memory_closeout.py",
     "audit": SCRIPT_ROOT / "agent_memory_audit.py",
     "audit-autorun": SCRIPT_ROOT / "agent_memory_audit_autorun.py",
+    "claim": SCRIPT_ROOT / "agent_memory_claim.py",
+    "claims": SCRIPT_ROOT / "agent_memory_claim.py",
     "doctor": SCRIPT_ROOT / "agent_memory_doctor.py",
     "index": SCRIPT_ROOT / "agent_memory_index.py",
     "zvec": SCRIPT_ROOT / "agent_memory_zvec_index.py",
     "check": SCRIPT_ROOT / "agent_memory_check.py",
 }
+
+
+def host_session_id(actor: str) -> str:
+    keys = {
+        "codex": ("AGENT_MEMORY_SESSION_ID", "CODEX_THREAD_ID"),
+        "claude": ("AGENT_MEMORY_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"),
+    }.get(actor, ("AGENT_MEMORY_SESSION_ID",))
+    for key in keys:
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,15 +45,32 @@ def parse_args() -> argparse.Namespace:
         choices=("codex", "claude", "human", "migration", "test"),
         default=os.environ.get("MEMORY_ACTOR", "codex"),
     )
-    parser.add_argument("command", choices=(*COMMANDS.keys(), "prewrite"))
+    parser.add_argument("command", choices=(*COMMANDS.keys(), "prewrite", "version"))
     parser.add_argument("args", nargs=argparse.REMAINDER)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.command == "version":
+        config_root = Path(os.path.expandvars(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))).expanduser()
+        manifest_path = config_root / "config" / "runtime-manifest.json"
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {"status": "unmanaged", "manifest": str(manifest_path)}
+        if "--json" in args.args:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(f"agent-memory-runtime={payload.get('source_commit', payload.get('status', 'unknown'))}")
+            print(f"manifest={manifest_path}")
+        return 0
+
     command_name = "closeout" if args.command == "prewrite" else args.command
     target = COMMANDS[command_name]
+    if not target.exists():
+        print(f"missing command target: {target}", file=sys.stderr)
+        return 2
     forwarded = list(args.args)
     if forwarded and forwarded[0] == "--":
         forwarded = forwarded[1:]
@@ -45,7 +79,28 @@ def main() -> int:
             print("prewrite requires a memory summary", file=sys.stderr)
             return 2
         forwarded = ["--prewrite", forwarded[0], *forwarded[1:]]
+    elif args.command in {"claim", "claims"}:
+        action = "claim" if args.command == "claim" else "list"
+        global_options: list[str] = []
+        action_options: list[str] = []
+        index = 0
+        while index < len(forwarded):
+            item = forwarded[index]
+            if item == "--json":
+                global_options.append(item)
+            elif item == "--session-id" and index + 1 < len(forwarded):
+                global_options.extend([item, forwarded[index + 1]])
+                index += 1
+            else:
+                action_options.append(item)
+            index += 1
+        forwarded = ["--actor", args.actor, *global_options, action, *action_options]
     if command_name == "closeout":
+        global_mode = "--global" in forwarded
+        forwarded = [item for item in forwarded if item != "--global"]
+        current_session = host_session_id(args.actor)
+        if not global_mode and current_session and "--session-id" not in forwarded:
+            forwarded.extend(["--session-id", current_session, "--claimed-only"])
         forwarded.extend(["--actor", args.actor])
         if args.command == "closeout" and not any(
             flag in forwarded for flag in ("--commit", "--dry-run", "--prewrite")

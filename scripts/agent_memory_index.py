@@ -38,6 +38,7 @@ class MemoryDoc:
     app_id: str
     user_id: str
     agent_id: str
+    agent_scope: str
     session_id: str
     status: str
     sensitivity: str
@@ -157,14 +158,29 @@ def extract_summary(text: str) -> str:
     return compact_lines(body[:12], 500)
 
 
-def extract_verified_at(text: str, meta: dict[str, object], mtime: float) -> tuple[str, str]:
+def extract_verified_at(
+    text: str,
+    meta: dict[str, object],
+    memory_type: str,
+    status: str,
+) -> tuple[str, str]:
     frontmatter_value = as_text(meta.get("verified_at"))
     if frontmatter_value:
         return frontmatter_value, "frontmatter"
+    verification_mode = as_text(meta.get("verification_mode")).lower()
+    if verification_mode in {"structural", "snapshot", "needs_review"}:
+        return "", verification_mode
     match = re.search(r"最近验证[:：]\s*(\d{4}-\d{2}-\d{2})", text)
     if match:
         return match.group(1), "summary"
-    return dt.datetime.fromtimestamp(mtime).date().isoformat(), "mtime_fallback"
+    summary_dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", extract_summary(text))
+    if summary_dates:
+        return max(summary_dates), "document_date"
+    if status in {"archived", "outdated", "deprecated", "stale"}:
+        return "", "snapshot"
+    if memory_type in {"routing", "directory_index", "template"}:
+        return "", "structural"
+    return "", "needs_review"
 
 
 def infer_review_after_days(path: Path, title: str, memory_type: str, status: str, meta: dict[str, object]) -> int:
@@ -260,7 +276,7 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
     rel_path = path.relative_to(VAULT_ROOT).as_posix()
     title = title_from_markdown(text, path)
     memory_type, track, project_id, status = infer_from_path(path, meta)
-    verified_at, verified_at_source = extract_verified_at(text, meta, stat.st_mtime)
+    verified_at, verified_at_source = extract_verified_at(text, meta, memory_type, status)
     summary = extract_summary(text)
     next_hint = compact_lines(section_lines(text, ["下次优先看"]), 500)
     stale_info = compact_lines(section_lines(text, ["已过时信息"]), 500)
@@ -278,7 +294,10 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
             project_id=project_id,
             app_id=as_text(meta.get("app_id"), DEFAULT_APP_ID),
             user_id=as_text(meta.get("user_id"), DEFAULT_USER_ID),
-            agent_id=as_text(meta.get("agent_scope"), as_text(meta.get("agent_id"), DEFAULT_AGENT_ID)),
+            agent_id=as_text(meta.get("agent_id"), DEFAULT_AGENT_ID),
+            agent_scope=as_text(meta.get("agent_scope"), "shared")
+            if as_text(meta.get("agent_scope"), "shared") in {"shared", "codex", "claude"}
+            else "shared",
             session_id=as_text(meta.get("session_id")),
             status=status,
             sensitivity=as_text(meta.get("sensitivity"), "private" if track == "user" else "normal"),
@@ -336,6 +355,7 @@ def init_db(conn: sqlite3.Connection) -> None:
           app_id TEXT DEFAULT 'codex',
           user_id TEXT DEFAULT 'demo-user',
           agent_id TEXT DEFAULT 'codex',
+          agent_scope TEXT DEFAULT 'shared',
           session_id TEXT DEFAULT '',
           status TEXT DEFAULT 'active',
           sensitivity TEXT DEFAULT 'normal',
@@ -387,20 +407,40 @@ def init_db(conn: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS memory_session_claims (
+          session_hash TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          path TEXT NOT NULL,
+          rel_path TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active',
+          claimed_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          completed_at TEXT,
+          PRIMARY KEY (session_hash, path)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_memory_docs_track ON memory_docs(track);
         CREATE INDEX IF NOT EXISTS idx_memory_docs_type ON memory_docs(memory_type);
         CREATE INDEX IF NOT EXISTS idx_memory_docs_project ON memory_docs(project_id);
         CREATE INDEX IF NOT EXISTS idx_memory_docs_user_agent_app ON memory_docs(user_id, agent_id, app_id);
-        CREATE INDEX IF NOT EXISTS idx_memory_docs_session ON memory_docs(session_id);
         """
     )
     ensure_column(conn, "memory_docs", "verified_at_source", "TEXT DEFAULT 'mtime_fallback'")
     ensure_column(conn, "memory_docs", "review_after_days", "INTEGER DEFAULT 180")
+    ensure_column(conn, "memory_docs", "agent_scope", "TEXT DEFAULT 'shared'")
+    ensure_column(conn, "memory_docs", "session_id", "TEXT DEFAULT ''")
     ensure_column(conn, "memory_search_log", "query_sha256", "TEXT")
     ensure_column(conn, "memory_search_log", "query_length", "INTEGER")
     ensure_column(conn, "memory_search_log", "sources", "TEXT")
     ensure_column(conn, "memory_search_log", "duration_ms", "INTEGER")
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "3"))
+    # Older databases do not have these columns until the migration above runs.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_docs_agent_scope ON memory_docs(agent_scope)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_docs_session ON memory_docs(session_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memory_session_claims_active "
+        "ON memory_session_claims(status, actor, session_hash)"
+    )
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "4"))
     conn.commit()
 
 
@@ -415,11 +455,11 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
         """
         INSERT INTO memory_docs (
           path, rel_path, sha256, title, memory_type, track, project_id, app_id,
-          user_id, agent_id, session_id, status, sensitivity, verified_at, verified_at_source,
+          user_id, agent_id, agent_scope, session_id, status, sensitivity, verified_at, verified_at_source,
           review_after_days, mtime, size_bytes, line_count, summary, next_hint, stale_info, has_open_loop,
           open_loop_count, indexed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
           rel_path=excluded.rel_path,
           sha256=excluded.sha256,
@@ -430,6 +470,7 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
           app_id=excluded.app_id,
           user_id=excluded.user_id,
           agent_id=excluded.agent_id,
+          agent_scope=excluded.agent_scope,
           session_id=excluded.session_id,
           status=excluded.status,
           sensitivity=excluded.sensitivity,
@@ -457,6 +498,7 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
             doc.app_id,
             doc.user_id,
             doc.agent_id,
+            doc.agent_scope,
             doc.session_id,
             doc.status,
             doc.sensitivity,
@@ -803,6 +845,54 @@ def print_report(conn: sqlite3.Connection) -> None:
         print(f"type[{memory_type}]={count}")
 
 
+def generated_index_candidate(conn: sqlite3.Connection) -> str:
+    """Generate a deterministic navigation view from indexed Markdown metadata."""
+    init_db(conn)
+    rows = conn.execute(
+        """
+        SELECT rel_path, title, memory_type, track, project_id, status, summary
+        FROM memory_docs
+        ORDER BY
+          CASE track
+            WHEN 'user' THEN 1
+            WHEN 'project' THEN 2
+            WHEN 'workflow' THEN 3
+            WHEN 'decision' THEN 4
+            WHEN 'agent' THEN 5
+            WHEN 'routing' THEN 6
+            ELSE 9
+          END,
+          rel_path
+        """
+    ).fetchall()
+    lines = [
+        "# Agent Memory INDEX candidate",
+        "",
+        f"Generated at: {utc_now()}",
+        "",
+        "This navigation candidate is derived from Markdown/frontmatter through SQLite. Review the diff before replacing a curated INDEX.md.",
+    ]
+    current_track = ""
+    for row in rows:
+        rel_path, title, memory_type, track, project_id, status, summary = row
+        normalized_track = track or "uncategorized"
+        if normalized_track != current_track:
+            current_track = normalized_track
+            lines.extend(["", f"## {current_track}", ""])
+        compact_summary = (summary or "").replace("\n", " ").strip()
+        if len(compact_summary) > 120:
+            compact_summary = compact_summary[:117] + "..."
+        metadata = str(memory_type)
+        if project_id:
+            metadata += f"; {project_id}"
+        if status and status != "active":
+            metadata += f"; status={status}"
+        suffix = f"; {compact_summary}" if compact_summary else ""
+        lines.append(f"- `{rel_path}`: {title} ({metadata}){suffix}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build and query the full Agent Memory SQLite index.")
     parser.add_argument("--init", action="store_true", help="Create or migrate the index schema.")
@@ -820,12 +910,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session-id", default="", help="Filter by session_id.")
     parser.add_argument("--status", default="", help="Filter by status.")
     parser.add_argument("--has-open-loop", action="store_true", help="Only return docs with open loops.")
+    parser.add_argument("--gen-index-candidate", action="store_true", help="Generate an INDEX.md candidate from SQLite.")
+    parser.add_argument("--output", default="", help="Optional output path for --gen-index-candidate.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if not (args.init or args.scan or args.report or args.search):
+    if not (args.init or args.scan or args.report or args.search or args.gen_index_candidate):
         args.init = True
         args.scan = True
         args.report = True
@@ -852,6 +944,14 @@ def main() -> int:
             )
         if args.report or args.scan:
             print_report(conn)
+        if args.gen_index_candidate:
+            candidate = generated_index_candidate(conn)
+            if args.output:
+                output_path = Path(args.output).expanduser().resolve()
+                output_path.write_text(candidate, encoding="utf-8")
+                print(f"index_candidate={output_path}")
+            else:
+                print(candidate)
     return 0
 
 

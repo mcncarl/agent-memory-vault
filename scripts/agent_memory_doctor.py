@@ -7,22 +7,41 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from agent_memory_env import env_value
+from agent_memory_env import env_value, load_config
 
 
-VERSION = "2.0"
+VERSION = "2.1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VAULT_ROOT = Path(os.path.expandvars(env_value("ROOT", str(REPO_ROOT / "templates" / "vault")))).expanduser().resolve()
+GIT_ROOT = Path(os.path.expandvars(env_value("GIT_ROOT", str(REPO_ROOT)))).expanduser().resolve()
 CONFIG_ROOT = Path(os.path.expandvars(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))).expanduser().resolve()
 STATE_DB = Path(os.path.expandvars(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite")))).expanduser().resolve()
 SCRIPT_ROOT = REPO_ROOT / "scripts"
-AUDIT_LOG = CONFIG_ROOT / "logs" / "audit_runs.jsonl"
-CLOSEOUT_LOG = CONFIG_ROOT / "logs" / "closeout.jsonl"
+AUDIT_LOG = Path(os.path.expandvars(env_value("AUDIT_RUN_LOG", str(CONFIG_ROOT / "logs" / "audit_runs.jsonl")))).expanduser().resolve()
+CLOSEOUT_LOG = Path(os.path.expandvars(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))).expanduser().resolve()
+RUNTIME_MANIFEST = CONFIG_ROOT / "config" / "runtime-manifest.json"
+HOST_CONFIG = load_config().get("host", {})
+if not isinstance(HOST_CONFIG, dict):
+    HOST_CONFIG = {}
+SEMANTIC_CONFIG = load_config().get("semantic_retrieval", {})
+if not isinstance(SEMANTIC_CONFIG, dict):
+    SEMANTIC_CONFIG = {}
+SEMANTIC_ENABLED = bool(SEMANTIC_CONFIG.get("enabled", False))
+ZVEC_PYTHON = Path(
+    os.path.expandvars(env_value("ZVEC_PYTHON", str(CONFIG_ROOT / ".venv" / "bin" / "python")))
+).expanduser()
+EMBEDDING_MODEL = Path(os.path.expandvars(env_value("EMBEDDING_MODEL", ""))).expanduser()
+MODEL_MANIFEST = Path(os.path.expandvars(env_value("MODEL_MANIFEST", str(CONFIG_ROOT / "models" / "embeddinggemma-300m" / "model-manifest.json")))).expanduser().resolve()
+MODEL_REVISION = env_value("MODEL_REVISION", "")
+DEPENDENCY_LOCK = Path(os.path.expandvars(env_value("DEPENDENCY_LOCK", str(CONFIG_ROOT / "requirements-vector.lock")))).expanduser().resolve()
+REQUIRE_LOCAL_MODEL = env_value("REQUIRE_LOCAL_MODEL", "false").strip().lower() in {"1", "true", "yes", "on"}
 EXCLUDED_VECTOR_TYPES = {"routing", "directory_index", "template", "agent_case_candidate", "skill_candidate"}
 EXCLUDED_VECTOR_STATUS = {"archived", "deleted", "obsolete", "outdated", "deprecated", "stale"}
 
@@ -31,9 +50,9 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
 
-def run(command: list[str], timeout: int = 300) -> dict[str, Any]:
+def run(command: list[str], timeout: int = 300, env: dict[str, str] | None = None) -> dict[str, Any]:
     try:
-        completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
+        completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout, env=env, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "returncode": 127, "detail": type(exc).__name__}
     return {"ok": completed.returncode == 0, "returncode": completed.returncode, "stdout": completed.stdout, "detail": (completed.stderr or completed.stdout).strip()[:500]}
@@ -49,6 +68,118 @@ def file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def offline_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        env.pop(key, None)
+    env["HF_HUB_OFFLINE"] = "1"
+    env["TRANSFORMERS_OFFLINE"] = "1"
+    return env
+
+
+def verify_model_manifest() -> tuple[bool, dict[str, Any]]:
+    manifest = read_json_object(MODEL_MANIFEST)
+    root = Path(os.path.expandvars(str(manifest.get("root", "")))).expanduser().resolve() if manifest else Path()
+    files = manifest.get("files") if isinstance(manifest, dict) else None
+    missing: list[str] = []
+    size_mismatch: list[str] = []
+    hash_mismatch: list[str] = []
+    symlinks: list[str] = []
+    if not manifest or not root.is_dir() or not isinstance(files, dict):
+        return False, {"manifest": str(MODEL_MANIFEST), "root": str(root), "error": "manifest_or_root_missing"}
+    for rel_path, expected in files.items():
+        path = root / str(rel_path)
+        if path.is_symlink():
+            symlinks.append(str(rel_path))
+        if not path.is_file():
+            missing.append(str(rel_path))
+            continue
+        expected_size = expected.get("size") if isinstance(expected, dict) else None
+        expected_hash = expected.get("sha256") if isinstance(expected, dict) else None
+        if expected_size is not None and path.stat().st_size != int(expected_size):
+            size_mismatch.append(str(rel_path))
+            continue
+        if expected_hash and file_sha256(path) != str(expected_hash):
+            hash_mismatch.append(str(rel_path))
+    revision = str(manifest.get("revision", ""))
+    revision_ok = not MODEL_REVISION or MODEL_REVISION == revision
+    ok = not missing and not size_mismatch and not hash_mismatch and not symlinks and revision_ok
+    return ok, {
+        "manifest": str(MODEL_MANIFEST),
+        "root": str(root),
+        "revision": revision,
+        "expected_revision": MODEL_REVISION,
+        "checked_files": len(files),
+        "missing": missing,
+        "size_mismatch": size_mismatch,
+        "hash_mismatch": hash_mismatch,
+        "symlinks": symlinks,
+    }
+
+
+def verify_dependency_lock() -> tuple[bool, dict[str, Any]]:
+    if not DEPENDENCY_LOCK.is_file() or not ZVEC_PYTHON.is_file():
+        return False, {"lock": str(DEPENDENCY_LOCK), "python": str(ZVEC_PYTHON), "error": "lock_or_python_missing"}
+    code = """
+import importlib.metadata as metadata
+import json
+import re
+import sys
+expected = {}
+for raw in open(sys.argv[1], encoding='utf-8'):
+    line = raw.strip()
+    if not line or line.startswith('#') or '==' not in line:
+        continue
+    name, version = line.split('==', 1)
+    expected[name] = version
+missing = []
+mismatched = []
+for name, version in expected.items():
+    try:
+        actual = metadata.version(name)
+    except metadata.PackageNotFoundError:
+        missing.append(name)
+        continue
+    if actual != version:
+        mismatched.append({'name': name, 'expected': version, 'actual': actual})
+print(json.dumps({'expected': len(expected), 'missing': missing, 'mismatched': mismatched}))
+raise SystemExit(0 if not missing and not mismatched else 2)
+"""
+    result = run([str(ZVEC_PYTHON), "-c", code, str(DEPENDENCY_LOCK)], 60, offline_env())
+    try:
+        detail = json.loads(str(result.get("stdout", "")))
+    except json.JSONDecodeError:
+        detail = {"error": result.get("detail", "invalid_dependency_check_output")}
+    detail.update({"lock": str(DEPENDENCY_LOCK), "python": str(ZVEC_PYTHON)})
+    return bool(result["ok"]), detail
+
+
+def offline_semantic_probe() -> tuple[bool, dict[str, Any]]:
+    command = [
+        str(ZVEC_PYTHON),
+        str(SCRIPT_ROOT / "agent_memory_zvec_index.py"),
+        "--search",
+        "Agent Memory offline healthcheck",
+        "--limit",
+        "1",
+        "--json",
+    ]
+    result = run(command, 240, offline_env())
+    try:
+        payload = json.loads(str(result.get("stdout", "")))
+    except json.JSONDecodeError:
+        return False, {"error": result.get("detail", "non_json_probe"), "returncode": result.get("returncode")}
+    rows = payload.get("results") if isinstance(payload, dict) else None
+    ok = bool(result["ok"] and isinstance(rows, list) and rows)
+    return ok, {
+        "returncode": result.get("returncode"),
+        "result_count": len(rows) if isinstance(rows, list) else 0,
+        "model": str(EMBEDDING_MODEL),
+        "offline": True,
+        "error": payload.get("error", "") if isinstance(payload, dict) else "",
+    }
 
 
 def parse_time(value: str) -> dt.datetime | None:
@@ -73,6 +204,68 @@ def latest_jsonl(path: Path, predicate: Any = None) -> dict[str, Any] | None:
         if isinstance(item, dict) and (not predicate or predicate(item)):
             latest = item
     return latest
+
+
+def read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def configured_path(name: str) -> Path | None:
+    raw = HOST_CONFIG.get(name)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return Path(os.path.expandvars(raw)).expanduser().resolve()
+
+
+def local_endpoint_reachable(raw_url: str) -> tuple[bool, dict[str, Any]]:
+    parsed = urlparse(raw_url)
+    host = parsed.hostname or ""
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return True, {"url_type": "remote_or_unset"}
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True, {"host": host, "port": port, "listening": True}
+    except OSError:
+        return False, {"host": host, "port": port, "listening": False}
+
+
+def cc_switch_hooks_match(db_path: Path, expected_hooks: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    if not db_path.exists():
+        return True, {"installed": False}
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.execute("PRAGMA busy_timeout=5000")
+        common = conn.execute("SELECT value FROM settings WHERE key = 'common_config_claude'").fetchone()
+        backups = conn.execute("SELECT original_config FROM proxy_live_backup WHERE app_type = 'claude'").fetchall()
+        conn.close()
+        common_payload = json.loads(str(common[0])) if common else {}
+        backup_payloads = [json.loads(str(row[0])) for row in backups]
+    except (sqlite3.Error, json.JSONDecodeError, TypeError, ValueError) as exc:
+        return False, {"installed": True, "error": type(exc).__name__}
+    common_ok = isinstance(common_payload, dict) and common_payload.get("hooks") == expected_hooks
+    backups_ok = all(isinstance(payload, dict) and payload.get("hooks") == expected_hooks for payload in backup_payloads)
+    return common_ok and backups_ok, {
+        "installed": True,
+        "common_config_ok": common_ok,
+        "backup_count": len(backup_payloads),
+        "backups_ok": backups_ok,
+    }
+
+
+def git_remote_has_credential() -> bool:
+    result = run(["git", "-C", str(GIT_ROOT), "config", "--get-regexp", r"^remote\..*\.url$"], 15)
+    if result["returncode"] not in {0, 1}:
+        return False
+    for line in str(result.get("stdout", "")).splitlines():
+        _, _, url = line.partition(" ")
+        if re.search(r"https?://[^/@\s]+:[^/@\s]+@", url) or re.search(r"gh[pousr]_[A-Za-z0-9]{20,}", url):
+            return True
+    return False
 
 
 def eligible_vector(row: sqlite3.Row) -> bool:
@@ -100,9 +293,66 @@ def repair_derived() -> list[dict[str, Any]]:
 
 def collect_checks() -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
-    required = ["agent_memory_index.py", "agent_memory_search.py", "agent_memory_closeout.py", "agent_memory_check.py", "agent_memory_audit.py", "agent_memory_audit_autorun.py", "agent_memory_zvec_index.py", "agent_memory_doctor.py", "agent_memory_stop_hook.py"]
+    required = [
+        "agent_memory_index.py",
+        "agent_memory_search.py",
+        "agent_memory_closeout.py",
+        "agent_memory_check.py",
+        "agent_memory_audit.py",
+        "agent_memory_audit_autorun.py",
+        "agent_memory_zvec_index.py",
+        "agent_memory_doctor.py",
+        "agent_memory_session_hook.py",
+        "agent_memory_stop_hook.py",
+        "agent_memory_env.py",
+        "install_runtime.py",
+        "memoryctl",
+    ]
     missing = [name for name in required if not (SCRIPT_ROOT / name).is_file()]
     add(checks, "runtime_files", "fail" if missing else "pass", "Runtime files complete." if not missing else "Runtime files missing.", {"missing": missing})
+    if REPO_ROOT.resolve() == CONFIG_ROOT.resolve():
+        manifest = read_json_object(RUNTIME_MANIFEST)
+        expected = manifest.get("files") if isinstance(manifest, dict) else None
+        manifest_missing: list[str] = []
+        manifest_mismatch: list[str] = []
+        support_missing: list[str] = []
+        support_mismatch: list[str] = []
+        if isinstance(expected, dict):
+            for name, digest in expected.items():
+                path = SCRIPT_ROOT / str(name)
+                if not path.is_file():
+                    manifest_missing.append(str(name))
+                elif file_sha256(path) != str(digest):
+                    manifest_mismatch.append(str(name))
+        support_expected = manifest.get("support_files", {}) if isinstance(manifest, dict) else {}
+        if isinstance(support_expected, dict):
+            for name, digest in support_expected.items():
+                path = CONFIG_ROOT / str(name)
+                if not path.is_file():
+                    support_missing.append(str(name))
+                elif file_sha256(path) != str(digest):
+                    support_mismatch.append(str(name))
+        manifest_ok = (
+            isinstance(expected, dict)
+            and not manifest_missing
+            and not manifest_mismatch
+            and not support_missing
+            and not support_mismatch
+        )
+        add(
+            checks,
+            "runtime_manifest",
+            "pass" if manifest_ok else "fail",
+            "Installed runtime matches its manifest." if manifest_ok else "Installed runtime drifted from its manifest.",
+            {
+                "source_commit": manifest.get("source_commit", "") if manifest else "",
+                "source_dirty": bool(manifest.get("source_dirty")) if manifest else False,
+                "missing": manifest_missing,
+                "mismatched": manifest_mismatch,
+                "support_missing": support_missing,
+                "support_mismatched": support_mismatch,
+            },
+        )
     if not STATE_DB.exists():
         add(checks, "state_db", "fail", "State database is missing.", {"path": str(STATE_DB)})
         return checks
@@ -127,21 +377,95 @@ def collect_checks() -> list[dict[str, Any]]:
     add(checks, "index_navigation_parity", "pass" if refs == actual_rel else "warn", f"INDEX.md lists {len(refs)}/{len(actual_rel)} docs.", {"unlisted": sorted(actual_rel - refs), "broken": sorted(refs - actual_rel)})
     tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if {"memory_vector_chunks", "memory_vector_index_state"}.issubset(tables):
-        eligible = {str(row["path"]): str(row["rel_path"]) for row in docs if eligible_vector(row)}
-        states = conn.execute("SELECT path, rel_path, status FROM memory_vector_index_state").fetchall()
+        eligible = {
+            str(row["path"]): {"rel_path": str(row["rel_path"]), "sha256": str(row["sha256"])}
+            for row in docs
+            if eligible_vector(row)
+        }
+        states = conn.execute(
+            "SELECT path, rel_path, doc_sha256, status, last_error FROM memory_vector_index_state"
+        ).fetchall()
         if not states:
             add(checks, "zvec_parity", "warn", "Optional vector index is not initialized.")
         else:
             indexed = {str(row["path"]) for row in states if row["status"] == "indexed"}
-            vector_missing = sorted(eligible[path] for path in eligible.keys() - indexed)
+            vector_missing = sorted(eligible[path]["rel_path"] for path in eligible.keys() - indexed)
             vector_stale = sorted(str(row["rel_path"] or row["path"]) for row in states if str(row["path"]) not in eligible)
-            add(checks, "zvec_parity", "pass" if not (vector_missing or vector_stale) else "fail", f"Zvec covers {len(indexed & eligible.keys())}/{len(eligible)} docs.", {"missing": vector_missing, "stale": vector_stale})
+            vector_hash_mismatch = sorted(
+                eligible[str(row["path"])]["rel_path"]
+                for row in states
+                if str(row["path"]) in eligible
+                and str(row["status"]) == "indexed"
+                and str(row["doc_sha256"] or "") != eligible[str(row["path"])]["sha256"]
+            )
+            vector_errors = sorted(
+                str(row["rel_path"] or row["path"])
+                for row in states
+                if str(row["status"]) == "error"
+            )
+            vector_ok = not (vector_missing or vector_stale or vector_hash_mismatch or vector_errors)
+            add(
+                checks,
+                "zvec_parity",
+                "pass" if vector_ok else "fail",
+                f"Zvec covers {len(indexed & eligible.keys())}/{len(eligible)} docs.",
+                {
+                    "missing": vector_missing,
+                    "stale": vector_stale,
+                    "hash_mismatch": vector_hash_mismatch,
+                    "errors": vector_errors,
+                },
+            )
     else:
         add(checks, "zvec_parity", "warn", "Optional vector index is not initialized.")
+    if SEMANTIC_ENABLED:
+        local_model_ok = (not REQUIRE_LOCAL_MODEL) or (EMBEDDING_MODEL.is_absolute() and EMBEDDING_MODEL.is_dir())
+        add(
+            checks,
+            "semantic_local_model",
+            "pass" if local_model_ok else "fail",
+            "Semantic retrieval is pinned to a managed local model." if local_model_ok else "Semantic retrieval is not backed by the required local model directory.",
+            {"model": str(EMBEDDING_MODEL), "require_local_model": REQUIRE_LOCAL_MODEL},
+        )
+        manifest_ok, manifest_detail = verify_model_manifest()
+        add(
+            checks,
+            "semantic_model_integrity",
+            "pass" if manifest_ok else "fail",
+            "Managed model files match the pinned manifest." if manifest_ok else "Managed model files drifted from the pinned manifest.",
+            manifest_detail,
+        )
+        dependency_ok, dependency_detail = verify_dependency_lock()
+        add(
+            checks,
+            "semantic_dependency_lock",
+            "pass" if dependency_ok else "fail",
+            "Semantic Python environment matches the exact dependency lock." if dependency_ok else "Semantic Python environment differs from the dependency lock.",
+            dependency_detail,
+        )
+        probe_ok, probe_detail = offline_semantic_probe()
+        add(
+            checks,
+            "semantic_offline_probe",
+            "pass" if probe_ok else "fail",
+            "Offline EmbeddingGemma + Zvec query succeeded." if probe_ok else "Offline EmbeddingGemma + Zvec query failed.",
+            probe_detail,
+        )
     source_counts = {str(row[0]): int(row[1]) for row in conn.execute("SELECT verified_at_source, COUNT(*) FROM memory_docs GROUP BY verified_at_source")}
-    weak = source_counts.get("mtime_fallback", 0)
-    add(checks, "verification_provenance", "warn" if weak else "pass", f"Explicit verification source on {len(docs) - weak}/{len(docs)} docs.", {"by_source": source_counts})
-    large = [{"rel_path": str(row["rel_path"]), "lines": int(row["line_count"]), "bytes": int(row["size_bytes"])} for row in docs if int(row["line_count"]) > 180 or int(row["size_bytes"]) > 24576]
+    weak = source_counts.get("mtime_fallback", 0) + source_counts.get("needs_review", 0)
+    add(
+        checks,
+        "verification_provenance",
+        "warn" if weak else "pass",
+        f"Explicit verification/provenance classification on {len(docs) - weak}/{len(docs)} docs.",
+        {"by_source": source_counts, "needs_review": weak},
+    )
+    large = [
+        {"rel_path": str(row["rel_path"]), "lines": int(row["line_count"]), "bytes": int(row["size_bytes"])}
+        for row in docs
+        if str(row["status"]) in {"active", "candidate"}
+        and (int(row["line_count"]) > 180 or int(row["size_bytes"]) > 24576)
+    ]
     add(checks, "large_memory_files", "warn" if large else "pass", f"{len(large)} docs exceed compaction advisory thresholds.", {"files": large})
     raw_logs = int(conn.execute("SELECT COUNT(*) FROM memory_search_log WHERE query NOT LIKE '[redacted:%'").fetchone()[0])
     add(checks, "search_log_privacy", "warn" if raw_logs else "pass", f"{raw_logs} legacy raw-query rows remain.", {"legacy_raw_rows": raw_logs})
@@ -152,6 +476,63 @@ def collect_checks() -> list[dict[str, Any]]:
     add(checks, "audit_freshness", "pass" if age is not None and age <= 7 else "warn", f"Last successful audit age: {age} days." if age is not None else "No successful audit recorded.")
     closeout = latest_jsonl(CLOSEOUT_LOG)
     add(checks, "closeout_history", "pass" if closeout and closeout.get("status") in {"ok", "warning"} else "warn", f"Latest closeout status: {closeout.get('status')}." if closeout else "No closeout history.")
+
+    remote_has_credential = git_remote_has_credential()
+    add(
+        checks,
+        "git_remote_credentials",
+        "fail" if remote_has_credential else "pass",
+        "Git remote contains an embedded credential." if remote_has_credential else "Git remote has no embedded credential.",
+    )
+    try:
+        memory_pathspec = VAULT_ROOT.relative_to(GIT_ROOT).as_posix()
+    except ValueError:
+        memory_pathspec = str(VAULT_ROOT)
+    git_status = run(
+        ["git", "-C", str(GIT_ROOT), "-c", "core.quotepath=false", "status", "--porcelain=v1", "--", memory_pathspec],
+        30,
+    )
+    dirty_lines = [line for line in str(git_status.get("stdout", "")).splitlines() if line]
+    add(
+        checks,
+        "memory_git_baseline",
+        "warn" if dirty_lines else ("pass" if git_status["ok"] else "fail"),
+        f"Memory Git baseline has {len(dirty_lines)} dirty files." if dirty_lines else "Memory Git baseline is clean.",
+        {"dirty_count": len(dirty_lines)},
+    )
+
+    if HOST_CONFIG:
+        codex_hooks_path = configured_path("codex_hooks_json")
+        if codex_hooks_path:
+            codex_hooks = read_json_object(codex_hooks_path)
+            codex_ok = "on-stop-memory.sh" in json.dumps(codex_hooks, ensure_ascii=False)
+            add(checks, "codex_stop_hook", "pass" if codex_ok else "warn", "Codex Stop hook is configured." if codex_ok else "Codex Stop hook is missing or invalid.")
+
+        claude_settings_path = configured_path("claude_settings_json")
+        claude_fragment_path = configured_path("claude_hooks_fragment")
+        claude_settings = read_json_object(claude_settings_path) if claude_settings_path else {}
+        expected_hooks = read_json_object(claude_fragment_path) if claude_fragment_path else {}
+        if claude_settings_path or claude_fragment_path:
+            claude_ok = bool(expected_hooks) and claude_settings.get("hooks") == expected_hooks
+            add(checks, "claude_stop_hook", "pass" if claude_ok else "warn", "Claude Stop/SessionEnd hooks are configured." if claude_ok else "Claude hooks differ from the managed fragment.")
+
+        cc_switch_path = configured_path("cc_switch_db")
+        if cc_switch_path:
+            cc_ok, cc_detail = cc_switch_hooks_match(cc_switch_path, expected_hooks)
+            add(checks, "claude_hook_persistence", "pass" if cc_ok else "warn", "Claude hook persistence is healthy." if cc_ok else "A provider manager may overwrite Claude hooks.", cc_detail)
+
+        env_payload = claude_settings.get("env") if isinstance(claude_settings, dict) else {}
+        base_url = str(env_payload.get("ANTHROPIC_BASE_URL", "")) if isinstance(env_payload, dict) else ""
+        if claude_settings_path:
+            endpoint_ok, endpoint_detail = local_endpoint_reachable(base_url)
+            add(checks, "claude_runtime_endpoint", "pass" if endpoint_ok else "warn", "Claude runtime endpoint is reachable or remote." if endpoint_ok else "Claude points to a local endpoint that is not listening.", endpoint_detail)
+
+        launch_path = configured_path("audit_launchagent")
+        launch_label = HOST_CONFIG.get("audit_launchagent_label")
+        if launch_path and isinstance(launch_label, str) and launch_label:
+            launch_loaded = run(["launchctl", "print", f"gui/{Path.home().stat().st_uid}/{launch_label}"], 15)["ok"]
+            launch_ok = launch_path.exists() and launch_loaded
+            add(checks, "audit_launchagent", "pass" if launch_ok else "warn", "Weekly audit LaunchAgent is loaded." if launch_ok else "Weekly audit LaunchAgent is missing or unloaded.", {"plist_exists": launch_path.exists(), "loaded": launch_loaded})
     return checks
 
 

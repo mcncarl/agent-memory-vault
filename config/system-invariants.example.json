@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "system_name": "Agent Memory Vault",
+  "memory_root": "/path/to/your/agent-memory-vault",
+  "runtime_root": "~/.config/agent-memory",
+  "canonical_script_prefix": "agent_memory_",
+  "shared_tracks": ["user", "project", "workflow", "decision", "routing"],
+  "scope_exceptions": [],
+  "forbidden_current_summary_patterns": [
+    {
+      "id": "legacy_codex_script_prefix",
+      "pattern": "codex_memory_",
+      "severity": "high",
+      "message": "Current summary still references the retired codex_memory_ script prefix."
+    },
+    {
+      "id": "legacy_codex_runtime_path",
+      "pattern": "\\.config/codex-memory",
+      "severity": "high",
+      "message": "Current summary still references the retired codex-memory runtime path."
+    },
+    {
+      "id": "legacy_compatibility_claim",
+      "pattern": "agent_memory_\\*[^。；\\n]{0,32}(?:兼容|compat)",
+      "severity": "medium",
+      "message": "Current summary claims a compatibility layer that no longer exists."
+    }
+  ]
+}

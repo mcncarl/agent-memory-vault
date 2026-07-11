@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import os
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,9 @@ STATE_DB = Path(
 ).expanduser().resolve()
 AUDIT_DB = Path(
     os.path.expandvars(env_value("AUDIT_DB", str(CONFIG_ROOT / "audit_decisions.sqlite")))
+).expanduser().resolve()
+INVARIANTS_PATH = Path(
+    os.path.expandvars(env_value("INVARIANTS", str(CONFIG_ROOT / "config" / "system-invariants.json")))
 ).expanduser().resolve()
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VAULT_ROOT = Path(
@@ -103,6 +107,183 @@ def severity_rank(value: str) -> int:
     return {"high": 3, "medium": 2, "low": 1}.get(value, 0)
 
 
+def load_invariants() -> dict[str, Any]:
+    defaults: dict[str, Any] = {
+        "schema_version": 1,
+        "system_name": "Agent Memory Vault",
+        "memory_root": str(VAULT_ROOT),
+        "runtime_root": str(CONFIG_ROOT),
+        "canonical_script_prefix": "agent_memory_",
+        "shared_tracks": ["user", "project", "workflow", "decision", "routing"],
+        "scope_exceptions": [],
+        "forbidden_current_summary_patterns": [
+            {
+                "id": "legacy_codex_script_prefix",
+                "pattern": r"codex_memory_",
+                "severity": "high",
+                "message": "Current summary still references the retired codex_memory_ script prefix.",
+            },
+            {
+                "id": "legacy_codex_runtime_path",
+                "pattern": r"\.config/codex-memory",
+                "severity": "high",
+                "message": "Current summary still references the retired codex-memory runtime path.",
+            },
+        ],
+    }
+    try:
+        payload = json.loads(INVARIANTS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return defaults
+    if not isinstance(payload, dict):
+        return defaults
+    return {**defaults, **payload}
+
+
+def add_current_fact_invariant_findings(conn: sqlite3.Connection, findings: list[Finding]) -> None:
+    invariants = load_invariants()
+    configured_roots = {
+        "memory_root": str(VAULT_ROOT),
+        "runtime_root": str(CONFIG_ROOT),
+    }
+    for key, actual in configured_roots.items():
+        expected = os.path.expandvars(str(invariants.get(key, "")))
+        expected = str(Path(expected).expanduser().resolve()) if expected else ""
+        if expected and expected != actual:
+            findings.append(
+                Finding(
+                    id=stable_id("invariant_config_conflict", key),
+                    kind="invariant_config_conflict",
+                    severity="high",
+                    rel_path="",
+                    title="System invariant configuration",
+                    message=f"Configured {key} does not match the active runtime.",
+                    detail={"key": key, "expected": expected, "actual": actual, "invariants_file": str(INVARIANTS_PATH)},
+                )
+            )
+
+    rows = conn.execute(
+        """
+        SELECT rel_path, title, summary, track, agent_scope, status
+        FROM memory_docs
+        WHERE status IN ('active', 'candidate')
+        ORDER BY rel_path
+        """
+    ).fetchall()
+    shared_tracks = {str(item) for item in invariants.get("shared_tracks", [])}
+    scope_exceptions = {str(item) for item in invariants.get("scope_exceptions", [])}
+    for row in rows:
+        rel_path = str(row["rel_path"])
+        track = str(row["track"] or "")
+        scope = str(row["agent_scope"] or "shared")
+        if track in shared_tracks and scope != "shared" and rel_path not in scope_exceptions:
+            findings.append(
+                Finding(
+                    id=stable_id("agent_scope_invariant", rel_path),
+                    kind="agent_scope_invariant",
+                    severity="high",
+                    rel_path=rel_path,
+                    title=str(row["title"]),
+                    message=f"Track {track} should be shared but agent_scope={scope}.",
+                    detail={"track": track, "agent_scope": scope, "allowed_exceptions": sorted(scope_exceptions)},
+                )
+            )
+
+    patterns = invariants.get("forbidden_current_summary_patterns", [])
+    for rule in patterns if isinstance(patterns, list) else []:
+        if not isinstance(rule, dict) or not rule.get("id") or not rule.get("pattern"):
+            continue
+        try:
+            compiled = re.compile(str(rule["pattern"]), re.IGNORECASE)
+        except re.error:
+            continue
+        for row in rows:
+            summary = str(row["summary"] or "")
+            if compiled.search(summary):
+                rule_id = str(rule["id"])
+                findings.append(
+                    Finding(
+                        id=stable_id("current_summary_invariant", rule_id, row["rel_path"]),
+                        kind="current_summary_invariant",
+                        severity=str(rule.get("severity", "medium")),
+                        rel_path=str(row["rel_path"]),
+                        title=str(row["title"]),
+                        message=str(rule.get("message") or f"Current summary violates invariant {rule_id}."),
+                        detail={"rule_id": rule_id, "pattern": str(rule["pattern"]), "invariants_file": str(INVARIANTS_PATH)},
+                    )
+                )
+
+    markdown_docs = int(conn.execute("SELECT COUNT(*) FROM memory_docs").fetchone()[0])
+    fts_docs = int(conn.execute("SELECT COUNT(DISTINCT path) FROM memory_fts").fetchone()[0])
+    tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    eligible_vector_docs = 0
+    indexed_vector_docs = 0
+    vector_chunks = 0
+    if {"memory_vector_index_state", "memory_vector_chunks"}.issubset(tables):
+        eligible_vector_docs = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM memory_docs
+                WHERE memory_type NOT IN ('routing','directory_index','template','agent_case_candidate','skill_candidate')
+                  AND status NOT IN ('archived','deleted','obsolete','outdated','deprecated','stale')
+                  AND sensitivity NOT IN ('secret','credential')
+                  AND rel_path NOT LIKE '%/README.md'
+                  AND rel_path NOT GLOB '*/_模板*'
+                """
+            ).fetchone()[0]
+        )
+        indexed_vector_docs = int(
+            conn.execute("SELECT COUNT(*) FROM memory_vector_index_state WHERE status='indexed'").fetchone()[0]
+        )
+        vector_chunks = int(conn.execute("SELECT COUNT(*) FROM memory_vector_chunks").fetchone()[0])
+
+    for row in rows:
+        summary = str(row["summary"] or "")
+        sqlite_match = re.search(r"Markdown/SQLite/FTS[^0-9]{0,20}(\d+)/(\d+)/(\d+)", summary, re.IGNORECASE)
+        if sqlite_match:
+            stated = tuple(int(value) for value in sqlite_match.groups())
+            actual = (markdown_docs, markdown_docs, fts_docs)
+            if stated != actual:
+                findings.append(
+                    Finding(
+                        id=stable_id("current_metric_conflict", "markdown_sqlite_fts", row["rel_path"]),
+                        kind="current_metric_conflict",
+                        severity="medium",
+                        rel_path=str(row["rel_path"]),
+                        title=str(row["title"]),
+                        message=f"Current summary says Markdown/SQLite/FTS={stated}, runtime reports {actual}.",
+                        detail={"metric": "markdown_sqlite_fts", "stated": stated, "actual": actual},
+                    )
+                )
+        zvec_match = re.search(
+            r"Zvec[^0-9]{0,20}(\d+)/(\d+)(?:[^0-9]{0,12}(\d+)\s*(?:个)?(?:当前事实块|事实块|chunks?))?",
+            summary,
+            re.IGNORECASE,
+        )
+        if zvec_match and indexed_vector_docs:
+            stated_docs = (int(zvec_match.group(1)), int(zvec_match.group(2)))
+            stated_chunks = int(zvec_match.group(3)) if zvec_match.group(3) else None
+            docs_actual = (indexed_vector_docs, eligible_vector_docs)
+            if stated_docs != docs_actual or (stated_chunks is not None and stated_chunks != vector_chunks):
+                findings.append(
+                    Finding(
+                        id=stable_id("current_metric_conflict", "zvec", row["rel_path"]),
+                        kind="current_metric_conflict",
+                        severity="medium",
+                        rel_path=str(row["rel_path"]),
+                        title=str(row["title"]),
+                        message=f"Current summary says Zvec={stated_docs}, runtime reports {docs_actual} with {vector_chunks} chunks.",
+                        detail={
+                            "metric": "zvec",
+                            "stated_docs": stated_docs,
+                            "stated_chunks": stated_chunks,
+                            "actual_docs": docs_actual,
+                            "actual_chunks": vector_chunks,
+                        },
+                    )
+                )
+
+
 def add_stale_findings(conn: sqlite3.Connection, findings: list[Finding], fallback_days: int) -> None:
     rows = conn.execute(
         """
@@ -114,7 +295,11 @@ def add_stale_findings(conn: sqlite3.Connection, findings: list[Finding], fallba
         ORDER BY rel_path
         """
     ).fetchall()
-    weak_rows = [row for row in rows if str(row["verified_at_source"] or "") == "mtime_fallback"]
+    weak_rows = [
+        row
+        for row in rows
+        if str(row["verified_at_source"] or "") in {"mtime_fallback", "needs_review"}
+    ]
     if weak_rows:
         findings.append(
             Finding(
@@ -123,13 +308,13 @@ def add_stale_findings(conn: sqlite3.Connection, findings: list[Finding], fallba
                 severity="medium",
                 rel_path="",
                 title="Verification provenance",
-                message=f"{len(weak_rows)} memories only have file mtime, not an explicit fact review date.",
+                message=f"{len(weak_rows)} memories still need an explicit provenance decision or fact review.",
                 detail={"count": len(weak_rows), "total": len(rows), "sample_paths": [str(row["rel_path"]) for row in weak_rows[:10]]},
             )
         )
     for row in rows:
         source = str(row["verified_at_source"] or "mtime_fallback")
-        if source == "mtime_fallback":
+        if source in {"mtime_fallback", "needs_review", "structural", "snapshot"}:
             continue
         verified = parse_date(str(row["verified_at"] or ""))
         if verified is None:
@@ -272,6 +457,7 @@ def add_large_file_findings(conn: sqlite3.Connection, findings: list[Finding], l
         SELECT rel_path, title, line_count, size_bytes
         FROM memory_docs
         WHERE memory_type NOT IN ('template', 'directory_index')
+          AND status IN ('active', 'candidate')
           AND (line_count > ? OR size_bytes > ?)
         ORDER BY size_bytes DESC, line_count DESC
         """,
@@ -331,6 +517,30 @@ def add_index_parity_findings(conn: sqlite3.Connection, findings: list[Finding])
                 detail={"eligible_docs": eligible_count, "indexed_docs": vector_count},
             )
         )
+    hash_mismatches = [
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT d.rel_path
+            FROM memory_docs d
+            JOIN memory_vector_index_state v ON v.path=d.path
+            WHERE v.status='indexed' AND coalesce(v.doc_sha256, '') != d.sha256
+            ORDER BY d.rel_path
+            """
+        ).fetchall()
+    ]
+    if hash_mismatches:
+        findings.append(
+            Finding(
+                id=stable_id("zvec_hash_parity"),
+                kind="zvec_hash_parity",
+                severity="high",
+                rel_path="",
+                title="Zvec hash parity",
+                message=f"{len(hash_mismatches)} semantic documents are older than their Markdown source.",
+                detail={"hash_mismatch": hash_mismatches},
+            )
+        )
 
 
 def load_decisions(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
@@ -371,6 +581,7 @@ def collect_findings(args: argparse.Namespace) -> list[Finding]:
         add_outdated_findings(conn, findings)
         add_large_file_findings(conn, findings, args.large_file_line_limit, args.large_file_byte_limit)
         add_index_parity_findings(conn, findings)
+        add_current_fact_invariant_findings(conn, findings)
     findings.sort(key=lambda item: (severity_rank(item.severity), item.kind, item.rel_path), reverse=True)
     with connect_audit() as audit_conn:
         decisions = load_decisions(audit_conn)

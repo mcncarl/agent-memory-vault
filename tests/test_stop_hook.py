@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -98,6 +100,7 @@ class StopHookGitBaselineTests(unittest.TestCase):
         self.module.GIT_ROOT = self.root
         self.module.VAULT_ROOT = self.vault
         self.module.LOG_PATH = self.log_path
+        self.module.STATE_DB = self.root / "state.sqlite"
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -116,6 +119,25 @@ class StopHookGitBaselineTests(unittest.TestCase):
         )
 
         self.assertEqual(self.module.historical_paths(), [self.note.resolve()])
+
+    def test_pending_paths_ignores_content_already_present_in_index(self) -> None:
+        self.note.write_text("# Agent Memory\n\nCommitted externally.\n", encoding="utf-8")
+        git(self.root, "add", "Agent记忆/AGENTS.md")
+        git(self.root, "commit", "-qm", "external commit")
+        self.log_path.write_text(
+            json.dumps({"git_observed_through": self.baseline}) + "\n",
+            encoding="utf-8",
+        )
+        digest = hashlib.sha256(self.note.read_bytes()).hexdigest()
+        with sqlite3.connect(self.module.STATE_DB) as conn:
+            conn.execute("CREATE TABLE memory_docs (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL)")
+            conn.execute("INSERT INTO memory_docs(path, sha256) VALUES (?, ?)", (str(self.note), digest))
+
+        self.assertEqual(self.module.historical_paths(), [self.note.resolve()])
+        self.assertEqual(self.module.pending_paths(), [])
+
+        self.note.write_text("# Agent Memory\n\nChanged again.\n", encoding="utf-8")
+        self.assertEqual(self.module.pending_paths(), [self.note.resolve()])
 
 
 if __name__ == "__main__":

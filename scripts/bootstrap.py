@@ -134,7 +134,7 @@ def main() -> int:
     print("  python3 scripts/agent_memory_check.py")
     print("  python3 scripts/agent_memory_doctor.py")
     print("optional_semantic_retrieval:")
-    print("  python3 -m pip install -r requirements-vector.txt")
+    print("  python3 -m pip install -r requirements-vector.lock")
     print("  python3 scripts/agent_memory_zvec_index.py --init --scan --prune")
     return 0
 

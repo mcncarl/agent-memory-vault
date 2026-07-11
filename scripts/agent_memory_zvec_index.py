@@ -37,6 +37,12 @@ DEFAULT_LOCK_PATH = Path(
 DEFAULT_MODEL = env_value("EMBEDDING_MODEL", "google/embeddinggemma-300m")
 DEFAULT_EMBEDDING_DIM = int(env_value("EMBEDDING_DIM", "768"))
 DEFAULT_DEVICE = env_value("EMBEDDING_DEVICE", "cpu")
+DEFAULT_REQUIRE_LOCAL_MODEL = env_value("REQUIRE_LOCAL_MODEL", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 DEFAULT_LIMIT = 5
 CHUNK_MAX_CHARS = 1400
 CHUNK_OVERLAP_CHARS = 160
@@ -411,11 +417,19 @@ def load_changed_docs(conn: sqlite3.Connection, raw_paths: list[str], vault_root
 
 
 class EmbeddingGemmaEmbedder:
-    def __init__(self, model_name: str, embedding_dim: int, device: str = "cpu", cache_folder: str = "") -> None:
+    def __init__(
+        self,
+        model_name: str,
+        embedding_dim: int,
+        device: str = "cpu",
+        cache_folder: str = "",
+        require_local_model: bool = False,
+    ) -> None:
         self.model_name = model_name
         self.embedding_dim = embedding_dim
         self.device = device
         self.cache_folder = cache_folder
+        self.require_local_model = require_local_model
         self._model: Any | None = None
 
     def _load_model(self) -> Any:
@@ -433,6 +447,11 @@ class EmbeddingGemmaEmbedder:
             kwargs["device"] = self.device
         if self.cache_folder:
             kwargs["cache_folder"] = self.cache_folder
+        if self.require_local_model:
+            model_path = Path(self.model_name).expanduser().resolve()
+            if not model_path.is_dir():
+                raise EmbedderError(f"managed_local_model_missing path={model_path}")
+            kwargs["local_files_only"] = True
         try:
             self._model = SentenceTransformer(self.model_name, **kwargs)
         except Exception as exc:
@@ -875,7 +894,13 @@ def run_indexing(args: argparse.Namespace, sqlite_index: Any, conn: sqlite3.Conn
         errors.extend(changed_errors)
 
     deduped: dict[str, IndexedDoc] = {str(doc.path): doc for doc in docs}
-    embedder = EmbeddingGemmaEmbedder(args.model, args.embedding_dim, args.device, args.cache_folder)
+    embedder = EmbeddingGemmaEmbedder(
+        args.model,
+        args.embedding_dim,
+        args.device,
+        args.cache_folder,
+        args.require_local_model,
+    )
     stats = {
         "status": "ok",
         "docs_seen": len(deduped),
@@ -927,7 +952,13 @@ def run_indexing(args: argparse.Namespace, sqlite_index: Any, conn: sqlite3.Conn
 def run_search(args: argparse.Namespace, conn: sqlite3.Connection, store: ZvecStore) -> int:
     init_db(conn)
     store.init()
-    embedder = EmbeddingGemmaEmbedder(args.model, args.embedding_dim, args.device, args.cache_folder)
+    embedder = EmbeddingGemmaEmbedder(
+        args.model,
+        args.embedding_dim,
+        args.device,
+        args.cache_folder,
+        args.require_local_model,
+    )
     try:
         query_embedding = embedder.embed_query(args.search)
     except Exception as exc:
@@ -953,6 +984,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Embedding model name or local path.")
     parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device for SentenceTransformer, default: cpu.")
     parser.add_argument("--cache-folder", default="", help="Optional Hugging Face/SentenceTransformers cache folder.")
+    parser.add_argument(
+        "--require-local-model",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_REQUIRE_LOCAL_MODEL,
+        help="Require an existing local model directory and disable remote model resolution.",
+    )
     parser.add_argument("--embedding-dim", type=int, default=DEFAULT_EMBEDDING_DIM, help="Expected embedding dimension.")
     parser.add_argument("--state-db", default=str(STATE_DB), help=argparse.SUPPRESS)
     parser.add_argument("--collection-path", default=str(DEFAULT_COLLECTION_PATH), help=argparse.SUPPRESS)
