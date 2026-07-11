@@ -73,6 +73,18 @@ python3 scripts/agent_memory_stop_hook.py \
   --timeout 300
 ```
 
+## Claude Settings Managers
+
+Some provider switchers and configuration managers regenerate `~/.claude/settings.json` when they start or change providers. A hook added only to the live file can therefore disappear even though the original installation succeeded.
+
+- Merge Agent Memory hooks into the manager's persistent or common Claude configuration, not only the generated live file.
+- If the manager keeps a live rollback copy, update that copy too; otherwise the next recovery can restore a hook-free file.
+- Keep unrelated hooks when merging.
+- After restarting or switching providers, verify that the live settings still contain `agent_memory_stop_hook.py`.
+- Use Claude debug logs or the `/hooks` browser to confirm that `Stop` and `SessionEnd` matchers are actually loaded. A file existing on disk is not sufficient evidence.
+
+For tools such as CC Switch, the practical source of truth may be the switcher's own database-backed common configuration. Treat the generated `~/.claude/settings.json` as an output of that manager.
+
 Codex reads `~/.codex/hooks.json`. Enable hooks in `~/.codex/config.toml`:
 
 ```toml
