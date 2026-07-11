@@ -10,19 +10,19 @@ from pathlib import Path
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
 COMMANDS = {
-    "search": SCRIPT_ROOT / "codex_memory_search.py",
-    "closeout": SCRIPT_ROOT / "codex_memory_closeout.py",
-    "audit": SCRIPT_ROOT / "codex_memory_audit.py",
-    "audit-autorun": SCRIPT_ROOT / "codex_memory_audit_autorun.py",
-    "doctor": SCRIPT_ROOT / "codex_memory_doctor.py",
-    "index": SCRIPT_ROOT / "codex_memory_index.py",
-    "zvec": SCRIPT_ROOT / "codex_memory_zvec_index.py",
-    "check": SCRIPT_ROOT / "codex_memory_check.py",
+    "search": SCRIPT_ROOT / "agent_memory_search.py",
+    "closeout": SCRIPT_ROOT / "agent_memory_closeout.py",
+    "audit": SCRIPT_ROOT / "agent_memory_audit.py",
+    "audit-autorun": SCRIPT_ROOT / "agent_memory_audit_autorun.py",
+    "doctor": SCRIPT_ROOT / "agent_memory_doctor.py",
+    "index": SCRIPT_ROOT / "agent_memory_index.py",
+    "zvec": SCRIPT_ROOT / "agent_memory_zvec_index.py",
+    "check": SCRIPT_ROOT / "agent_memory_check.py",
 }
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Shared Claude Code/Codex memory entrypoint.")
+    parser = argparse.ArgumentParser(description="Platform-neutral Agent Memory Vault entrypoint.")
     parser.add_argument(
         "--actor",
         choices=("codex", "claude", "human", "migration", "test"),

@@ -1,7 +1,7 @@
 ---
 memory_type: workflow
 track: workflow
-project_id: codex-memory-sqlite-index
+project_id: agent-memory-vault-sqlite-index
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
@@ -15,7 +15,7 @@ keywords:
   - index
 ---
 
-# Codex 记忆 SQLite 全库索引设计
+# Agent 记忆 SQLite 全库索引设计
 
 ## 当前有效摘要
 

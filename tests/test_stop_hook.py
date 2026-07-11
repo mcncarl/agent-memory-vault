@@ -13,10 +13,13 @@ from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_ROOT = REPO_ROOT / "scripts"
+if str(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_ROOT))
 
 
 def load_stop_hook():
-    path = REPO_ROOT / "scripts" / "codex_memory_stop_hook.py"
+    path = REPO_ROOT / "scripts" / "agent_memory_stop_hook.py"
     spec = importlib.util.spec_from_file_location("test_stop_hook_module", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {path}")

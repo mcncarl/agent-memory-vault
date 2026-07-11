@@ -61,17 +61,17 @@ def write_env(args: argparse.Namespace, memory_root: Path) -> None:
     git_root = expand_path(args.git_root) if args.git_root else memory_root
     content = "\n".join(
         [
-            f"CODEX_MEMORY_ROOT={memory_root}",
-            f"CODEX_MEMORY_GIT_ROOT={git_root}",
-            f"CODEX_MEMORY_CONFIG_ROOT={config_root}",
-            f"CODEX_MEMORY_STATE_DB={expand_path(args.state_db)}",
-            f"CODEX_MEMORY_USER_ID={args.user_id}",
-            f"CODEX_MEMORY_AGENT_ID={args.agent_id}",
-            f"CODEX_MEMORY_APP_ID={args.app_id}",
-            f"CODEX_MEMORY_AUDIT_DB={config_root / 'audit_decisions.sqlite'}",
-            f"CODEX_MEMORY_CLOSEOUT_LOG={config_root / 'logs' / 'closeout.jsonl'}",
-            f"CODEX_MEMORY_AUDIT_RUN_LOG={config_root / 'logs' / 'audit_runs.jsonl'}",
-            f"CODEX_MEMORY_AUDIT_REPORT={config_root / 'reports' / 'latest-audit.json'}",
+            f"AGENT_MEMORY_ROOT={memory_root}",
+            f"AGENT_MEMORY_GIT_ROOT={git_root}",
+            f"AGENT_MEMORY_CONFIG_ROOT={config_root}",
+            f"AGENT_MEMORY_STATE_DB={expand_path(args.state_db)}",
+            f"AGENT_MEMORY_USER_ID={args.user_id}",
+            f"AGENT_MEMORY_AGENT_ID={args.agent_id}",
+            f"AGENT_MEMORY_APP_ID={args.app_id}",
+            f"AGENT_MEMORY_AUDIT_DB={config_root / 'audit_decisions.sqlite'}",
+            f"AGENT_MEMORY_CLOSEOUT_LOG={config_root / 'logs' / 'closeout.jsonl'}",
+            f"AGENT_MEMORY_AUDIT_RUN_LOG={config_root / 'logs' / 'audit_runs.jsonl'}",
+            f"AGENT_MEMORY_AUDIT_REPORT={config_root / 'reports' / 'latest-audit.json'}",
             "",
         ]
     )
@@ -80,16 +80,16 @@ def write_env(args: argparse.Namespace, memory_root: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create a local Codex memory vault from the public template.")
+    parser = argparse.ArgumentParser(description="Create a local Agent Memory Vault from the public template.")
     parser.add_argument("--memory-root", required=True, help="Target local memory vault path.")
     parser.add_argument(
         "--state-db",
-        default="$HOME/.config/codex-memory/state.sqlite",
+        default="$HOME/.config/agent-memory/state.sqlite",
         help="SQLite state database path.",
     )
     parser.add_argument(
         "--config-root",
-        default="$HOME/.config/codex-memory",
+        default="$HOME/.config/agent-memory",
         help="Local config/state directory for logs, audit decisions, and derived indexes.",
     )
     parser.add_argument(
@@ -127,15 +127,15 @@ def main() -> int:
 
     print("next_commands:")
     print("  source .env")
-    print("  git -C \"$CODEX_MEMORY_GIT_ROOT\" init  # optional, if the vault is not already in a git repo")
-    print("  python3 scripts/codex_agent_evolution.py --init --scan --report")
-    print("  python3 scripts/codex_memory_index.py --init --scan --report")
-    print("  python3 scripts/codex_memory_closeout.py --dry-run")
-    print("  python3 scripts/codex_memory_check.py")
-    print("  python3 scripts/codex_memory_doctor.py")
+    print("  git -C \"$AGENT_MEMORY_GIT_ROOT\" init  # optional, if the vault is not already in a git repo")
+    print("  python3 scripts/agent_memory_evolution.py --init --scan --report")
+    print("  python3 scripts/agent_memory_index.py --init --scan --report")
+    print("  python3 scripts/agent_memory_closeout.py --dry-run")
+    print("  python3 scripts/agent_memory_check.py")
+    print("  python3 scripts/agent_memory_doctor.py")
     print("optional_semantic_retrieval:")
     print("  python3 -m pip install -r requirements-vector.txt")
-    print("  python3 scripts/codex_memory_zvec_index.py --init --scan --prune")
+    print("  python3 scripts/agent_memory_zvec_index.py --init --scan --prune")
     return 0
 
 

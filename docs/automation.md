@@ -1,6 +1,6 @@
 # Automation
 
-Codex Memory can run without background automation. The recommended automated setup is layered:
+Agent Memory Vault can run without background automation. The recommended automated setup is layered:
 
 1. `closeout` piggyback: every important task-end closeout checks whether audit is due.
 2. Optional Stop hook: reminder mode is safest; shared Claude/Codex setups can opt into full closeout only when pending memory changes exist.
@@ -13,13 +13,13 @@ Automation should only produce reminders, reports, logs, and local audit decisio
 This is the primary path because it runs when an Agent is already present to read and explain the result.
 
 ```bash
-python3 scripts/codex_memory_closeout.py --commit
+python3 scripts/agent_memory_closeout.py --commit
 ```
 
 By default, closeout calls:
 
 ```bash
-python3 scripts/codex_memory_audit_autorun.py \
+python3 scripts/agent_memory_audit_autorun.py \
   --reason closeout \
   --min-interval-days 7 \
   --json
@@ -36,7 +36,7 @@ Stop is turn-scoped in both Claude Code and Codex, so the hook must stay quiet a
 Reminder mode:
 
 - Remind only when Markdown files under the memory vault changed and the SQLite index is older than those files.
-- Call `codex_memory_audit_autorun.py`; its interval gate decides whether a real audit is due.
+- Call `agent_memory_audit_autorun.py`; its interval gate decides whether a real audit is due.
 - Stamp each session or day so the same reminder is not repeated constantly.
 - Do not let the hook invent or rewrite memory facts.
 
@@ -58,7 +58,7 @@ on Stop:
   if memory vault has dirty Markdown files:
     if state.sqlite is older than the changed files:
       if this session was not reminded:
-        notify: run codex_memory_closeout.py --dry-run
+        notify: run agent_memory_closeout.py --dry-run
 
   run audit_autorun with a 7-day interval gate
 ```
@@ -66,7 +66,7 @@ on Stop:
 Automatic closeout example:
 
 ```bash
-python3 scripts/codex_memory_stop_hook.py \
+python3 scripts/agent_memory_stop_hook.py \
   --actor claude \
   --protocol claude \
   --auto-closeout \
@@ -90,7 +90,7 @@ Reminder-only `Stop` entry (merge it with existing hooks instead of overwriting 
         "hooks": [
           {
             "type": "command",
-            "command": "/bin/zsh -lc 'set -a; source /path/to/codex-memory/.env; set +a; exec python3 /path/to/codex-memory/scripts/codex_memory_stop_hook.py'",
+            "command": "/bin/zsh -lc 'set -a; source /path/to/agent-memory-vault/.env; set +a; exec python3 /path/to/agent-memory-vault/scripts/agent_memory_stop_hook.py'",
             "timeout": 15
           }
         ]
@@ -100,7 +100,7 @@ Reminder-only `Stop` entry (merge it with existing hooks instead of overwriting 
 }
 ```
 
-The command sources the private `.env` so the hook sees the real vault and state database. It inherits stdin, so `codex_memory_stop_hook.py` can read the event JSON. After changing a hook command, review the updated hook in Codex if the client asks you to trust the new hash.
+The command sources the private `.env` so the hook sees the real vault and state database. It inherits stdin, so `agent_memory_stop_hook.py` can read the event JSON. After changing a hook command, review the updated hook in Codex if the client asks you to trust the new hash.
 
 For automatic Codex closeout, add the actor, protocol, and timeout explicitly, and give the outer hook enough time to receive the structured result:
 
@@ -112,7 +112,7 @@ For automatic Codex closeout, add the actor, protocol, and timeout explicitly, a
         "hooks": [
           {
             "type": "command",
-            "command": "/bin/zsh -lc 'set -a; source /path/to/codex-memory/.env; set +a; exec python3 /path/to/codex-memory/scripts/codex_memory_stop_hook.py --actor codex --protocol codex --auto-closeout --timeout 300'",
+            "command": "/bin/zsh -lc 'set -a; source /path/to/agent-memory-vault/.env; set +a; exec python3 /path/to/agent-memory-vault/scripts/agent_memory_stop_hook.py --actor codex --protocol codex --auto-closeout --timeout 300'",
             "timeout": 320
           }
         ]
@@ -126,7 +126,7 @@ For automatic Codex closeout, add the actor, protocol, and timeout explicitly, a
 
 Use `launchd` when you want a weekly audit even if no Agent session happens.
 
-Create `~/Library/LaunchAgents/com.example.codex-memory-audit.plist`:
+Create `~/Library/LaunchAgents/com.example.agent-memory-vault-audit.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -135,12 +135,12 @@ Create `~/Library/LaunchAgents/com.example.codex-memory-audit.plist`:
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.example.codex-memory-audit</string>
+  <string>com.example.agent-memory-vault-audit</string>
 
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
-    <string>/path/to/codex-memory/scripts/codex_memory_audit_autorun.py</string>
+    <string>/path/to/agent-memory-vault/scripts/agent_memory_audit_autorun.py</string>
     <string>--reason</string>
     <string>launchd</string>
     <string>--notify</string>
@@ -149,12 +149,12 @@ Create `~/Library/LaunchAgents/com.example.codex-memory-audit.plist`:
 
   <key>EnvironmentVariables</key>
   <dict>
-    <key>CODEX_MEMORY_ROOT</key>
+    <key>AGENT_MEMORY_ROOT</key>
     <string>/path/to/private-memory-vault</string>
-    <key>CODEX_MEMORY_CONFIG_ROOT</key>
-    <string>/path/to/codex-memory-config</string>
-    <key>CODEX_MEMORY_STATE_DB</key>
-    <string>/path/to/codex-memory-config/state.sqlite</string>
+    <key>AGENT_MEMORY_CONFIG_ROOT</key>
+    <string>/path/to/agent-memory-vault-config</string>
+    <key>AGENT_MEMORY_STATE_DB</key>
+    <string>/path/to/agent-memory-vault-config/state.sqlite</string>
   </dict>
 
   <key>StartCalendarInterval</key>
@@ -168,13 +168,13 @@ Create `~/Library/LaunchAgents/com.example.codex-memory-audit.plist`:
   </dict>
 
   <key>StandardOutPath</key>
-  <string>/path/to/codex-memory-config/logs/audit-launchd.out.log</string>
+  <string>/path/to/agent-memory-vault-config/logs/audit-launchd.out.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/path/to/codex-memory-config/logs/audit-launchd.err.log</string>
+  <string>/path/to/agent-memory-vault-config/logs/audit-launchd.err.log</string>
 
   <key>WorkingDirectory</key>
-  <string>/path/to/codex-memory</string>
+  <string>/path/to/agent-memory-vault</string>
 </dict>
 </plist>
 ```
@@ -182,14 +182,14 @@ Create `~/Library/LaunchAgents/com.example.codex-memory-audit.plist`:
 Load it:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.example.codex-memory-audit.plist
-launchctl list | grep codex-memory-audit
+launchctl load ~/Library/LaunchAgents/com.example.agent-memory-vault-audit.plist
+launchctl list | grep agent-memory-vault-audit
 ```
 
 Unload it:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.example.codex-memory-audit.plist
+launchctl unload ~/Library/LaunchAgents/com.example.agent-memory-vault-audit.plist
 ```
 
 ## Reading Results
@@ -197,7 +197,7 @@ launchctl unload ~/Library/LaunchAgents/com.example.codex-memory-audit.plist
 The latest report is local:
 
 ```bash
-cat "$CODEX_MEMORY_AUDIT_REPORT"
+cat "$AGENT_MEMORY_AUDIT_REPORT"
 ```
 
 Typical findings mean:

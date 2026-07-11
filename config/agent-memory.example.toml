@@ -1,14 +1,14 @@
 # Example config. The current scripts use environment variables by default.
 # You can keep this file as human-readable documentation for your setup.
 
-memory_root = "/path/to/your/codex-memory-vault"
+memory_root = "/path/to/your/agent-memory-vault"
 git_root = "/path/to/git-root-containing-the-vault"
-config_root = "~/.config/codex-memory"
-state_db = "~/.config/codex-memory/state.sqlite"
-audit_db = "~/.config/codex-memory/audit_decisions.sqlite"
-closeout_log = "~/.config/codex-memory/logs/closeout.jsonl"
-audit_run_log = "~/.config/codex-memory/logs/audit_runs.jsonl"
-audit_report = "~/.config/codex-memory/reports/latest-audit.json"
+config_root = "~/.config/agent-memory"
+state_db = "~/.config/agent-memory/state.sqlite"
+audit_db = "~/.config/agent-memory/audit_decisions.sqlite"
+closeout_log = "~/.config/agent-memory/logs/closeout.jsonl"
+audit_run_log = "~/.config/agent-memory/logs/audit_runs.jsonl"
+audit_report = "~/.config/agent-memory/reports/latest-audit.json"
 python = "python3"
 
 user_id = "demo-user"
@@ -24,7 +24,7 @@ commit_scoped_memory_files = true
 
 [semantic_retrieval]
 enabled = false
-vector_dir = "~/.config/codex-memory/zvec/memory_chunks_embeddinggemma_768"
+vector_dir = "~/.config/agent-memory/zvec/memory_chunks_embeddinggemma_768"
 embedding_model = "google/embeddinggemma-300m"
 embedding_dim = 768
 embedding_device = "cpu"

@@ -1,7 +1,7 @@
 ---
 memory_type: routing
 track: routing
-project_id: codex-memory-index
+project_id: agent-memory-vault-index
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
@@ -14,18 +14,18 @@ keywords:
   - routing
 ---
 
-# Codex 记忆索引
+# Agent 记忆索引
 
 ## 读取入口
 
 - 全局规则：`AGENTS.md`
 - 用户偏好：`用户记忆/偏好与边界.md`
 - 用户画像：`用户记忆/长期画像.md`
-- 字段规范：`工作流/Codex记忆字段规范.md`
-- 收尾规则：`工作流/Codex记忆收尾决策规则.md`
-- 本地脚本：`工作流/Codex记忆本地脚本.md`
-- SQLite 索引：`工作流/Codex记忆SQLite全库索引设计.md`
-- 语义检索：`工作流/Codex记忆语义检索设计.md`
+- 字段规范：`工作流/Agent记忆字段规范.md`
+- 收尾规则：`工作流/Agent记忆收尾决策规则.md`
+- 本地脚本：`工作流/Agent记忆本地脚本.md`
+- SQLite 索引：`工作流/Agent记忆SQLite全库索引设计.md`
+- 语义检索：`工作流/Agent记忆语义检索设计.md`
 - Agent 记忆：`agent/README.md`
 
 ## 目录职责
@@ -53,8 +53,8 @@ keywords:
 优先用统一搜索入口，再读命中的少量 Markdown：
 
 ```bash
-python3 scripts/codex_memory_search.py "关键词" --limit 5
-python3 scripts/codex_memory_search.py "关键词" --track project
-python3 scripts/codex_memory_search.py "关键词" --has-open-loop
-python3 scripts/codex_memory_search.py "只记得大概意思的问题" --limit 5
+python3 scripts/agent_memory_search.py "关键词" --limit 5
+python3 scripts/agent_memory_search.py "关键词" --track project
+python3 scripts/agent_memory_search.py "关键词" --has-open-loop
+python3 scripts/agent_memory_search.py "只记得大概意思的问题" --limit 5
 ```

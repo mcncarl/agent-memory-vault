@@ -1,7 +1,7 @@
 ---
 memory_type: workflow
 track: workflow
-project_id: codex-memory-closeout
+project_id: agent-memory-vault-closeout
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
@@ -14,7 +14,7 @@ keywords:
   - memory
 ---
 
-# Codex 记忆收尾决策规则
+# Agent 记忆收尾决策规则
 
 ## 当前有效摘要
 
@@ -25,7 +25,7 @@ keywords:
 写入前先运行：
 
 ```bash
-python3 scripts/codex_memory_closeout.py --prewrite "准备写入的记忆摘要"
+python3 scripts/agent_memory_closeout.py --prewrite "准备写入的记忆摘要"
 ```
 
 根据结果选择：
@@ -77,8 +77,8 @@ python3 scripts/codex_memory_closeout.py --prewrite "准备写入的记忆摘要
 写完记忆后优先运行统一 closeout：
 
 ```bash
-python3 scripts/codex_memory_closeout.py --dry-run
-python3 scripts/codex_memory_closeout.py --commit
+python3 scripts/agent_memory_closeout.py --dry-run
+python3 scripts/agent_memory_closeout.py --commit
 ```
 
 它会自动完成：
@@ -100,7 +100,7 @@ python3 scripts/codex_memory_closeout.py --commit
 audit 负责发现需要复核、合并或忽略的记忆，不直接修改 Markdown。
 
 ```bash
-python3 scripts/codex_memory_audit.py
-python3 scripts/codex_memory_audit.py --ignore FINDING_ID --note "保留原因"
-python3 scripts/codex_memory_audit_autorun.py --reason closeout --min-interval-days 7
+python3 scripts/agent_memory_audit.py
+python3 scripts/agent_memory_audit.py --ignore FINDING_ID --note "保留原因"
+python3 scripts/agent_memory_audit_autorun.py --reason closeout --min-interval-days 7
 ```

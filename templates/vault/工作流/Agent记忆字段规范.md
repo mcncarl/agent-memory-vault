@@ -1,7 +1,7 @@
 ---
 memory_type: workflow
 track: workflow
-project_id: codex-memory-fields
+project_id: agent-memory-vault-fields
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
@@ -15,7 +15,7 @@ keywords:
   - orthogonal
 ---
 
-# Codex 记忆字段规范
+# Agent 记忆字段规范
 
 ## 当前有效摘要
 
@@ -61,7 +61,7 @@ keywords:
 这些字段互相独立，可以组合使用。例如：
 
 ```bash
-python3 scripts/codex_memory_index.py --search "部署" --track project --project-id example-app
+python3 scripts/agent_memory_index.py --search "部署" --track project --project-id example-app
 ```
 
 这会比只全文搜索更省上下文，也更少误召回。

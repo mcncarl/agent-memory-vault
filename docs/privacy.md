@@ -31,7 +31,7 @@ Claude Code 与 Codex 可以读取同一个私有配置源，但真实 Cookie、
 
 ```bash
 find . -name "*.sqlite" -o -name "*.db" -o -name ".env" -o -name "*.key" -o -name "*.pem" -o -name "zvec" -o -path "*/logs/*.jsonl"
-python3 scripts/codex_memory_check.py
+python3 scripts/agent_memory_check.py
 ```
 
 如果检查结果出现真实 key 或真实路径，先从模板里移除。

@@ -1,6 +1,17 @@
 # Migration Guide
 
-这份指南用于把一个已经在使用的私人 Codex 记忆系统，整理成可复用模板。
+## 从 Codex Memory 名称迁移
+
+Agent Memory Vault 使用平台中立命名：
+
+- 新环境变量：`AGENT_MEMORY_*`。
+- 新脚本：`agent_memory_*`。
+- 统一命令：`memoryctl`。
+- 默认本地状态目录：`$HOME/.config/agent-memory`。
+
+迁移窗口内，旧 `CODEX_MEMORY_*` 变量只作回退，旧 `codex_memory_*` 和 `codex_agent_evolution.py` 只是转发包装。新名优先级高于旧名；如果两者同时存在，脚本使用新名。确认 Hook、定时任务和自定义脚本都已转向新入口后，再在后续主版本删除兼容包装。
+
+这份指南用于把一个已经在使用的私人 Agent 记忆系统，整理成可复用模板。
 
 ## 接入 Claude Code 而不复制 vault
 
@@ -22,7 +33,7 @@
 ## 2. 用模板初始化新的本地 vault
 
 ```bash
-python3 scripts/bootstrap.py --memory-root "$HOME/codex-memory-vault" --write-env
+python3 scripts/bootstrap.py --memory-root "$HOME/agent-memory-vault" --write-env
 ```
 
 如果目标目录已经存在，脚本默认只补齐缺失文件，不覆盖已有文件。
@@ -52,10 +63,10 @@ python3 scripts/bootstrap.py --memory-root "$HOME/codex-memory-vault" --write-en
 
 ```bash
 source .env
-python3 scripts/codex_agent_evolution.py --init --scan --report
-python3 scripts/codex_memory_index.py --init --scan --report
-python3 scripts/codex_memory_closeout.py --dry-run
-python3 scripts/codex_memory_check.py
+python3 scripts/agent_memory_evolution.py --init --scan --report
+python3 scripts/agent_memory_index.py --init --scan --report
+python3 scripts/agent_memory_closeout.py --dry-run
+python3 scripts/agent_memory_check.py
 ```
 
 检查通过后，就可以开始在本地使用这个模板。

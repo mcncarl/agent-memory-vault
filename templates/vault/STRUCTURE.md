@@ -1,7 +1,7 @@
 ---
 memory_type: directory_index
 track: routing
-project_id: codex-memory-structure
+project_id: agent-memory-vault-structure
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
