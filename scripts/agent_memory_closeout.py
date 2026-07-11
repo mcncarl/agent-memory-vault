@@ -771,7 +771,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         warnings.append("dry_run: no index refresh, zvec refresh, or commit will be written")
     if git_entries:
         info.append(
-            "git reports dirty Codex memory files; if some are historical, review dry-run output before committing"
+            "git reports dirty Agent Memory files; if some are historical, review dry-run output before committing"
         )
 
     check_step = run_check(process_files, args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
@@ -905,7 +905,7 @@ def print_human(payload: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Unified closeout for the local Codex memory system."
+        description="Unified closeout for the local Agent Memory system."
     )
     parser.add_argument("--prewrite", help="Run reconcile before writing a new memory; does not modify files.")
     parser.add_argument("--changed-file", action="append", default=[], help="Explicit changed memory file. Repeatable.")

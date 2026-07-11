@@ -804,7 +804,7 @@ def print_report(conn: sqlite3.Connection) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build and query the full Codex memory SQLite index.")
+    parser = argparse.ArgumentParser(description="Build and query the full Agent Memory SQLite index.")
     parser.add_argument("--init", action="store_true", help="Create or migrate the index schema.")
     parser.add_argument("--scan", action="store_true", help="Scan all Markdown files into SQLite.")
     parser.add_argument("--report", action="store_true", help="Print index summary.")

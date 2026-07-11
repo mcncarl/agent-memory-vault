@@ -231,7 +231,7 @@ def run_audit(args: argparse.Namespace, last_run: dt.datetime | None) -> dict[st
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Auto-run Codex memory audit with interval gating and optional notification.")
+    parser = argparse.ArgumentParser(description="Auto-run Agent Memory audit with interval gating and optional notification.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--reason", default="manual", help="Trigger source: closeout, launchd, hook, or manual.")
     parser.add_argument("--force", action="store_true", help="Run even when the last audit is still recent.")

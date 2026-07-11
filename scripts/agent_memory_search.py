@@ -430,7 +430,7 @@ def print_human(query: str, rows: list[SearchResult], warnings: list[str]) -> No
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Unified Codex memory search: SQLite FTS plus optional Zvec semantic results.")
+    parser = argparse.ArgumentParser(description="Unified Agent Memory search: SQLite FTS plus optional Zvec semantic results.")
     parser.add_argument("query", nargs="?", help="Search query.")
     parser.add_argument("--search", dest="search", help="Search query, alternative to positional query.")
     parser.add_argument("--limit", type=int, default=5, help="Maximum merged results.")

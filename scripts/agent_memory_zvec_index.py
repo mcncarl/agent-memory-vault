@@ -941,7 +941,7 @@ def run_search(args: argparse.Namespace, conn: sqlite3.Connection, store: ZvecSt
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build and query the optional Zvec semantic index for Codex memory.")
+    parser = argparse.ArgumentParser(description="Build and query the optional Zvec semantic index for Agent Memory.")
     parser.add_argument("--init", action="store_true", help="Create SQLite vector tables and Zvec collection.")
     parser.add_argument("--scan", action="store_true", help="Incrementally index eligible Markdown docs from the SQLite memory index.")
     parser.add_argument("--prune", action="store_true", help="Remove deleted, renamed, or no-longer-eligible vector rows.")

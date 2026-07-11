@@ -432,7 +432,7 @@ def print_human(payload: dict[str, Any]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Audit Codex memory for stale facts, noisy loops, and duplicates.")
+    parser = argparse.ArgumentParser(description="Audit Agent Memory for stale facts, noisy loops, and duplicates.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--limit", type=int, default=50, help="Maximum visible findings.")
     parser.add_argument("--stale-days", type=int, default=180, help="Fallback review period.")

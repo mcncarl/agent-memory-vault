@@ -269,7 +269,7 @@ def check_public_repo_files() -> list[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Check the local Codex memory system.")
+    parser = argparse.ArgumentParser(description="Check the local Agent Memory system.")
     parser.add_argument(
         "--changed-file",
         action="append",

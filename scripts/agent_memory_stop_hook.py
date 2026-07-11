@@ -35,7 +35,7 @@ GIT_ROOT = Path(os.path.expandvars(env_value("GIT_ROOT", str(default_git_root())
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Stop hook for shared Claude Code/Codex memory.")
+    parser = argparse.ArgumentParser(description="Stop hook for Agent Memory shared by Claude Code and Codex.")
     parser.add_argument("--actor", choices=("codex", "claude"), default="codex")
     parser.add_argument("--protocol", choices=("codex", "claude"), default="codex")
     parser.add_argument("--auto-closeout", action="store_true")

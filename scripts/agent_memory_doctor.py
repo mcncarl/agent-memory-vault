@@ -156,7 +156,7 @@ def collect_checks() -> list[dict[str, Any]]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Read-only health report for the complete Codex memory pipeline.")
+    parser = argparse.ArgumentParser(description="Read-only health report for the complete Agent Memory pipeline.")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--repair-derived", action="store_true", help="Rebuild derived indexes without editing Markdown facts.")
     return parser.parse_args()
