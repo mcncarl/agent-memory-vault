@@ -124,6 +124,59 @@ class CloseoutReconcileStatusTests(unittest.TestCase):
         self.assertEqual(findings, [])
         self.assertEqual(warnings, [])
 
+    def test_frontmatter_boilerplate_is_not_used_as_fallback_summary(self) -> None:
+        note = self.vault / "项目" / "new-project.md"
+        note.write_text(
+            "---\n"
+            "memory_type: project\n"
+            "track: project\n"
+            "app_id: agent-memory\n"
+            "agent_scope: shared\n"
+            "status: active\n"
+            "---\n\n"
+            "# Unique Project\n\n"
+            "unique_project_marker_20260712\n",
+            encoding="utf-8",
+        )
+
+        query = self.module.reconcile_query_for_file(note)
+        self.assertIn("unique_project_marker_20260712", query)
+        self.assertNotIn("memory_type", query)
+        self.assertNotIn("agent_scope", query)
+
+    def test_postwrite_ignores_navigation_and_template_candidates(self) -> None:
+        note = self.vault / "项目" / "new-project.md"
+        note.write_text("# Unique Project\n\nunique_project_marker_20260712\n", encoding="utf-8")
+        entry = self.module.GitEntry(
+            status="A",
+            repo_path="AgentMemory/项目/new-project.md",
+            path=note,
+        )
+        rows = [
+            {
+                "path": str(self.vault / "INDEX.md"),
+                "rel_path": "INDEX.md",
+                "title": "Agent Memory Index",
+                "memory_type": "directory_index",
+                "summary": "Unique Project unique_project_marker_20260712",
+                "hit": "Unique Project unique_project_marker_20260712",
+                "sources": ["sqlite"],
+            }
+        ]
+        args = Namespace(
+            reconcile_all=False,
+            limit=8,
+            no_zvec=True,
+            merge_threshold=0.42,
+            merge_coverage_threshold=0.35,
+            semantic_merge_threshold=0.32,
+        )
+        with mock.patch.object(self.module, "search_memory", return_value=(rows, [])):
+            findings, warnings = self.module.postwrite_reconcile([entry], args)
+
+        self.assertEqual(findings, [])
+        self.assertEqual(warnings, [])
+
     def test_history_requires_a_matching_closeout_observation(self) -> None:
         note = self.vault / "项目" / "observed.md"
         note.write_text("# Observed\n", encoding="utf-8")

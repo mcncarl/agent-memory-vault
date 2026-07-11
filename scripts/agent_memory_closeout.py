@@ -79,6 +79,7 @@ ASK_USER_PATTERNS = [
     ),
 ]
 NONCURRENT_RECONCILE_STATUSES = {"archived", "outdated", "superseded", "deleted"}
+NONFACT_RECONCILE_TYPES = {"directory_index", "routing", "template", "open_loop"}
 
 
 @dataclass
@@ -389,6 +390,15 @@ def title_from_text(text: str, path: Path) -> str:
     return path.stem
 
 
+def without_frontmatter(text: str) -> str:
+    if not text.startswith("---"):
+        return text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return text
+    return text[end + 4 :].lstrip("\r\n")
+
+
 def summary_from_text(text: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()
@@ -397,7 +407,8 @@ def summary_from_text(text: str) -> str:
     current_summary = text.find("## 当前有效摘要")
     if current_summary != -1:
         return text[current_summary : current_summary + 500].replace("\n", " ")
-    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("---")]
+    body = without_frontmatter(text)
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
     return " ".join(lines[:8])[:700]
 
 
@@ -590,6 +601,8 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
             if row.get("path") == str(entry.path) or row.get("rel_path") == relative_to_vault(entry.path):
                 continue
             if str(row.get("rel_path") or "") in declared_relations:
+                continue
+            if str(row.get("memory_type") or "").lower() in NONFACT_RECONCILE_TYPES:
                 continue
             comparison = " ".join(
                 str(row.get(key, ""))
