@@ -120,7 +120,7 @@ class StopHookGitBaselineTests(unittest.TestCase):
 
         self.assertEqual(self.module.historical_paths(), [self.note.resolve()])
 
-    def test_pending_paths_ignores_content_already_present_in_index(self) -> None:
+    def test_pending_paths_ignores_content_with_matching_closeout_observation(self) -> None:
         self.note.write_text("# Agent Memory\n\nCommitted externally.\n", encoding="utf-8")
         git(self.root, "add", "Agent记忆/AGENTS.md")
         git(self.root, "commit", "-qm", "external commit")
@@ -130,8 +130,11 @@ class StopHookGitBaselineTests(unittest.TestCase):
         )
         digest = hashlib.sha256(self.note.read_bytes()).hexdigest()
         with sqlite3.connect(self.module.STATE_DB) as conn:
-            conn.execute("CREATE TABLE memory_docs (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL)")
-            conn.execute("INSERT INTO memory_docs(path, sha256) VALUES (?, ?)", (str(self.note), digest))
+            conn.execute("CREATE TABLE memory_file_observations (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL)")
+            conn.execute(
+                "INSERT INTO memory_file_observations(path, sha256) VALUES (?, ?)",
+                (str(self.note), digest),
+            )
 
         self.assertEqual(self.module.historical_paths(), [self.note.resolve()])
         self.assertEqual(self.module.pending_paths(), [])

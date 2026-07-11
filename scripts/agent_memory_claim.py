@@ -33,6 +33,14 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def session_value(explicit: str = "", actor: str = "codex") -> str:
     if explicit.strip():
         return explicit.strip()
@@ -73,10 +81,57 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_file_observations (
+          path TEXT PRIMARY KEY,
+          rel_path TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          session_hash TEXT NOT NULL DEFAULT '',
+          observed_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_memory_session_claims_active "
         "ON memory_session_claims(status, actor, session_hash)"
     )
     conn.commit()
+
+
+def record_file_observations(raw_session_id: str, actor: str, paths: list[Path]) -> int:
+    rows: list[tuple[str, str, str]] = []
+    for raw_path in paths:
+        path = raw_path.resolve()
+        if not path.is_file() or path.suffix.lower() != ".md":
+            continue
+        try:
+            rel_path = path.relative_to(VAULT_ROOT).as_posix()
+        except ValueError:
+            continue
+        rows.append((str(path), rel_path, file_sha256(path)))
+    if not rows:
+        return 0
+    now = utc_now()
+    hashed = session_hash(raw_session_id)
+    with connect() as conn:
+        for path, rel_path, digest in rows:
+            conn.execute(
+                """
+                INSERT INTO memory_file_observations (
+                  path, rel_path, sha256, actor, session_hash, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                  rel_path=excluded.rel_path,
+                  sha256=excluded.sha256,
+                  actor=excluded.actor,
+                  session_hash=excluded.session_hash,
+                  observed_at=excluded.observed_at
+                """,
+                (path, rel_path, digest, actor, hashed, now),
+            )
+        conn.commit()
+    return len(rows)
 
 
 def normalize_claim_path(raw: str) -> tuple[Path, str]:

@@ -45,6 +45,7 @@ Automatic closeout mode is appropriate when the Agent has already written and cl
 - Claude must run `agent_memory_session_hook.py` from `SessionStart`. It writes the hook payload's real `session_id` to `CLAUDE_ENV_FILE`, so later Bash calls to `memoryctl claim` and the Stop payload use the same ownership key. It also clears an inherited `CODEX_THREAD_ID` inside Claude Bash commands.
 - After each formal write, run `memoryctl --actor codex|claude claim --file <path>`.
 - Gate on active claims for the current session. Dirty files claimed by another session stay untouched.
+- Treat a historical file as complete only when its current content hash matches `memory_file_observations`; a full SQLite scan alone is not closeout evidence.
 - If dirty memory is not claimed by any session, block silent completion and ask the Agent to claim or resolve it.
 - Pass `--actor codex` or `--actor claude` so logs and commits remain attributable.
 - Claude Stop may return `decision: block` when closeout fails. Codex Stop can request continuation by exiting with code `2` and writing a non-empty continuation prompt to stderr.

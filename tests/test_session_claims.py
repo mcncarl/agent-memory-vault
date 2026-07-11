@@ -227,8 +227,12 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
                 completed = conn.execute(
                     "SELECT COUNT(*) FROM memory_session_claims WHERE status='completed'"
                 ).fetchone()[0]
+                observations = conn.execute(
+                    "SELECT COUNT(*) FROM memory_file_observations"
+                ).fetchone()[0]
             self.assertEqual(active, 0)
             self.assertEqual(completed, 2)
+            self.assertEqual(observations, 2)
 
 
 if __name__ == "__main__":

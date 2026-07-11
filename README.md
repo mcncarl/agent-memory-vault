@@ -102,7 +102,7 @@ python3 scripts/memoryctl --actor codex claim --file "/absolute/path/to/changed-
 python3 scripts/memoryctl --actor claude closeout
 ```
 
-写完正式记忆后先 `claim`。认领记录保存在 SQLite，只存 session id 的哈希；Agent 会话内的 closeout 和 Stop Hook 只处理本会话认领的文件，其他会话的脏文件明确排除。普通事实默认 `agent_scope: shared`；只有宿主特有经验才标为 `codex` 或 `claude`。
+写完正式记忆后先 `claim`。认领记录保存在 SQLite，只存 session id 的哈希；Agent 会话内的 closeout 和 Stop Hook 只处理本会话认领的文件，其他会话的脏文件明确排除。成功 closeout 还会记录每个文件的内容 hash，只有具备这份完成证据的历史文件才允许 Git 观察基线跨过。普通事实默认 `agent_scope: shared`；只有宿主特有经验才标为 `codex` 或 `claude`。
 
 搜索示例：
 

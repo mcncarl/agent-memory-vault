@@ -44,7 +44,7 @@ python3 scripts/memoryctl --actor <codex|claude> prewrite "准备写入的记忆
 python3 scripts/memoryctl --actor <codex|claude> claim --file "/absolute/path/to/memory.md"
 ```
 
-Codex 会自动使用 `CODEX_THREAD_ID`；Claude Code 必须通过 `SessionStart` 运行 `agent_memory_session_hook.py --actor claude`，把官方 Hook payload 的真实 `session_id` 写入 `CLAUDE_ENV_FILE`，供后续 Bash 命令使用。Stop Hook 只处理当前会话认领的文件，其他会话的脏文件会明确排除。
+Codex 会自动使用 `CODEX_THREAD_ID`；Claude Code 必须通过 `SessionStart` 运行 `agent_memory_session_hook.py --actor claude`，把官方 Hook payload 的真实 `session_id` 写入 `CLAUDE_ENV_FILE`，供后续 Bash 命令使用。Stop Hook 只处理当前会话认领的文件，其他会话的脏文件会明确排除；成功 closeout 会另存文件内容 hash，只有匹配这份完成指纹的历史内容才视为已处理。
 
 重要任务结束前执行 memory closeout：
 

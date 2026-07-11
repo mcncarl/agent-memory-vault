@@ -88,6 +88,7 @@ REQUIRED_STATE_TABLES = {
     "memory_fts",
     "memory_open_loops",
     "memory_session_claims",
+    "memory_file_observations",
 }
 
 OPTIONAL_STATE_TABLES = {

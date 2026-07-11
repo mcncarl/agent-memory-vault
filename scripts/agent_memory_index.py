@@ -419,6 +419,15 @@ def init_db(conn: sqlite3.Connection) -> None:
           PRIMARY KEY (session_hash, path)
         );
 
+        CREATE TABLE IF NOT EXISTS memory_file_observations (
+          path TEXT PRIMARY KEY,
+          rel_path TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          session_hash TEXT NOT NULL DEFAULT '',
+          observed_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_memory_docs_track ON memory_docs(track);
         CREATE INDEX IF NOT EXISTS idx_memory_docs_type ON memory_docs(memory_type);
         CREATE INDEX IF NOT EXISTS idx_memory_docs_project ON memory_docs(project_id);
@@ -440,7 +449,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_memory_session_claims_active "
         "ON memory_session_claims(status, actor, session_hash)"
     )
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "4"))
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "5"))
     conn.commit()
 
 

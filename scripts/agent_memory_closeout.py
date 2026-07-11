@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_memory_env import env_value
-from agent_memory_claim import active_claim_rows, complete_claim_paths
+from agent_memory_claim import active_claim_rows, complete_claim_paths, record_file_observations
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -761,6 +761,28 @@ def append_log(payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def unobserved_history_entries(entries: list[GitEntry]) -> list[GitEntry]:
+    if not entries or not STATE_DB.exists():
+        return entries
+    try:
+        with sqlite3.connect(STATE_DB, timeout=5) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+            rows = conn.execute("SELECT path, sha256 FROM memory_file_observations").fetchall()
+    except sqlite3.Error:
+        return entries
+    observed = {str(Path(str(path)).resolve()): str(digest) for path, digest in rows}
+    pending: list[GitEntry] = []
+    for entry in entries:
+        try:
+            digest = hashlib.sha256(entry.path.read_bytes()).hexdigest()
+        except OSError:
+            pending.append(entry)
+            continue
+        if observed.get(str(entry.path.resolve())) != digest:
+            pending.append(entry)
+    return pending
+
+
 def short_step(step: dict[str, Any]) -> dict[str, Any]:
     return {
         "ok": bool(step.get("ok")),
@@ -895,6 +917,14 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
             status = "error"
 
     claim_step: dict[str, Any] = {"ok": True, "skipped": True, "detail": "ownership_not_enabled"}
+    observation_step: dict[str, Any] = {"ok": True, "skipped": True, "detail": "not_completed"}
+    if status == "ok" and not args.dry_run and commit_step.get("ok"):
+        try:
+            observed = record_file_observations(args.session_id, args.actor, process_files)
+            observation_step = {"ok": True, "skipped": False, "detail": f"recorded={observed}"}
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            observation_step = {"ok": False, "skipped": False, "detail": str(exc)}
+            status = "error"
     if args.claimed_only:
         claim_step = {"ok": True, "skipped": True, "detail": "claims_retained"}
         if status == "ok" and not args.dry_run and commit_step.get("ok"):
@@ -904,9 +934,12 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
     git_head_after, after_warnings = current_git_head()
     warnings.extend(after_warnings)
     dirty_paths = {entry.path for entry in git_entries}
-    unclaimed_history = [entry for entry in history_entries if entry.path in {item.path for item in unclaimed_entries}]
+    unclaimed_history = unobserved_history_entries(
+        [entry for entry in history_entries if entry.path in {item.path for item in unclaimed_entries}]
+    )
     can_advance_baseline = (
-        not step_failed and not blocking_reconcile and not deleted_entries and not unclaimed_history and bool(git_head_before)
+        not step_failed and observation_step.get("ok") and not blocking_reconcile
+        and not deleted_entries and not unclaimed_history and bool(git_head_before)
         and (not dirty_paths or bool(commit_step.get("commit")) or commit_step.get("detail") == "nothing_staged")
     )
     would_observe_through = (
@@ -946,6 +979,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
             "agent_evolution": short_step(agent_step),
             "audit": short_step(audit_step),
             "commit": short_step(commit_step),
+            "observations": short_step(observation_step),
             "claims": short_step(claim_step),
         },
         "commit": commit_step.get("commit", "skipped"),

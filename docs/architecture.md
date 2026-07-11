@@ -18,6 +18,7 @@ SQLite 只负责索引，不负责成为唯一事实源。
 - Markdown：保存正式记忆。
 - SQLite：保存文件索引、搜索字段、未闭环事项和 Agent case 状态。
 - Session claims：在 SQLite 中记录“哪个会话负责哪些 Markdown”，避免两个 Agent 串提交。
+- File observations：成功 closeout 后记录文件内容 hash；它证明某一版内容已经完成检查、索引与收尾，不能用全库索引时顺带扫到来冒充。
 - Git：保存修改记录，支持 scoped commit 和回滚。
 - 统一搜索脚本：合并关键词搜索、字段过滤、可选语义召回和手动 rg。
 - closeout 脚本：在任务结束时自动检查、对账、刷新索引、写日志，并可选择提交本轮记忆文件。
@@ -38,7 +39,7 @@ Claude Code 与 Codex 共用 Markdown、Git、SQLite、Zvec、closeout 和 audit
 
 普通事实默认 `agent_scope: shared`，这个字段决定可见范围；`agent_id` 只记录来源。`created_by` 和 `last_updated_by` 记录来源；closeout 日志另外记录 actor、trigger、session hash 和 run id。不要为每个 Agent 建独立 Git 基线或独立向量库。
 
-并发控制分两层：全局文件锁保证 SQLite/Zvec/Git 操作不会同时执行；`memory_session_claims` 保证每次 closeout 只处理当前会话自己的文件。只有锁没有认领，仍可能把另一 Agent 的脏文件一起提交。
+并发控制分三层：全局文件锁保证 SQLite/Zvec/Git 操作不会同时执行；`memory_session_claims` 保证每次 closeout 只处理当前会话自己的文件；`memory_file_observations` 以内容 hash 证明别的会话已经处理完某一版文件，使共享 Git 基线可以安全前进。三者不能互相替代。
 
 ## 4. User memory and Agent memory
 

@@ -163,13 +163,13 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def stale_index_paths(paths: list[Path]) -> list[Path]:
+def unobserved_paths(paths: list[Path]) -> list[Path]:
     if not paths or not STATE_DB.exists():
         return paths
     try:
         with sqlite3.connect(STATE_DB, timeout=5) as conn:
             conn.execute("PRAGMA busy_timeout=5000")
-            rows = conn.execute("SELECT path, sha256 FROM memory_docs").fetchall()
+            rows = conn.execute("SELECT path, sha256 FROM memory_file_observations").fetchall()
     except (OSError, sqlite3.Error):
         return paths
     indexed = {str(Path(str(path)).resolve()): str(digest) for path, digest in rows}
@@ -186,7 +186,7 @@ def stale_index_paths(paths: list[Path]) -> list[Path]:
 
 def pending_paths() -> list[Path]:
     candidates = list(dict.fromkeys([*historical_paths(), *dirty_paths()]))
-    return stale_index_paths(candidates)
+    return unobserved_paths(candidates)
 
 
 def notify(message: str) -> None:
