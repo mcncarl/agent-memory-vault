@@ -84,6 +84,7 @@ class GitEntry:
     status: str
     repo_path: str
     path: Path
+    previous_repo_path: str = ""
 
     @property
     def exists(self) -> bool:
@@ -95,7 +96,7 @@ class GitEntry:
 
     @property
     def is_new(self) -> bool:
-        return self.status == "??" or "A" in self.status
+        return self.status == "??" or "A" in self.status or self.status.startswith("C")
 
     @property
     def is_memory_markdown(self) -> bool:
@@ -219,11 +220,18 @@ def decode_status_line(line: str) -> GitEntry | None:
     return GitEntry(status=status, repo_path=repo_path, path=path)
 
 
-def git_status_entries() -> tuple[list[GitEntry], list[str]]:
+def repo_path_in_vault(repo_path: str) -> bool:
     try:
-        target = str(VAULT_ROOT.relative_to(REPO_ROOT))
+        vault_repo_path = VAULT_ROOT.relative_to(REPO_ROOT).as_posix().rstrip("/")
     except ValueError:
-        target = str(VAULT_ROOT)
+        return False
+    candidate = Path(repo_path).as_posix().lstrip("./")
+    if vault_repo_path in {"", "."}:
+        return True
+    return candidate == vault_repo_path or candidate.startswith(f"{vault_repo_path}/")
+
+
+def git_status_entries() -> tuple[list[GitEntry], list[str]]:
     result = run_command(
         [
             "git",
@@ -235,8 +243,6 @@ def git_status_entries() -> tuple[list[GitEntry], list[str]]:
             "--porcelain=v1",
             "-z",
             "--untracked-files=all",
-            "--",
-            target,
         ],
         timeout=30,
     )
@@ -248,10 +254,17 @@ def git_status_entries() -> tuple[list[GitEntry], list[str]]:
     while index < len(items):
         item = items[index]
         entry = decode_status_line(item)
+        previous_repo_path = ""
+        if entry and entry.status.startswith(("R", "C")) and index + 1 < len(items):
+            previous_repo_path = items[index + 1]
+            index += 1
         if entry:
-            entries.append(entry)
-            if entry.status.startswith(("R", "C")):
-                index += 1
+            if repo_path_in_vault(entry.repo_path):
+                entry.previous_repo_path = previous_repo_path
+                entries.append(entry)
+            elif entry.status.startswith("R") and repo_path_in_vault(previous_repo_path):
+                old_path = (REPO_ROOT / previous_repo_path).resolve()
+                entries.append(GitEntry(status="D", repo_path=previous_repo_path, path=old_path))
         index += 1
     return entries, []
 
@@ -290,12 +303,11 @@ def git_history_entries(baseline: str, head: str) -> tuple[list[GitEntry], list[
     ancestor = run_command(["git", "-C", str(REPO_ROOT), "merge-base", "--is-ancestor", baseline, head], timeout=30)
     if ancestor["returncode"] != 0:
         return [], [f"closeout git baseline is not an ancestor of HEAD: baseline={baseline[:12]} head={head[:12]}"]
-    try:
-        target = str(VAULT_ROOT.relative_to(REPO_ROOT))
-    except ValueError:
-        target = str(VAULT_ROOT)
     result = run_command(
-        ["git", "-C", str(REPO_ROOT), "-c", "core.quotepath=false", "diff", "--name-status", "-z", f"{baseline}..{head}", "--", target],
+        [
+            "git", "-C", str(REPO_ROOT), "-c", "core.quotepath=false",
+            "diff", "--find-renames", "--name-status", "-z", f"{baseline}..{head}",
+        ],
         timeout=60,
     )
     if not result["ok"]:
@@ -311,13 +323,26 @@ def git_history_entries(baseline: str, head: str) -> tuple[list[GitEntry], list[
         if status.startswith(("R", "C")):
             if index + 1 >= len(items):
                 break
+            previous_repo_path = items[index]
             index += 1
             repo_path = items[index]
             index += 1
         else:
+            previous_repo_path = ""
             repo_path = items[index]
             index += 1
-        entries.append(GitEntry(status=status, repo_path=repo_path, path=(REPO_ROOT / repo_path).resolve()))
+        if repo_path_in_vault(repo_path):
+            entries.append(
+                GitEntry(
+                    status=status,
+                    repo_path=repo_path,
+                    path=(REPO_ROOT / repo_path).resolve(),
+                    previous_repo_path=previous_repo_path,
+                )
+            )
+        elif status.startswith("R") and repo_path_in_vault(previous_repo_path):
+            old_path = (REPO_ROOT / previous_repo_path).resolve()
+            entries.append(GitEntry(status="D", repo_path=previous_repo_path, path=old_path))
     return entries, []
 
 
