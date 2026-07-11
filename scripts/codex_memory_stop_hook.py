@@ -199,7 +199,11 @@ def report_failure(protocol: str, result: dict[str, Any]) -> int:
     if protocol == "claude":
         print(json.dumps({"decision": "block", "reason": "Memory closeout failed: " + reason}, ensure_ascii=False))
         return 0
-    print("memory closeout failed: " + reason, file=sys.stderr)
+    print(
+        "Shared memory closeout did not finish. Continue this turn, resolve the issue below, "
+        "and run closeout again: " + reason,
+        file=sys.stderr,
+    )
     return 2
 
 

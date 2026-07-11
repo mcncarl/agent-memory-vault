@@ -45,7 +45,9 @@ Automatic closeout mode is appropriate when the Agent has already written formal
 - Gate on dirty Markdown or Git history after `git_observed_through`.
 - Run complete closeout only when the gate is true; otherwise stay silent.
 - Pass `--actor codex` or `--actor claude` so logs and commits remain attributable.
-- Claude Stop may return `decision: block` when closeout fails; SessionEnd can be a short non-blocking fallback.
+- Claude Stop may return `decision: block` when closeout fails. Codex Stop can request continuation by exiting with code `2` and writing a non-empty continuation prompt to stderr.
+- Claude SessionEnd can be a short non-blocking fallback. Codex currently has no direct SessionEnd equivalent.
+- Set the outer hook timeout slightly above the closeout timeout. For a 300-second closeout, use at least 320 seconds outside.
 - Keep one global closeout lock and one Git baseline across both hosts.
 
 Pseudo-flow:
@@ -78,7 +80,7 @@ Codex reads `~/.codex/hooks.json`. Enable hooks in `~/.codex/config.toml`:
 hooks = true
 ```
 
-Example `Stop` entry (merge it with existing hooks instead of overwriting unrelated entries):
+Reminder-only `Stop` entry (merge it with existing hooks instead of overwriting unrelated entries):
 
 ```json
 {
@@ -99,6 +101,26 @@ Example `Stop` entry (merge it with existing hooks instead of overwriting unrela
 ```
 
 The command sources the private `.env` so the hook sees the real vault and state database. It inherits stdin, so `codex_memory_stop_hook.py` can read the event JSON. After changing a hook command, review the updated hook in Codex if the client asks you to trust the new hash.
+
+For automatic Codex closeout, add the actor, protocol, and timeout explicitly, and give the outer hook enough time to receive the structured result:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/zsh -lc 'set -a; source /path/to/codex-memory/.env; set +a; exec python3 /path/to/codex-memory/scripts/codex_memory_stop_hook.py --actor codex --protocol codex --auto-closeout --timeout 300'",
+            "timeout": 320
+          }
+        ]
+      }
+    ]
+  }
+}
+```
 
 ## macOS launchd Fallback
 
