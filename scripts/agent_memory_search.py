@@ -260,6 +260,8 @@ def zvec_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]
     rows = payload.get("results", [])
     if not isinstance(rows, list):
         return [], ["zvec returned invalid result shape"]
+    if not rows:
+        return [], []
     results: list[SearchResult] = []
     with connect() as conn:
         for rank, row in enumerate(rows, 1):
