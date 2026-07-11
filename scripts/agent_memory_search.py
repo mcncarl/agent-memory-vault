@@ -436,31 +436,65 @@ def redact_legacy_search_logs() -> dict[str, int]:
     return {"redacted": len(rows), "remaining_raw": remaining}
 
 
-def run_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]]:
+def run_search(
+    args: argparse.Namespace,
+) -> tuple[list[SearchResult], list[str], dict[str, dict[str, Any]]]:
     started = time.monotonic()
     warnings: list[str] = []
-    tasks = []
+    result_groups: list[list[SearchResult]] = []
+    backend_status: dict[str, dict[str, Any]] = {
+        "sqlite": {"status": "pending", "results": 0, "warnings": []},
+        "zvec": {
+            "status": "skipped" if args.no_zvec else "pending",
+            "results": 0,
+            "warnings": [],
+        },
+        "rg": {
+            "status": "pending" if args.force_rg else "skipped",
+            "results": 0,
+            "warnings": [],
+        },
+    }
     with ThreadPoolExecutor(max_workers=3) as executor:
-        tasks.append(executor.submit(sqlite_search, args))
-        tasks.append(executor.submit(zvec_search, args))
+        tasks = {executor.submit(sqlite_search, args): "sqlite"}
+        if not args.no_zvec:
+            tasks[executor.submit(zvec_search, args)] = "zvec"
         if args.force_rg:
-            tasks.append(executor.submit(rg_search, args))
+            tasks[executor.submit(rg_search, args)] = "rg"
         for future in as_completed(tasks):
+            backend = tasks[future]
             try:
                 rows, task_warnings = future.result()
             except Exception as exc:  # pragma: no cover
                 rows, task_warnings = [], [f"search task failed: {exc}"]
             warnings.extend(task_warnings)
-            future.rows = rows  # type: ignore[attr-defined]
-    rows = merge_results([getattr(task, "rows", []) for task in tasks])
+            result_groups.append(rows)
+            backend_status[backend] = {
+                "status": "error" if task_warnings else "ok",
+                "results": len(rows),
+                "warnings": [str(item) for item in task_warnings],
+            }
+    rows = merge_results(result_groups)
     rows = [row for row in rows if result_matches_filters(row, args)][: args.limit]
     log_search(args.query, rows, round((time.monotonic() - started) * 1000))
-    return rows, warnings
+    return rows, warnings, backend_status
 
 
-def print_human(query: str, rows: list[SearchResult], warnings: list[str]) -> None:
+def print_human(
+    query: str,
+    rows: list[SearchResult],
+    warnings: list[str],
+    backend_status: dict[str, dict[str, Any]],
+) -> None:
     print(f"query={query}")
     print(f"results={len(rows)}")
+    print(
+        "backends="
+        + ",".join(
+            f"{name}:{detail.get('status', '')}"
+            for name, detail in backend_status.items()
+        )
+    )
     for warning in warnings:
         print(f"warning: {warning}")
     for index, row in enumerate(rows, 1):
@@ -526,12 +560,23 @@ def main() -> int:
         else:
             print(f"redacted={payload['redacted']} remaining_raw={payload['remaining_raw']}")
         return 0
-    rows, warnings = run_search(args)
+    rows, warnings, backend_status = run_search(args)
     if args.json:
-        print(json.dumps({"query": args.query, "results": [row.to_dict() for row in rows], "warnings": warnings}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {
+                    "query": args.query,
+                    "backend_status": backend_status,
+                    "results": [row.to_dict() for row in rows],
+                    "warnings": warnings,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     else:
-        print_human(args.query, rows, warnings)
-    return 0
+        print_human(args.query, rows, warnings, backend_status)
+    return 0 if backend_status.get("sqlite", {}).get("status") == "ok" else 2
 
 
 if __name__ == "__main__":

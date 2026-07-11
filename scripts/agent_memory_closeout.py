@@ -38,6 +38,7 @@ LOG_PATH = Path(
     os.path.expandvars(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))
 ).expanduser().resolve()
 LOCK_PATH = CONFIG_ROOT / "locks" / "closeout.lock"
+RECONCILE_QUERY_MAX_CHARS = 900
 
 
 def find_default_git_root() -> Path:
@@ -444,7 +445,22 @@ def reconcile_query_for_file(path: Path) -> str:
     title = title_from_text(text, path)
     summary = summary_from_text(text)
     query = f"{title} {summary}".strip()
-    return query[:900]
+    return query[:RECONCILE_QUERY_MAX_CHARS]
+
+
+def reconcile_query_for_text(text: str) -> str:
+    """Build a bounded search query while retaining full text for safety checks."""
+    compact = re.sub(r"\s+", " ", text).strip()
+    if not compact:
+        return ""
+    title = ""
+    for line in text.splitlines():
+        if line.startswith("# "):
+            title = line[2:].strip()
+            break
+    summary = summary_from_text(text)
+    query = re.sub(r"\s+", " ", f"{title} {summary}".strip()) or compact
+    return query[:RECONCILE_QUERY_MAX_CHARS]
 
 
 def is_current_reconcile_target(path: Path) -> bool:
@@ -480,24 +496,45 @@ def coverage(left: str, right: str) -> float:
     return len(left_tokens & right_tokens) / len(left_tokens)
 
 
-def search_memory(query: str, limit: int = 8, no_zvec: bool = True) -> tuple[list[dict[str, Any]], list[str]]:
+def compact_identity_text(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9\u3400-\u9fff]+", "", text).casefold()
+
+
+def search_memory(
+    query: str,
+    limit: int = 8,
+    no_zvec: bool = True,
+) -> tuple[list[dict[str, Any]], list[str], dict[str, dict[str, Any]]]:
     command = [PYTHON, str(SEARCH_SCRIPT), query, "--limit", str(limit), "--json"]
     if no_zvec:
         command.append("--no-zvec")
     result = run_command(command, timeout=80, env=command_env_offline())
-    if not result["ok"]:
-        return [], [f"search failed: {str(result['stderr']).strip() or result['returncode']}"]
     try:
         payload = json.loads(str(result["stdout"]))
-    except json.JSONDecodeError:
-        return [], ["search returned non-json output"]
+    except (json.JSONDecodeError, TypeError):
+        detail = str(result.get("stderr", "")).strip() or str(result.get("returncode", ""))
+        warning = f"search failed: {detail}" if not result.get("ok") else "search returned non-json output"
+        return [], [warning], {"sqlite": {"status": "error"}}
+    if not isinstance(payload, dict):
+        return [], ["search returned invalid payload"], {"sqlite": {"status": "error"}}
     rows = payload.get("results", [])
     warnings = payload.get("warnings", [])
     if not isinstance(rows, list):
         rows = []
     if not isinstance(warnings, list):
         warnings = []
-    return rows, [str(item) for item in warnings]
+    backend_status = payload.get("backend_status", {})
+    if not isinstance(backend_status, dict):
+        backend_status = {}
+    if "sqlite" not in backend_status:
+        backend_status["sqlite"] = {
+            "status": "error" if not result.get("ok") else "ok",
+            "results": len(rows),
+            "warnings": [str(item) for item in warnings],
+        }
+    if not result.get("ok") and not warnings:
+        warnings = [f"search process exited with {result.get('returncode', '')}"]
+    return rows, [str(item) for item in warnings], backend_status
 
 
 def semantic_distance(row: dict[str, Any]) -> float | None:
@@ -522,11 +559,26 @@ def raw_semantic_distance(row: dict[str, Any]) -> float | None:
 
 def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
     if any(pattern.search(text) for pattern in ASK_USER_PATTERNS):
-        return "ASK_USER", None, {"similarity": 0.0, "coverage": 0.0, "semantic_distance": None, "raw_semantic_distance": None}
+        return "ASK_USER", None, {
+            "similarity": 0.0,
+            "coverage": 0.0,
+            "candidate_coverage": 0.0,
+            "title_match": False,
+            "semantic_distance": None,
+            "raw_semantic_distance": None,
+        }
     if not rows:
-        return "ADD", None, {"similarity": 0.0, "coverage": 0.0, "semantic_distance": None, "raw_semantic_distance": None}
-    candidates: list[tuple[int, float, float, float, str, dict[str, Any]]] = []
+        return "ADD", None, {
+            "similarity": 0.0,
+            "coverage": 0.0,
+            "candidate_coverage": 0.0,
+            "title_match": False,
+            "semantic_distance": None,
+            "raw_semantic_distance": None,
+        }
+    candidates: list[tuple[int, int, float, float, float, float, str, dict[str, Any]]] = []
     action_priority = {"NOOP": 4, "UPDATE": 3, "MERGE_REQUIRED": 2, "ADD": 1}
+    compact_input = compact_identity_text(text)
     for row in rows:
         comparison = " ".join(
             str(row.get(key, ""))
@@ -534,26 +586,72 @@ def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str,
         )
         similarity = jaccard(text, comparison)
         row_coverage = coverage(text, comparison)
+        candidate_coverage = coverage(comparison, text)
+        compact_title = compact_identity_text(str(row.get("title", "")))
+        title_match = len(compact_title) >= 4 and compact_title in compact_input
         distance = semantic_distance(row)
         if similarity >= 0.80 or row_coverage >= 0.90:
             action = "NOOP"
-        elif similarity >= 0.45 or row_coverage >= 0.55 or (distance is not None and distance <= 0.32):
+        elif (
+            title_match
+            or similarity >= 0.45
+            or row_coverage >= 0.55
+            or candidate_coverage >= 0.70
+            or (distance is not None and distance <= 0.32)
+        ):
             action = "UPDATE"
-        elif similarity >= 0.28 or row_coverage >= 0.35 or (distance is not None and distance <= 0.55):
+        elif (
+            similarity >= 0.28
+            or row_coverage >= 0.35
+            or candidate_coverage >= 0.45
+            or (distance is not None and distance <= 0.55)
+        ):
             action = "MERGE_REQUIRED"
         else:
             action = "ADD"
         semantic_quality = 1.0 - distance if distance is not None else -1.0
-        candidates.append((action_priority[action], semantic_quality, row_coverage, similarity, action, row))
-    _, _, best_coverage, best_similarity, action, best_row = max(candidates, key=lambda item: item[:4])
+        candidates.append(
+            (
+                action_priority[action],
+                int(title_match),
+                semantic_quality,
+                candidate_coverage,
+                row_coverage,
+                similarity,
+                action,
+                row,
+            )
+        )
+    _, best_title_match, _, best_candidate_coverage, best_coverage, best_similarity, action, best_row = max(
+        candidates,
+        key=lambda item: item[:6],
+    )
     distance = semantic_distance(best_row)
     raw_distance = raw_semantic_distance(best_row)
-    return action, best_row, {"similarity": best_similarity, "coverage": best_coverage, "semantic_distance": distance, "raw_semantic_distance": raw_distance}
+    return action, best_row, {
+        "similarity": best_similarity,
+        "coverage": best_coverage,
+        "candidate_coverage": best_candidate_coverage,
+        "title_match": bool(best_title_match),
+        "semantic_distance": distance,
+        "raw_semantic_distance": raw_distance,
+    }
 
 
 def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
-    rows, warnings = search_memory(args.prewrite, limit=args.limit, no_zvec=args.no_zvec)
+    search_query = reconcile_query_for_text(args.prewrite)
+    rows, warnings, backend_status = search_memory(
+        search_query,
+        limit=args.limit,
+        no_zvec=args.no_zvec,
+    )
+    sqlite_healthy = backend_status.get("sqlite", {}).get("status") == "ok"
     action, target, metrics = prewrite_recommendation(args.prewrite, rows)
+    recommendation_unavailable_reason = None
+    if not sqlite_healthy and action != "ASK_USER":
+        action = None
+        target = None
+        recommendation_unavailable_reason = "reconcile_search_unhealthy"
     return {
         "time": utc_now(),
         "run_id": uuid.uuid4().hex,
@@ -562,18 +660,27 @@ def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
         "session_hash": session_hash(args.session_id),
         "mode": "prewrite",
         "input_preview": args.prewrite[:500],
+        "search_query_preview": search_query[:500],
         "recommended_action": action,
+        "recommendation_unavailable_reason": recommendation_unavailable_reason,
         "recommended_target": target,
         "recommendation_metrics": {
             "similarity": round(metrics["similarity"], 4),
             "coverage": round(metrics["coverage"], 4),
+            "candidate_coverage": round(metrics["candidate_coverage"], 4),
+            "title_match": metrics["title_match"],
             "semantic_distance": round(metrics["semantic_distance"], 4) if metrics["semantic_distance"] is not None else None,
             "raw_semantic_distance": round(metrics["raw_semantic_distance"], 4) if metrics["raw_semantic_distance"] is not None else None,
         },
         "allowed_actions": sorted(RECONCILE_ACTIONS),
         "candidates": rows,
+        "backend_status": backend_status,
         "warnings": warnings,
-        "status": "warning" if action in {"ASK_USER", "MERGE_REQUIRED"} else "ok",
+        "status": (
+            "error"
+            if not sqlite_healthy
+            else ("warning" if warnings or action in {"ASK_USER", "MERGE_REQUIRED"} else "ok")
+        ),
     }
 
 
@@ -593,8 +700,23 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
         query = reconcile_query_for_file(entry.path)
         if not query:
             continue
-        rows, search_warnings = search_memory(query, limit=max(args.limit, 8), no_zvec=args.no_zvec)
+        rows, search_warnings, backend_status = search_memory(
+            query,
+            limit=max(args.limit, 8),
+            no_zvec=args.no_zvec,
+        )
         warnings.extend(search_warnings)
+        if backend_status.get("sqlite", {}).get("status") != "ok":
+            findings.append(
+                {
+                    "action": "ASK_USER",
+                    "file": str(entry.path),
+                    "rel_path": relative_to_vault(entry.path),
+                    "reason": "reconcile_search_unhealthy",
+                    "candidates": [],
+                }
+            )
+            continue
         source_text = query
         candidates: list[dict[str, Any]] = []
         for row in rows:
@@ -1006,7 +1128,13 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
 def print_human(payload: dict[str, Any]) -> None:
     if payload.get("mode") == "prewrite":
         print(f"mode=prewrite status={payload['status']}")
-        print(f"recommended_action={payload['recommended_action']}")
+        if payload.get("recommended_action"):
+            print(f"recommended_action={payload['recommended_action']}")
+        elif payload.get("recommendation_unavailable_reason"):
+            print(
+                "recommendation_unavailable="
+                f"{payload['recommendation_unavailable_reason']}"
+            )
         for index, row in enumerate(payload.get("candidates", [])[:5], 1):
             print(f"{index}. {row.get('rel_path', '')}")
             print(f"   title: {row.get('title', '')}")
