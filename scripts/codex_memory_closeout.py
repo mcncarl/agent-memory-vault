@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -12,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -108,6 +110,15 @@ class GitEntry:
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def normalized_actor(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9._-]+", "-", value.strip().lower()).strip("-")
+    return cleaned or "unknown"
+
+
+def session_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16] if value else ""
 
 
 def command_env_offline() -> dict[str, str]:
@@ -361,6 +372,33 @@ def summary_from_text(text: str) -> str:
     return " ".join(lines[:8])[:700]
 
 
+def frontmatter_list(path: Path, key: str) -> set[str]:
+    text = read_text(path)
+    if not text.startswith("---"):
+        return set()
+    end = text.find("\n---", 3)
+    if end == -1:
+        return set()
+    values: list[str] = []
+    current_key = ""
+    for line in text[3:end].splitlines():
+        if re.match(r"^\s+-\s+", line) and current_key == key:
+            values.append(re.sub(r"^\s+-\s+", "", line).strip())
+            continue
+        if line.startswith(" ") or ":" not in line:
+            continue
+        current_key, raw_value = line.split(":", 1)
+        current_key = current_key.strip()
+        if current_key != key:
+            continue
+        raw_value = raw_value.strip()
+        if raw_value.startswith("[") and raw_value.endswith("]"):
+            values.extend(item.strip() for item in raw_value[1:-1].split(","))
+        elif raw_value:
+            values.append(raw_value)
+    return {value.strip().strip("'\"`") for value in values if value.strip()}
+
+
 def reconcile_query_for_file(path: Path) -> str:
     text = read_text(path)
     title = title_from_text(text, path)
@@ -473,6 +511,10 @@ def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
     action, target, metrics = prewrite_recommendation(args.prewrite, rows)
     return {
         "time": utc_now(),
+        "run_id": uuid.uuid4().hex,
+        "actor": args.actor,
+        "trigger": args.trigger,
+        "session_hash": session_hash(args.session_id),
         "mode": "prewrite",
         "input_preview": args.prewrite[:500],
         "recommended_action": action,
@@ -495,6 +537,7 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
     findings: list[dict[str, Any]] = []
     targets = [entry for entry in entries if entry.exists and entry.is_memory_markdown and (entry.is_new or args.reconcile_all)]
     for entry in targets:
+        declared_relations = frontmatter_list(entry.path, "related_workflows")
         query = reconcile_query_for_file(entry.path)
         if not query:
             continue
@@ -505,6 +548,8 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
         for row in rows:
             if row.get("path") == str(entry.path) or row.get("rel_path") == relative_to_vault(entry.path):
                 continue
+            if str(row.get("rel_path") or "") in declared_relations:
+                continue
             comparison = " ".join(
                 str(row.get(key, ""))
                 for key in ("title", "rel_path", "summary", "hit")
@@ -513,9 +558,12 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
             row_coverage = coverage(source_text, comparison)
             distance = semantic_distance(row)
             raw_distance = raw_semantic_distance(row)
-            if similarity >= args.merge_threshold or row_coverage >= args.merge_coverage_threshold or (
-                distance is not None and distance <= args.semantic_merge_threshold
-            ):
+            semantic_duplicate = (
+                raw_distance <= args.semantic_merge_threshold
+                if raw_distance is not None
+                else distance is not None and distance <= args.semantic_merge_threshold
+            )
+            if similarity >= args.merge_threshold or row_coverage >= args.merge_coverage_threshold or semantic_duplicate:
                 candidates.append(
                     {
                         "rel_path": row.get("rel_path", ""),
@@ -652,7 +700,7 @@ def commit_files(files: list[Path], args: argparse.Namespace) -> dict[str, Any]:
     if diff_result["returncode"] == 0:
         return {"ok": True, "skipped": True, "detail": "nothing_staged"}
 
-    message = args.message or f"codex memory closeout: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    message = args.message or f"memory closeout[{args.actor}]: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
     commit_result = run_command(["git", "-C", str(REPO_ROOT), "commit", "-m", message, "--", *repo_paths], timeout=120)
     if not commit_result["ok"]:
         return {"ok": False, "stage": "commit", "detail": commit_result}
@@ -786,6 +834,10 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
 
     payload = {
         "time": utc_now(),
+        "run_id": uuid.uuid4().hex,
+        "actor": args.actor,
+        "trigger": args.trigger,
+        "session_hash": session_hash(args.session_id),
         "cwd": str(Path.cwd()),
         "mode": "closeout",
         "git_previous_observed_head": previous_observed_head,
@@ -861,6 +913,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--commit", action="store_true", help="After successful closeout, commit only processed memory files.")
     parser.add_argument("--commit-warnings", action="store_true", help="Allow commit when non-blocking warnings exist.")
     parser.add_argument("--message", default="", help="Custom scoped commit message.")
+    parser.add_argument("--actor", default=os.environ.get("MEMORY_ACTOR", "codex"), help="Agent that initiated closeout.")
+    parser.add_argument(
+        "--trigger",
+        default="manual",
+        choices=("manual", "stop-hook", "session-end", "launchd", "migration", "test"),
+        help="How this closeout run was triggered.",
+    )
+    parser.add_argument("--session-id", default="", help="Optional session id; only a one-way hash is logged.")
     parser.add_argument("--skip-zvec", action="store_true", help="Skip Zvec refresh.")
     parser.add_argument("--no-zvec", action="store_true", help="Skip Zvec during prewrite/postwrite reconcile search.")
     parser.add_argument("--zvec-timeout", type=int, default=240, help="Seconds before Zvec refresh times out.")
@@ -876,6 +936,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audit-open-loop-threshold", type=int, default=4, help="Forwarded open-loop threshold for closeout piggyback audit.")
     parser.add_argument("--audit-timeout", type=int, default=180, help="Seconds before closeout piggyback audit times out.")
     args = parser.parse_args()
+    args.actor = normalized_actor(args.actor)
     args.limit = max(args.limit, 1)
     args.audit_interval_days = max(args.audit_interval_days, 1)
     args.audit_limit = max(args.audit_limit, 1)

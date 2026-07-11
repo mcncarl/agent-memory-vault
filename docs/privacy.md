@@ -2,6 +2,8 @@
 
 这个模板不是你的真实记忆库。真实信息应该留在本地私有 vault 里。
 
+Claude Code 与 Codex 可以读取同一个私有配置源，但真实 Cookie、token 和 API key 仍然不能进入 Markdown vault、CLAUDE.md、AGENTS.md、auto-memory、搜索日志或公开仓库。推荐把私有值放在 Git 之外、权限为 `600` 的结构化文件或系统 Keychain 中，并通过 runner 只向目标子进程注入所需变量；不要让 Agent 打印整个 secrets 文件。
+
 ## 永远不要放进模板
 
 - `.env`

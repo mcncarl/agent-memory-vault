@@ -31,7 +31,13 @@ SQLite 只负责索引，不负责成为唯一事实源。
 
 统一搜索会并行查询 SQLite/FTS 与 Zvec，合并去重后再统一执行 `track`、`memory_type`、`project_id`、`status` 等筛选。语义距离超过阈值的结果直接丢弃，因此向量库不会为了凑足数量而返回明显无关的记忆。
 
-## 3. User memory and Agent memory
+## 3. Shared core and host adapters
+
+Claude Code 与 Codex 共用 Markdown、Git、SQLite、Zvec、closeout 和 audit。每个宿主只保留自己的规则入口与 Hook：Claude 使用 `CLAUDE.md` 导入共享 `AGENTS.md`，Codex 直接读取 `AGENTS.md`。
+
+普通事实默认 `agent_scope: shared`。`created_by` 和 `last_updated_by` 记录来源；closeout 日志另外记录 actor、trigger、session hash 和 run id。不要为每个 Agent 建独立 Git 基线或独立向量库。
+
+## 4. User memory and Agent memory
 
 用户记忆和 Agent 记忆分开：
 
@@ -40,7 +46,7 @@ SQLite 只负责索引，不负责成为唯一事实源。
 
 这样不会把“用户是谁”和“Agent 怎么做事”混在一起。
 
-## 4. Orthogonal retrieval
+## 5. Orthogonal retrieval
 
 正交检索就是用多个互不冲突的字段过滤记忆。
 
@@ -50,8 +56,9 @@ SQLite 只负责索引，不负责成为唯一事实源。
 memory_type: project
 track: project
 user_id: demo-user
-agent_id: codex
-app_id: codex
+agent_id: shared
+agent_scope: shared
+app_id: agent-memory
 project_id: example-app
 session_id: ""
 status: active
@@ -66,7 +73,7 @@ status: active
 
 它的价值不是让目录更复杂，而是减少 Agent 每次读取无关内容。
 
-## 5. Semantic retrieval sidecar
+## 6. Semantic retrieval sidecar
 
 语义检索适合这些问题：
 
@@ -81,7 +88,7 @@ status: active
 3. 表达模糊时，可以启用 Zvec 做语义候选召回。
 4. Zvec 命中的 chunk 只作为候选，最终仍然回读 Markdown 原文。
 
-## 6. Closeout and audit loop
+## 7. Closeout and audit loop
 
 closeout 是每次任务结束后的自动整理员。它不替 Agent 判断“什么值得记”，但会把收尾动作压成稳定流程：
 
@@ -99,7 +106,7 @@ audit 是定期体检。它只产出 findings 和裁决记录，不直接改写 
 
 `codex_memory_doctor.py` 是统一体检入口，核对 Markdown、SQLite、FTS、INDEX、Zvec、Git 基线、验证日期来源、日志隐私与自动化新鲜度。默认只读；`--repair-derived` 也只重建可再生索引。
 
-## 7. Self evolution
+## 8. Self evolution
 
 普通记忆不设候选池，直接进入正式目录。
 

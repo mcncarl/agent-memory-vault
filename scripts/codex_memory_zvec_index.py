@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -11,6 +13,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,6 +28,9 @@ DEFAULT_COLLECTION_PATH = Path(
     os.path.expandvars(
         os.environ.get("CODEX_MEMORY_VECTOR_DIR", "$HOME/.config/codex-memory/zvec/memory_chunks_embeddinggemma_768")
     )
+).expanduser().resolve()
+DEFAULT_LOCK_PATH = Path(
+    os.path.expandvars(os.environ.get("CODEX_MEMORY_ZVEC_LOCK", "$HOME/.config/codex-memory/locks/zvec.lock"))
 ).expanduser().resolve()
 DEFAULT_MODEL = os.environ.get("CODEX_MEMORY_EMBEDDING_MODEL", "google/embeddinggemma-300m")
 DEFAULT_EMBEDDING_DIM = int(os.environ.get("CODEX_MEMORY_EMBEDDING_DIM", "768"))
@@ -89,6 +95,26 @@ def load_sqlite_index() -> Any:
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+@contextlib.contextmanager
+def zvec_lock(exclusive: bool, timeout: float):
+    DEFAULT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with DEFAULT_LOCK_PATH.open("a+", encoding="utf-8") as handle:
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), operation | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"zvec lock timed out: {DEFAULT_LOCK_PATH}")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def sha256_text(text: str) -> str:
@@ -929,13 +955,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-db", default=str(STATE_DB), help=argparse.SUPPRESS)
     parser.add_argument("--collection-path", default=str(DEFAULT_COLLECTION_PATH), help=argparse.SUPPRESS)
     parser.add_argument("--force", action="store_true", help="Re-index even when doc hashes are unchanged.")
+    parser.add_argument("--lock-timeout", type=float, default=60.0, help="Seconds to wait for concurrent Zvec readers or writers.")
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    if not (args.init or args.scan or args.prune or args.report or args.changed_file or args.search):
-        args.init = True
+def run_locked(args: argparse.Namespace) -> int:
     sqlite_index = load_sqlite_index()
     state_db = Path(args.state_db).expanduser().resolve()
     collection_path = Path(args.collection_path).expanduser().resolve()
@@ -965,6 +989,22 @@ def main() -> int:
                 exit_code = max(exit_code, run_search(args, conn, store))
             return exit_code
     except Exception as exc:
+        if args.json:
+            print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2))
+        else:
+            print(f"vector_index=error\nerror: {exc}", file=sys.stderr)
+        return 2
+
+
+def main() -> int:
+    args = parse_args()
+    if not (args.init or args.scan or args.prune or args.report or args.changed_file or args.search):
+        args.init = True
+    exclusive = bool(args.init or args.scan or args.prune or args.changed_file)
+    try:
+        with zvec_lock(exclusive=exclusive, timeout=args.lock_timeout):
+            return run_locked(args)
+    except TimeoutError as exc:
         if args.json:
             print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2))
         else:

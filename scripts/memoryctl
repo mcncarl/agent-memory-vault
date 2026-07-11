@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+SCRIPT_ROOT = Path(__file__).resolve().parent
+COMMANDS = {
+    "search": SCRIPT_ROOT / "codex_memory_search.py",
+    "closeout": SCRIPT_ROOT / "codex_memory_closeout.py",
+    "audit": SCRIPT_ROOT / "codex_memory_audit.py",
+    "audit-autorun": SCRIPT_ROOT / "codex_memory_audit_autorun.py",
+    "doctor": SCRIPT_ROOT / "codex_memory_doctor.py",
+    "index": SCRIPT_ROOT / "codex_memory_index.py",
+    "zvec": SCRIPT_ROOT / "codex_memory_zvec_index.py",
+    "check": SCRIPT_ROOT / "codex_memory_check.py",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Shared Claude Code/Codex memory entrypoint.")
+    parser.add_argument(
+        "--actor",
+        choices=("codex", "claude", "human", "migration", "test"),
+        default=os.environ.get("MEMORY_ACTOR", "codex"),
+    )
+    parser.add_argument("command", choices=(*COMMANDS.keys(), "prewrite"))
+    parser.add_argument("args", nargs=argparse.REMAINDER)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    command_name = "closeout" if args.command == "prewrite" else args.command
+    target = COMMANDS[command_name]
+    forwarded = list(args.args)
+    if forwarded and forwarded[0] == "--":
+        forwarded = forwarded[1:]
+    if args.command == "prewrite":
+        if not forwarded:
+            print("prewrite requires a memory summary", file=sys.stderr)
+            return 2
+        forwarded = ["--prewrite", forwarded[0], *forwarded[1:]]
+    if command_name == "closeout":
+        forwarded.extend(["--actor", args.actor])
+        if args.command == "closeout" and not any(
+            flag in forwarded for flag in ("--commit", "--dry-run", "--prewrite")
+        ):
+            forwarded.append("--commit")
+    elif command_name == "search" and args.actor in {"codex", "claude"} and "--agent-scope" not in forwarded:
+        forwarded.extend(["--agent-scope", args.actor])
+    env = os.environ.copy()
+    env["MEMORY_ACTOR"] = args.actor
+    return subprocess.run([str(target), *forwarded], env=env, check=False).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

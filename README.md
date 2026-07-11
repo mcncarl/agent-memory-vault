@@ -1,12 +1,12 @@
-# Codex Memory Template
+# Codex Memory Template: Shared Claude Code + Codex
 
-这是一个 Codex 长期记忆库模板。它把普通 Markdown 文件当作长期事实源，用 SQLite 建全库索引，并用少量固定字段支持按用户、Agent、项目、应用、会话和记忆类型过滤。需要语义检索时，也可以额外启用本地 EmbeddingGemma + Zvec 向量旁路。
+这是一个可由 Claude Code 与 Codex 共用的长期记忆库模板。它把普通 Markdown 文件当作唯一长期事实源，用 SQLite 建全库索引，并用少量固定字段支持按用户、Agent、项目、应用、会话和记忆类型过滤。需要语义检索时，也可以额外启用本地 EmbeddingGemma + Zvec 向量旁路。
 
 这个仓库只包含模板、脚本和假示例，不应该包含你的真实记忆、真实路径、API key、私人项目名或聊天原文。
 
 ## 它解决什么问题
 
-- 让 Codex 每次开始重要任务时，先读最相关的长期记忆。
+- 让 Claude Code 与 Codex 每次开始重要任务时，读取同一份相关长期记忆。
 - 让每次任务结束时，把稳定事实、项目状态、工作流和 Agent 经验沉淀到 Markdown。
 - 让 Markdown 仍然是源文件，SQLite 只做索引和搜索，Obsidian 只是可选的查看和编辑方式。
 - 可选增加向量检索：只记得大概意思时，用 embedding + Zvec 找到相关 Markdown，再回读原文。
@@ -24,7 +24,7 @@
 
 ```text
 templates/vault/
-  AGENTS.md              # Codex 读取和写入规则
+  AGENTS.md              # 两端共享的读取和写入规则
   INDEX.md               # 记忆路由索引
   用户记忆/              # 用户偏好、边界、长期画像
   项目/                  # 项目级状态和结论
@@ -43,7 +43,8 @@ scripts/
                           # audit 自动触发器：超过间隔才运行
   codex_memory_doctor.py  # 全链路体检：Markdown/SQLite/FTS/Zvec/Git/自动化
   codex_memory_stop_hook.py
-                          # Stop 事件节流提醒 + 到期 audit
+                          # 可选 Stop 自动 closeout + 到期 audit
+  memoryctl               # Claude/Codex 共用的平台中立命令入口
   codex_memory_zvec_index.py
   codex_memory_retrieval_benchmark.py
   codex_agent_evolution.py
@@ -69,6 +70,23 @@ python3 scripts/codex_memory_check.py
 python3 scripts/codex_memory_doctor.py
 ```
 
+## Claude Code 与 Codex 共用
+
+保持一个 Markdown vault、一个 Git 基线、一个 SQLite、一个 Zvec 和一个 audit 调度器。两个宿主只维护薄适配层：
+
+- Codex 的 `AGENTS.md` 指向 vault 规则。
+- Claude Code 的 `CLAUDE.md` 使用 `@/absolute/path/to/AGENTS.md` 导入同一规则。
+- Claude Code 原生 auto-memory 不要指向正式 vault；推荐关闭，或只把它当作非正式草稿层。
+- 两端通过 `memoryctl --actor codex|claude` 使用同一搜索和 closeout。
+
+```bash
+python3 scripts/memoryctl --actor claude search "项目状态" --limit 5
+python3 scripts/memoryctl --actor codex prewrite "准备写入的记忆摘要"
+python3 scripts/memoryctl --actor claude closeout
+```
+
+closeout 日志只保存 session id 的哈希，并记录 `actor`、`trigger` 和 `run_id`。普通事实默认 `agent_scope: shared`；只有宿主特有经验才标为 `codex` 或 `claude`。
+
 搜索示例：
 
 ```bash
@@ -80,14 +98,14 @@ python3 scripts/codex_memory_search.py "复用流程" --memory-type workflow
 任务结束时建议使用统一收尾脚本。它会自动发现未提交变更，也会追踪“上次成功 closeout 观察到的提交”之后的 Git 历史，因此 Obsidian Git 等工具提前自动提交也不会造成漏处理。随后执行结构检查、字面与语义双重对账、SQLite 刷新、可选 Zvec 补漏/清理、Agent evolution 刷新，并在 audit 超过间隔时顺手跑一次体检。并发 closeout 会被文件锁拦住，避免数据库和 Git 基线互相踩踏。
 
 ```bash
-python3 scripts/codex_memory_closeout.py --dry-run
-python3 scripts/codex_memory_closeout.py --commit
+python3 scripts/memoryctl --actor codex closeout --dry-run
+python3 scripts/memoryctl --actor codex closeout
 ```
 
 写入正式记忆前，可以先让脚本做一次对账，判断应该新建、更新旧文件、跳过、还是需要人工合并：
 
 ```bash
-python3 scripts/codex_memory_closeout.py --prewrite "准备写入的记忆摘要"
+python3 scripts/memoryctl --actor codex prewrite "准备写入的记忆摘要"
 ```
 
 audit 可以手动运行，也可以由 closeout 捎带触发：

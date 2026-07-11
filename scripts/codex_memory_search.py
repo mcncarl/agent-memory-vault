@@ -197,7 +197,7 @@ def sqlite_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[st
                 args.memory_type,
                 args.project_id,
                 args.user_id,
-                args.agent_id,
+                args.agent_id if not args.agent_scope else "",
                 args.app_id,
                 args.session_id,
                 args.status,
@@ -340,6 +340,8 @@ def merge_results(result_groups: list[list[SearchResult]]) -> list[SearchResult]
 
 
 def result_matches_filters(result: SearchResult, args: argparse.Namespace) -> bool:
+    if args.agent_scope and (result.agent_id or "shared") not in {"shared", args.agent_scope}:
+        return False
     for value, actual in (
         (args.track, result.track),
         (args.memory_type, result.memory_type),
@@ -441,6 +443,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project-id", default="", help="Filter all results by project_id substring.")
     parser.add_argument("--user-id", default="", help="Filter all results by user_id.")
     parser.add_argument("--agent-id", default="", help="Filter all results by agent_id.")
+    parser.add_argument(
+        "--agent-scope",
+        choices=("codex", "claude", "shared"),
+        default="",
+        help="Return shared memories plus memories scoped to this Agent.",
+    )
     parser.add_argument("--app-id", default="", help="Filter all results by app_id.")
     parser.add_argument("--session-id", default="", help="Filter all results by session_id.")
     parser.add_argument("--status", default="", help="Filter all results by status.")

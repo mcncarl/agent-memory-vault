@@ -12,8 +12,8 @@ audit_report = "~/.config/codex-memory/reports/latest-audit.json"
 python = "python3"
 
 user_id = "demo-user"
-agent_id = "codex"
-app_id = "codex"
+agent_id = "shared"
+app_id = "agent-memory"
 
 [closeout]
 ordinary_memory_candidate_pool = false

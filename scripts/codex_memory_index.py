@@ -19,8 +19,8 @@ STATE_DB = Path(
     os.path.expandvars(os.environ.get("CODEX_MEMORY_STATE_DB", "$HOME/.config/codex-memory/state.sqlite"))
 ).expanduser().resolve()
 DEFAULT_USER_ID = os.environ.get("CODEX_MEMORY_USER_ID", "demo-user")
-DEFAULT_AGENT_ID = os.environ.get("CODEX_MEMORY_AGENT_ID", "codex")
-DEFAULT_APP_ID = os.environ.get("CODEX_MEMORY_APP_ID", "codex")
+DEFAULT_AGENT_ID = os.environ.get("CODEX_MEMORY_AGENT_ID", "shared")
+DEFAULT_APP_ID = os.environ.get("CODEX_MEMORY_APP_ID", "agent-memory")
 DEFAULT_LIMIT = 5
 
 
@@ -276,7 +276,7 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
             project_id=project_id,
             app_id=as_text(meta.get("app_id"), DEFAULT_APP_ID),
             user_id=as_text(meta.get("user_id"), DEFAULT_USER_ID),
-            agent_id=as_text(meta.get("agent_id"), DEFAULT_AGENT_ID),
+            agent_id=as_text(meta.get("agent_scope"), as_text(meta.get("agent_id"), DEFAULT_AGENT_ID)),
             session_id=as_text(meta.get("session_id")),
             status=status,
             sensitivity=as_text(meta.get("sensitivity"), "private" if track == "user" else "normal"),

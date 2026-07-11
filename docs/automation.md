@@ -3,7 +3,7 @@
 Codex Memory can run without background automation. The recommended automated setup is layered:
 
 1. `closeout` piggyback: every important task-end closeout checks whether audit is due.
-2. Optional Stop hook: only reminds when memory files changed and the index is stale; it also lets the seven-day gate run audit when due.
+2. Optional Stop hook: reminder mode is safest; shared Claude/Codex setups can opt into full closeout only when pending memory changes exist.
 3. Optional macOS `launchd` fallback: runs audit weekly even if no Agent session happens.
 
 Automation should only produce reminders, reports, logs, and local audit decisions. It should not directly rewrite Markdown facts.
@@ -29,14 +29,24 @@ If the last successful audit is recent, autorun exits with `skipped_recent`.
 
 If another tool auto-commits the vault before closeout runs, closeout compares the last successful `git_observed_through` value with current `HEAD` and processes those committed file changes as well. This lets Obsidian Git keep its backup schedule without stealing the memory pipeline's indexing baseline.
 
-## Stop Hook Reminder
+## Stop Hook Modes
 
-Codex Stop is turn-scoped, so the hook must stay quiet and idempotent:
+Stop is turn-scoped in both Claude Code and Codex, so the hook must stay quiet and idempotent.
+
+Reminder mode:
 
 - Remind only when Markdown files under the memory vault changed and the SQLite index is older than those files.
 - Call `codex_memory_audit_autorun.py`; its interval gate decides whether a real audit is due.
 - Stamp each session or day so the same reminder is not repeated constantly.
-- Do not write memories, run commits, or edit Markdown from the hook.
+- Do not let the hook invent or rewrite memory facts.
+
+Automatic closeout mode is appropriate when the Agent has already written formal memory before stopping:
+
+- Gate on dirty Markdown or Git history after `git_observed_through`.
+- Run complete closeout only when the gate is true; otherwise stay silent.
+- Pass `--actor codex` or `--actor claude` so logs and commits remain attributable.
+- Claude Stop may return `decision: block` when closeout fails; SessionEnd can be a short non-blocking fallback.
+- Keep one global closeout lock and one Git baseline across both hosts.
 
 Pseudo-flow:
 
@@ -49,6 +59,16 @@ on Stop:
         notify: run codex_memory_closeout.py --dry-run
 
   run audit_autorun with a 7-day interval gate
+```
+
+Automatic closeout example:
+
+```bash
+python3 scripts/codex_memory_stop_hook.py \
+  --actor claude \
+  --protocol claude \
+  --auto-closeout \
+  --timeout 300
 ```
 
 Codex reads `~/.codex/hooks.json`. Enable hooks in `~/.codex/config.toml`:

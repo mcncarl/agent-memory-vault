@@ -1,6 +1,6 @@
-# Codex Memory Instructions
+# Shared Claude Code and Codex Memory Instructions
 
-这是本地长期记忆库。遇到既有项目、仓库、路径、人物、历史结论、继续上次任务、报告、调研、较长排查时，默认先使用这个记忆库；简单翻译、改一句话、查时间等一次性小任务可以跳过。
+这是 Claude Code 与 Codex 可共用的本地长期记忆库。Markdown 是唯一正式事实源；两个 Agent 不各自维护第二套正式事实。
 
 读取顺序：
 
@@ -15,7 +15,8 @@
 优先使用统一搜索脚本，而不是手工猜该读哪个文件：
 
 ```bash
-python3 scripts/codex_memory_search.py "查询词" --limit 5
+python3 scripts/memoryctl --actor codex search "查询词" --limit 5
+python3 scripts/memoryctl --actor claude search "查询词" --limit 5
 ```
 
 它会先查 SQLite/FTS；启用语义索引时，也可以并行查 Zvec。Zvec 命中只能当作候选线索，最终回答前必须回读 Markdown 原文。
@@ -25,7 +26,7 @@ python3 scripts/codex_memory_search.py "查询词" --limit 5
 正式写入前先做对账，避免重复记忆越写越多：
 
 ```bash
-python3 scripts/codex_memory_closeout.py --prewrite "准备写入的记忆摘要"
+python3 scripts/memoryctl --actor <codex|claude> prewrite "准备写入的记忆摘要"
 ```
 
 对账动作只允许这 6 种：
@@ -40,8 +41,8 @@ python3 scripts/codex_memory_closeout.py --prewrite "准备写入的记忆摘要
 重要任务结束前执行 memory closeout：
 
 ```bash
-python3 scripts/codex_memory_closeout.py --dry-run
-python3 scripts/codex_memory_closeout.py --commit
+python3 scripts/memoryctl --actor <codex|claude> closeout --dry-run
+python3 scripts/memoryctl --actor <codex|claude> closeout
 ```
 
 closeout 会自动发现记忆库变更文件，执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新、audit 捎带触发、closeout 日志写入，并只提交本轮处理过的记忆文件。
@@ -75,6 +76,9 @@ project_id: example-app
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
+agent_scope: shared
+created_by: human | codex | claude
+last_updated_by: human | codex | claude
 session_id: ""
 status: active
 sensitivity: normal
@@ -92,3 +96,4 @@ keywords:
 - 不要把 SQLite 数据库提交到 Git。
 - 搜索日志只保存查询哈希、长度、来源和耗时，不保存新的查询原文。
 - 对外分享前必须脱敏。
+- Claude Code 原生 auto-memory 不应直接指向正式 vault；可停用，或只把它当作非正式草稿层。

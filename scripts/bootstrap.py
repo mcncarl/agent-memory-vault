@@ -98,8 +98,8 @@ def parse_args() -> argparse.Namespace:
         help="Git root that contains the memory vault. Defaults to --memory-root.",
     )
     parser.add_argument("--user-id", default="demo-user", help="Non-secret user identifier.")
-    parser.add_argument("--agent-id", default="codex", help="Agent identifier.")
-    parser.add_argument("--app-id", default="codex", help="Application/workspace identifier.")
+    parser.add_argument("--agent-id", default="shared", help="Default memory scope: shared, codex, or claude.")
+    parser.add_argument("--app-id", default="agent-memory", help="Application/workspace identifier.")
     parser.add_argument(
         "--overwrite",
         action="store_true",

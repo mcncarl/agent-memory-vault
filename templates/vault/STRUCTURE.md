@@ -5,6 +5,7 @@ project_id: codex-memory-structure
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
+agent_scope: shared
 session_id: ""
 status: active
 sensitivity: normal

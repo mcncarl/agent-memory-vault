@@ -2,6 +2,12 @@
 
 这份指南用于把一个已经在使用的私人 Codex 记忆系统，整理成可复用模板。
 
+## 接入 Claude Code 而不复制 vault
+
+保留现有 Markdown、Git 基线、SQLite、Zvec、closeout 日志和 audit 调度器。新增一个薄的 `~/.claude/CLAUDE.md`，通过绝对路径导入 vault 的 `AGENTS.md`，再让 Claude 使用 `memoryctl --actor claude` 搜索和收尾。
+
+关闭 Claude Code auto-memory，或明确把它限定为非正式草稿；不要把 auto-memory 目录重定向到正式 vault。旧文件缺少 `agent_scope` 时按 `shared` 处理，只有宿主特有 Agent case 才标 `codex` 或 `claude`。
+
 ## 1. 不要直接复制真实 vault
 
 真实 vault 里通常会有：
