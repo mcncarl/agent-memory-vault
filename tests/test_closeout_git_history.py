@@ -5,7 +5,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -86,6 +88,39 @@ class CloseoutRenameTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assert_rename_and_add(entries)
 
+
+class CloseoutReconcileStatusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = load_closeout()
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.vault = Path(self.tempdir.name).resolve() / "AgentMemory"
+        (self.vault / "项目").mkdir(parents=True)
+        self.module.VAULT_ROOT = self.vault
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_archived_history_does_not_block_active_fact_reconcile(self) -> None:
+        archived = self.vault / "项目" / "history.md"
+        archived.write_text(
+            "---\nmemory_type: project_history\nstatus: archived\n---\n\n# History\n",
+            encoding="utf-8",
+        )
+        entry = self.module.GitEntry(
+            status="A",
+            repo_path="AgentMemory/项目/history.md",
+            path=archived,
+        )
+        args = Namespace(reconcile_all=False, limit=8, no_zvec=False)
+        with mock.patch.object(
+            self.module,
+            "search_memory",
+            side_effect=AssertionError("archived history must not enter duplicate search"),
+        ):
+            findings, warnings = self.module.postwrite_reconcile([entry], args)
+
+        self.assertEqual(findings, [])
+        self.assertEqual(warnings, [])
 
 if __name__ == "__main__":
     unittest.main()

@@ -78,6 +78,7 @@ ASK_USER_PATTERNS = [
         r"[\"']?(?!redacted\b|example\b|placeholder\b|your[_-]|<)[A-Za-z0-9_./+=-]{20,}"
     ),
 ]
+NONCURRENT_RECONCILE_STATUSES = {"archived", "outdated", "superseded", "deleted"}
 
 
 @dataclass
@@ -435,6 +436,11 @@ def reconcile_query_for_file(path: Path) -> str:
     return query[:900]
 
 
+def is_current_reconcile_target(path: Path) -> bool:
+    statuses = {value.lower() for value in frontmatter_list(path, "status")}
+    return not bool(statuses & NONCURRENT_RECONCILE_STATUSES)
+
+
 def tokenize(text: str) -> set[str]:
     tokens: set[str] = set()
     for word in re.findall(r"[A-Za-z0-9_]{2,}", text.lower()):
@@ -563,7 +569,14 @@ def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
 def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[str]]:
     warnings: list[str] = []
     findings: list[dict[str, Any]] = []
-    targets = [entry for entry in entries if entry.exists and entry.is_memory_markdown and (entry.is_new or args.reconcile_all)]
+    targets = [
+        entry
+        for entry in entries
+        if entry.exists
+        and entry.is_memory_markdown
+        and (entry.is_new or args.reconcile_all)
+        and is_current_reconcile_target(entry.path)
+    ]
     for entry in targets:
         declared_relations = frontmatter_list(entry.path, "related_workflows")
         query = reconcile_query_for_file(entry.path)
