@@ -10,6 +10,7 @@ SCRIPTS_ROOT = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
+import agent_memory_env
 from agent_memory_env import env_value, reset_config_cache
 
 
@@ -52,6 +53,42 @@ class AgentMemoryEnvironmentTests(unittest.TestCase):
                     reset_config_cache()
                     self.assertEqual(env_value("ROOT", "/default"), "/configured/vault")
                     self.assertEqual(env_value("ZVEC_PYTHON", "python3"), "/configured/vector/python")
+        reset_config_cache()
+
+    def test_repo_source_defaults_to_isolated_local_state(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            with mock.patch.object(agent_memory_env, "RUNTIME_ROOT", root), mock.patch.dict(
+                "os.environ", {}, clear=True
+            ):
+                reset_config_cache()
+                self.assertEqual(
+                    env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"),
+                    str(root / ".agent-memory" / "state.sqlite"),
+                )
+        reset_config_cache()
+
+    def test_repo_dotenv_is_loaded_without_shell_export(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            (root / ".env").write_text(
+                "AGENT_MEMORY_ROOT=/dotenv/vault\n"
+                "AGENT_MEMORY_CONFIG_ROOT=$HOME/.config/dotenv-memory\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(agent_memory_env, "RUNTIME_ROOT", root), mock.patch.dict(
+                "os.environ", {}, clear=True
+            ):
+                reset_config_cache()
+                self.assertEqual(env_value("ROOT", "/default"), "/dotenv/vault")
+                self.assertEqual(
+                    env_value("STATE_DB", "/default/state.sqlite"),
+                    "$HOME/.config/dotenv-memory/state.sqlite",
+                )
         reset_config_cache()
 
 

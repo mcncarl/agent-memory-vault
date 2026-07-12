@@ -19,6 +19,7 @@ COMMANDS = {
     "audit-autorun": SCRIPT_ROOT / "agent_memory_audit_autorun.py",
     "claim": SCRIPT_ROOT / "agent_memory_claim.py",
     "claims": SCRIPT_ROOT / "agent_memory_claim.py",
+    "claims-expire": SCRIPT_ROOT / "agent_memory_claim.py",
     "doctor": SCRIPT_ROOT / "agent_memory_doctor.py",
     "index": SCRIPT_ROOT / "agent_memory_index.py",
     "zvec": SCRIPT_ROOT / "agent_memory_zvec_index.py",
@@ -79,8 +80,8 @@ def main() -> int:
             print("prewrite requires a memory summary", file=sys.stderr)
             return 2
         forwarded = ["--prewrite", forwarded[0], *forwarded[1:]]
-    elif args.command in {"claim", "claims"}:
-        action = "claim" if args.command == "claim" else "list"
+    elif args.command in {"claim", "claims", "claims-expire"}:
+        action = {"claim": "claim", "claims": "list", "claims-expire": "expire-stale"}[args.command]
         global_options: list[str] = []
         action_options: list[str] = []
         index = 0

@@ -278,7 +278,7 @@ def main() -> int:
         result = run_closeout(payload, args.actor, args.timeout)
         return 0 if result.get("status") == "ok" else report_failure(args.protocol, result)
     if args.auto_closeout and paths:
-        all_claimed_paths = {Path(row["path"]).resolve() for row in all_active_claim_rows()}
+        all_claimed_paths = {Path(row["path"]).resolve() for row in all_active_claim_rows(max_age_hours=24)}
         unclaimed = [path for path in paths if path.resolve() not in all_claimed_paths]
         if unclaimed:
             result = {

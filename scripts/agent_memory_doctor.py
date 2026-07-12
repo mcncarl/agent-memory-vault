@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 from agent_memory_env import env_value, load_config
 
 
-VERSION = "2.1"
+VERSION = "2.2"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VAULT_ROOT = Path(os.path.expandvars(env_value("ROOT", str(REPO_ROOT / "templates" / "vault")))).expanduser().resolve()
 GIT_ROOT = Path(os.path.expandvars(env_value("GIT_ROOT", str(REPO_ROOT)))).expanduser().resolve()
@@ -44,6 +44,9 @@ DEPENDENCY_LOCK = Path(os.path.expandvars(env_value("DEPENDENCY_LOCK", str(CONFI
 REQUIRE_LOCAL_MODEL = env_value("REQUIRE_LOCAL_MODEL", "false").strip().lower() in {"1", "true", "yes", "on"}
 EXCLUDED_VECTOR_TYPES = {"routing", "directory_index", "template", "agent_case_candidate", "skill_candidate"}
 EXCLUDED_VECTOR_STATUS = {"archived", "deleted", "obsolete", "outdated", "deprecated", "stale"}
+STALE_CLAIM_HOURS = 24
+REMOTE_BACKUP_MAX_UNPUSHED_COMMITS = 10
+REMOTE_BACKUP_MAX_AGE_DAYS = 3
 
 
 def utc_now() -> str:
@@ -156,6 +159,33 @@ raise SystemExit(0 if not missing and not mismatched else 2)
     return bool(result["ok"]), detail
 
 
+def verify_semantic_python_runtime() -> tuple[bool, dict[str, Any]]:
+    if not ZVEC_PYTHON.is_file():
+        return False, {"python": str(ZVEC_PYTHON), "error": "python_missing_or_broken_symlink"}
+    code = """
+import json
+import os
+import sys
+base = getattr(sys, '_base_executable', '') or sys.executable
+print(json.dumps({
+    'executable': sys.executable,
+    'base_executable': base,
+    'base_exists': os.path.isfile(base),
+    'version': '.'.join(str(part) for part in sys.version_info[:3]),
+}))
+"""
+    result = run([str(ZVEC_PYTHON), "-c", code], 30, offline_env())
+    try:
+        detail = json.loads(str(result.get("stdout", "")))
+    except json.JSONDecodeError:
+        detail = {"error": result.get("detail", "invalid_python_runtime_output")}
+    detail.update({"python": str(ZVEC_PYTHON), "returncode": result.get("returncode")})
+    ok = bool(result["ok"] and detail.get("base_exists"))
+    if result["ok"] and not detail.get("base_exists"):
+        detail["error"] = "base_interpreter_missing"
+    return ok, detail
+
+
 def offline_semantic_probe() -> tuple[bool, dict[str, Any]]:
     command = [
         str(ZVEC_PYTHON),
@@ -266,6 +296,106 @@ def git_remote_has_credential() -> bool:
         if re.search(r"https?://[^/@\s]+:[^/@\s]+@", url) or re.search(r"gh[pousr]_[A-Za-z0-9]{20,}", url):
             return True
     return False
+
+
+def git_remote_backup_health(memory_pathspec: str, now: dt.datetime | None = None) -> tuple[bool, dict[str, Any]]:
+    upstream_result = run(
+        ["git", "-C", str(GIT_ROOT), "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        15,
+    )
+    if not upstream_result["ok"]:
+        return False, {"configured": False, "error": "upstream_missing"}
+    upstream = str(upstream_result.get("stdout", "")).strip()
+    divergence = run(
+        ["git", "-C", str(GIT_ROOT), "rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
+        30,
+    )
+    memory_ahead_result = run(
+        ["git", "-C", str(GIT_ROOT), "rev-list", "--count", "@{upstream}..HEAD", "--", memory_pathspec],
+        30,
+    )
+    try:
+        behind, ahead_total = [int(value) for value in str(divergence.get("stdout", "")).split()]
+        ahead_memory = int(str(memory_ahead_result.get("stdout", "")).strip())
+    except (TypeError, ValueError):
+        return False, {
+            "configured": True,
+            "upstream": upstream,
+            "error": "git_divergence_unreadable",
+        }
+    oldest_age_days: float | None = None
+    if ahead_memory:
+        oldest_result = run(
+            [
+                "git",
+                "-C",
+                str(GIT_ROOT),
+                "log",
+                "--reverse",
+                "--format=%ct",
+                "@{upstream}..HEAD",
+                "--",
+                memory_pathspec,
+            ],
+            30,
+        )
+        timestamps = [line for line in str(oldest_result.get("stdout", "")).splitlines() if line]
+        try:
+            oldest = dt.datetime.fromtimestamp(int(timestamps[0]), tz=dt.timezone.utc)
+        except (IndexError, TypeError, ValueError, OSError):
+            return False, {
+                "configured": True,
+                "upstream": upstream,
+                "ahead_total": ahead_total,
+                "ahead_memory": ahead_memory,
+                "behind": behind,
+                "error": "oldest_unpushed_commit_unreadable",
+            }
+        current = now or dt.datetime.now(dt.timezone.utc)
+        oldest_age_days = max(0.0, (current - oldest).total_seconds() / 86400)
+    overdue = (
+        behind > 0
+        or ahead_memory >= REMOTE_BACKUP_MAX_UNPUSHED_COMMITS
+        or (oldest_age_days is not None and oldest_age_days >= REMOTE_BACKUP_MAX_AGE_DAYS)
+    )
+    return not overdue, {
+        "configured": True,
+        "upstream": upstream,
+        "ahead_total": ahead_total,
+        "ahead_memory": ahead_memory,
+        "behind": behind,
+        "oldest_unpushed_age_days": round(oldest_age_days, 2) if oldest_age_days is not None else None,
+        "warning_threshold_commits": REMOTE_BACKUP_MAX_UNPUSHED_COMMITS,
+        "warning_threshold_days": REMOTE_BACKUP_MAX_AGE_DAYS,
+    }
+
+
+def session_claim_hygiene(
+    conn: sqlite3.Connection,
+    now: dt.datetime | None = None,
+    max_age_hours: int = STALE_CLAIM_HOURS,
+) -> tuple[bool, dict[str, Any]]:
+    tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "memory_session_claims" not in tables:
+        return False, {"active": 0, "stale": [], "error": "claim_table_missing"}
+    rows = conn.execute(
+        "SELECT actor, rel_path, updated_at FROM memory_session_claims WHERE status='active' ORDER BY actor, rel_path"
+    ).fetchall()
+    current = now or dt.datetime.now(dt.timezone.utc)
+    stale: list[dict[str, Any]] = []
+    for row in rows:
+        updated_at = parse_time(str(row["updated_at"]))
+        age_hours = (current - updated_at).total_seconds() / 3600 if updated_at else None
+        if updated_at is None or age_hours is not None and age_hours >= max_age_hours:
+            stale.append(
+                {
+                    "actor": str(row["actor"]),
+                    "rel_path": str(row["rel_path"]),
+                    "age_hours": round(max(0.0, age_hours), 1) if age_hours is not None else None,
+                    "reason": "expired" if updated_at else "invalid_timestamp",
+                }
+            )
+    return not stale, {"active": len(rows), "stale": stale, "stale_after_hours": max_age_hours}
 
 
 def eligible_vector(row: sqlite3.Row) -> bool:
@@ -435,6 +565,14 @@ def collect_checks() -> list[dict[str, Any]]:
             "Managed model files match the pinned manifest." if manifest_ok else "Managed model files drifted from the pinned manifest.",
             manifest_detail,
         )
+        python_ok, python_detail = verify_semantic_python_runtime()
+        add(
+            checks,
+            "semantic_python_runtime",
+            "pass" if python_ok else "fail",
+            "Semantic Python and its base interpreter are available." if python_ok else "Semantic Python runtime is broken or lost its base interpreter.",
+            python_detail,
+        )
         dependency_ok, dependency_detail = verify_dependency_lock()
         add(
             checks,
@@ -469,6 +607,15 @@ def collect_checks() -> list[dict[str, Any]]:
     add(checks, "large_memory_files", "warn" if large else "pass", f"{len(large)} docs exceed compaction advisory thresholds.", {"files": large})
     raw_logs = int(conn.execute("SELECT COUNT(*) FROM memory_search_log WHERE query NOT LIKE '[redacted:%'").fetchone()[0])
     add(checks, "search_log_privacy", "warn" if raw_logs else "pass", f"{raw_logs} legacy raw-query rows remain.", {"legacy_raw_rows": raw_logs})
+    claims_ok, claims_detail = session_claim_hygiene(conn)
+    stale_claim_count = len(claims_detail.get("stale", []))
+    add(
+        checks,
+        "session_claim_hygiene",
+        "pass" if claims_ok else "warn",
+        f"Active claims={claims_detail.get('active', 0)}, stale claims={stale_claim_count}.",
+        claims_detail,
+    )
     conn.close()
     latest_audit = latest_jsonl(AUDIT_LOG, lambda item: item.get("status") == "ran" and item.get("ok"))
     audit_time = parse_time(str(latest_audit.get("time", ""))) if latest_audit else None
@@ -499,6 +646,23 @@ def collect_checks() -> list[dict[str, Any]]:
         "warn" if dirty_lines else ("pass" if git_status["ok"] else "fail"),
         f"Memory Git baseline has {len(dirty_lines)} dirty files." if dirty_lines else "Memory Git baseline is clean.",
         {"dirty_count": len(dirty_lines)},
+    )
+    backup_ok, backup_detail = git_remote_backup_health(memory_pathspec)
+    unpushed_memory = int(backup_detail.get("ahead_memory", 0) or 0)
+    add(
+        checks,
+        "memory_remote_backup",
+        "pass" if backup_ok else "warn",
+        (
+            "Memory Git history is backed up to its upstream."
+            if backup_ok and unpushed_memory == 0
+            else (
+                f"{unpushed_memory} unpushed memory commits remain within the backup grace window."
+                if backup_ok
+                else "Memory Git history has no healthy recent upstream backup."
+            )
+        ),
+        backup_detail,
     )
 
     if HOST_CONFIG:

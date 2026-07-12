@@ -67,6 +67,8 @@ cp .env.example .env
 
 编辑 `.env`，把 `AGENT_MEMORY_ROOT` 改成你的本地记忆库路径。它可以只是一个普通文件夹；如果你使用 Obsidian，也可以把这个文件夹作为 Obsidian vault 打开。
 
+脚本会安全解析仓库根目录的 `.env`，不依赖 shell 是否把变量 `export` 给子进程。若源码仓库里既没有 `.env`、也没有 Runtime TOML，所有 SQLite、日志和向量等派生状态会落到仓库内已忽略的 `.agent-memory/`，不会误用另一套已安装记忆系统的正式状态库。
+
 ```bash
 python3 scripts/bootstrap.py --memory-root "$HOME/agent-memory-vault" --write-env
 source .env
@@ -104,6 +106,13 @@ python3 scripts/memoryctl --actor claude closeout
 
 写完正式记忆后先 `claim`。认领记录保存在 SQLite，只存 session id 的哈希；Agent 会话内的 closeout 和 Stop Hook 只处理本会话认领的文件，其他会话的脏文件明确排除。成功 closeout 还会记录每个文件的内容 hash，只有具备这份完成证据的历史文件才允许 Git 观察基线跨过。普通事实默认 `agent_scope: shared`；只有宿主特有经验才标为 `codex` 或 `claude`。
 
+异常退出可能留下旧认领。Stop Hook 不会继续信任超过 24 小时的认领，Doctor 会把它列为警告。清理时先预览，再显式应用；这只把 SQLite 账本状态改为 `expired`，不会删除或改写 Markdown：
+
+```bash
+python3 scripts/memoryctl --actor human claims-expire --older-than-hours 24 --json
+python3 scripts/memoryctl --actor human claims-expire --older-than-hours 24 --apply --json
+```
+
 搜索示例：
 
 ```bash
@@ -138,6 +147,8 @@ python3 scripts/agent_memory_audit_autorun.py --reason manual --json
 python3 scripts/agent_memory_doctor.py
 python3 scripts/agent_memory_doctor.py --repair-derived  # 只重建派生索引，不改 Markdown
 ```
+
+Doctor 还会检查语义检索虚拟环境的基础 Python 是否仍存在、会话认领是否卡死，以及记忆 Git 提交是否长期没有推送。默认容忍少量刚生成的本地提交；记忆提交累计到 10 个，或最老一条超过 3 天仍未推送时才报警，避免日常噪声。
 
 可选的 Stop hook 与 macOS `launchd` 周期兜底见 [docs/automation.md](docs/automation.md)。
 

@@ -18,14 +18,15 @@ keywords:
 
 ## 当前有效摘要
 
-本模板提供三类本地脚本：
+本模板提供以下本地脚本：
 
 - `agent_memory_index.py`：全库 Markdown 索引和搜索。
 - `agent_memory_search.py`：统一检索入口，合并 SQLite、可选 Zvec 和手动 rg 结果。
 - `agent_memory_closeout.py`：任务结束收尾，负责检查、对账、刷新索引、捎带 audit 和可选 scoped commit。
+- `agent_memory_claim.py`：记录当前会话负责的记忆文件，并预览或显式过期异常退出遗留的旧认领。
 - `agent_memory_audit.py`：定期体检，发现过期记忆、重复标题、open-loop 噪声和已过时状态。
 - `agent_memory_audit_autorun.py`：audit 自动触发器，只在超过设定间隔时运行。
-- `agent_memory_doctor.py`：统一体检 Markdown、SQLite、FTS、INDEX、Zvec、验证来源和自动化状态。
+- `agent_memory_doctor.py`：统一体检 Markdown、SQLite、FTS、INDEX、Zvec、远端备份、会话认领、语义 Python、验证来源和自动化状态。
 - `agent_memory_stop_hook.py`：Stop 事件节流提醒；到期 audit 仍由 7 天闸门决定是否执行。
 - `agent_memory_evolution.py`：Agent case 和 skill 候选状态统计。
 - `agent_memory_check.py`：结构、frontmatter、SQLite、泄密风险检查。
@@ -58,6 +59,8 @@ python3 scripts/agent_memory_search.py "关键词" --limit 5
 python3 scripts/agent_memory_closeout.py --prewrite "准备写入的记忆摘要"
 python3 scripts/agent_memory_closeout.py --dry-run
 python3 scripts/agent_memory_closeout.py --commit
+python3 scripts/memoryctl --actor codex claim --file "/absolute/path/to/memory.md"
+python3 scripts/memoryctl --actor human claims-expire --older-than-hours 24 --json
 python3 scripts/agent_memory_audit.py
 python3 scripts/agent_memory_audit_autorun.py --reason manual --json
 python3 scripts/agent_memory_doctor.py

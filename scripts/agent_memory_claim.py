@@ -195,7 +195,19 @@ def active_claim_rows(raw_session_id: str, actor: str = "") -> list[dict[str, st
     return [{key: str(row[key] or "") for key in row.keys()} for row in rows]
 
 
-def all_active_claim_rows() -> list[dict[str, str]]:
+def parsed_time(value: str) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def all_active_claim_rows(max_age_hours: float | None = None) -> list[dict[str, str]]:
+    if max_age_hours is not None and max_age_hours <= 0:
+        raise ValueError("max_age_hours must be positive")
     with connect() as conn:
         rows = conn.execute(
             """
@@ -205,7 +217,40 @@ def all_active_claim_rows() -> list[dict[str, str]]:
             ORDER BY actor, session_hash, rel_path
             """
         ).fetchall()
-    return [{key: str(row[key] or "") for key in row.keys()} for row in rows]
+    payloads = [{key: str(row[key] or "") for key in row.keys()} for row in rows]
+    if max_age_hours is None:
+        return payloads
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max_age_hours)
+    return [row for row in payloads if (parsed_time(row["updated_at"]) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)) >= cutoff]
+
+
+def stale_active_claim_rows(max_age_hours: float = 24) -> list[dict[str, str]]:
+    if max_age_hours <= 0:
+        raise ValueError("max_age_hours must be positive")
+    rows = all_active_claim_rows()
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max_age_hours)
+    return [row for row in rows if (parsed_time(row["updated_at"]) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)) < cutoff]
+
+
+def expire_stale_claims(max_age_hours: float = 24, apply: bool = False) -> tuple[list[dict[str, str]], int]:
+    rows = stale_active_claim_rows(max_age_hours)
+    if not apply or not rows:
+        return rows, 0
+    now = utc_now()
+    changed = 0
+    with connect() as conn:
+        for row in rows:
+            cursor = conn.execute(
+                """
+                UPDATE memory_session_claims
+                SET status='expired', completed_at=?, updated_at=?
+                WHERE session_hash=? AND path=? AND status='active' AND updated_at=?
+                """,
+                (now, now, row["session_hash"], row["path"], row["updated_at"]),
+            )
+            changed += int(cursor.rowcount)
+        conn.commit()
+    return rows, changed
 
 
 def complete_claim_paths(raw_session_id: str, actor: str, paths: list[Path]) -> int:
@@ -239,17 +284,23 @@ def parse_args() -> argparse.Namespace:
     claim_parser.add_argument("--file", action="append", required=True)
     subparsers.add_parser("list", help="List active claims for this session.")
     subparsers.add_parser("list-all", help="List all active claims.")
+    expire_parser = subparsers.add_parser("expire-stale", help="Preview or expire abandoned active claims.")
+    expire_parser.add_argument("--older-than-hours", type=float, default=24)
+    expire_parser.add_argument("--apply", action="store_true", help="Mark matching claims expired; default is preview only.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     raw_session_id = session_value(args.session_id, args.actor)
+    applied = 0
     try:
         if args.action == "claim":
             rows = claim_paths(args.actor, raw_session_id, args.file)
         elif args.action == "list-all":
             rows = all_active_claim_rows()
+        elif args.action == "expire-stale":
+            rows, applied = expire_stale_claims(args.older_than_hours, args.apply)
         else:
             if not raw_session_id:
                 raise ValueError("session id is required; pass --session-id or use a supported host session environment")
@@ -268,11 +319,12 @@ def main() -> int:
         "session_hash": session_hash(raw_session_id),
         "count": len(rows),
         "claims": rows,
+        "applied": applied,
     }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print(f"claims={len(rows)} actor={args.actor} session={payload['session_hash']}")
+        print(f"claims={len(rows)} applied={applied} actor={args.actor} session={payload['session_hash']}")
         for row in rows:
             print(row.get("rel_path", row.get("path", "")))
     return 0
