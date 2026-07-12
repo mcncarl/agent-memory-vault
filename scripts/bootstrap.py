@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import shutil
 from pathlib import Path
 
@@ -28,6 +29,10 @@ def render_text(text: str, mapping: dict[str, str]) -> str:
     for key, value in mapping.items():
         text = text.replace(key, value)
     return text
+
+
+def shell_export(name: str, value: object) -> str:
+    return f"export {name}={shlex.quote(str(value))}"
 
 
 def copy_template(target_root: Path, mapping: dict[str, str], overwrite: bool) -> tuple[int, int]:
@@ -61,17 +66,17 @@ def write_env(args: argparse.Namespace, memory_root: Path) -> None:
     git_root = expand_path(args.git_root) if args.git_root else memory_root
     content = "\n".join(
         [
-            f"AGENT_MEMORY_ROOT={memory_root}",
-            f"AGENT_MEMORY_GIT_ROOT={git_root}",
-            f"AGENT_MEMORY_CONFIG_ROOT={config_root}",
-            f"AGENT_MEMORY_STATE_DB={expand_path(args.state_db)}",
-            f"AGENT_MEMORY_USER_ID={args.user_id}",
-            f"AGENT_MEMORY_AGENT_ID={args.agent_id}",
-            f"AGENT_MEMORY_APP_ID={args.app_id}",
-            f"AGENT_MEMORY_AUDIT_DB={config_root / 'audit_decisions.sqlite'}",
-            f"AGENT_MEMORY_CLOSEOUT_LOG={config_root / 'logs' / 'closeout.jsonl'}",
-            f"AGENT_MEMORY_AUDIT_RUN_LOG={config_root / 'logs' / 'audit_runs.jsonl'}",
-            f"AGENT_MEMORY_AUDIT_REPORT={config_root / 'reports' / 'latest-audit.json'}",
+            shell_export("AGENT_MEMORY_ROOT", memory_root),
+            shell_export("AGENT_MEMORY_GIT_ROOT", git_root),
+            shell_export("AGENT_MEMORY_CONFIG_ROOT", config_root),
+            shell_export("AGENT_MEMORY_STATE_DB", expand_path(args.state_db)),
+            shell_export("AGENT_MEMORY_USER_ID", args.user_id),
+            shell_export("AGENT_MEMORY_AGENT_ID", args.agent_id),
+            shell_export("AGENT_MEMORY_APP_ID", args.app_id),
+            shell_export("AGENT_MEMORY_AUDIT_DB", config_root / "audit_decisions.sqlite"),
+            shell_export("AGENT_MEMORY_CLOSEOUT_LOG", config_root / "logs" / "closeout.jsonl"),
+            shell_export("AGENT_MEMORY_AUDIT_RUN_LOG", config_root / "logs" / "audit_runs.jsonl"),
+            shell_export("AGENT_MEMORY_AUDIT_REPORT", config_root / "reports" / "latest-audit.json"),
             "",
         ]
     )
