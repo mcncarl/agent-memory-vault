@@ -39,6 +39,9 @@ LOG_PATH = Path(
 ).expanduser().resolve()
 LOCK_PATH = CONFIG_ROOT / "locks" / "closeout.lock"
 RECONCILE_QUERY_MAX_CHARS = 900
+# Keep incidental mentions of short, generic candidates from forcing UPDATE.
+RECONCILE_TITLE_MATCH_MIN_CHARS = 8
+RECONCILE_CANDIDATE_COVERAGE_MIN_TOKENS = 8
 
 
 def find_default_git_root() -> Path:
@@ -587,8 +590,14 @@ def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str,
         similarity = jaccard(text, comparison)
         row_coverage = coverage(text, comparison)
         candidate_coverage = coverage(comparison, text)
+        candidate_coverage_eligible = (
+            len(tokenize(comparison)) >= RECONCILE_CANDIDATE_COVERAGE_MIN_TOKENS
+        )
         compact_title = compact_identity_text(str(row.get("title", "")))
-        title_match = len(compact_title) >= 4 and compact_title in compact_input
+        title_match = (
+            len(compact_title) >= RECONCILE_TITLE_MATCH_MIN_CHARS
+            and compact_title in compact_input
+        )
         distance = semantic_distance(row)
         if similarity >= 0.80 or row_coverage >= 0.90:
             action = "NOOP"
@@ -596,14 +605,14 @@ def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str,
             title_match
             or similarity >= 0.45
             or row_coverage >= 0.55
-            or candidate_coverage >= 0.70
+            or (candidate_coverage_eligible and candidate_coverage >= 0.70)
             or (distance is not None and distance <= 0.32)
         ):
             action = "UPDATE"
         elif (
             similarity >= 0.28
             or row_coverage >= 0.35
-            or candidate_coverage >= 0.45
+            or (candidate_coverage_eligible and candidate_coverage >= 0.45)
             or (distance is not None and distance <= 0.55)
         ):
             action = "MERGE_REQUIRED"

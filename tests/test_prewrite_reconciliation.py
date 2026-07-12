@@ -134,6 +134,55 @@ class PrewriteReconciliationTests(unittest.TestCase):
         self.assertIs(target, row)
         self.assertTrue(metrics["title_match"])
 
+    def test_generic_short_candidate_does_not_force_update(self) -> None:
+        row = {
+            "title": "Memory",
+            "rel_path": "memory.md",
+            "summary": "",
+            "hit": "",
+        }
+        text = (
+            "Memory guidelines for a separate deployment cover backups, retention, "
+            "ownership, validation, and incident recovery."
+        )
+
+        action, target, metrics = self.module.prewrite_recommendation(text, [row])
+
+        self.assertEqual(action, "ADD")
+        self.assertIs(target, row)
+        self.assertFalse(metrics["title_match"])
+        self.assertEqual(metrics["candidate_coverage"], 0.5)
+
+    def test_generic_short_chinese_title_does_not_force_update(self) -> None:
+        row = {
+            "title": "工作流程",
+            "rel_path": "工作流程.md",
+            "summary": "",
+            "hit": "",
+        }
+        text = "工作流程只是这份部署说明中的普通术语，正文记录的是备份、责任人与事故恢复。"
+
+        action, target, metrics = self.module.prewrite_recommendation(text, [row])
+
+        self.assertEqual(action, "ADD")
+        self.assertIs(target, row)
+        self.assertFalse(metrics["title_match"])
+
+    def test_specific_chinese_title_still_matches(self) -> None:
+        row = {
+            "title": "跨平台批量图片转换工具",
+            "rel_path": "项目/跨平台批量图片转换工具.md",
+            "summary": "当前正在验证编码输出。",
+            "hit": "",
+        }
+        text = "跨平台批量图片转换工具已经完成编码验证，下一步需要复核默认参数。"
+
+        action, target, metrics = self.module.prewrite_recommendation(text, [row])
+
+        self.assertEqual(action, "UPDATE")
+        self.assertIs(target, row)
+        self.assertTrue(metrics["title_match"])
+
     def test_postwrite_search_failure_is_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             vault = Path(raw) / "vault"
