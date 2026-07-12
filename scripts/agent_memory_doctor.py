@@ -415,8 +415,12 @@ def repair_derived() -> list[dict[str, Any]]:
     actions = []
     index_result = run([str(SCRIPT_ROOT / "agent_memory_index.py"), "--init", "--scan", "--report"], 180)
     actions.append({"action": "rebuild_sqlite_fts", "ok": index_result["ok"], "detail": index_result["detail"]})
-    if index_result["ok"]:
-        vector_result = run([str(SCRIPT_ROOT / "agent_memory_zvec_index.py"), "--scan", "--prune", "--json"], 900)
+    if index_result["ok"] and SEMANTIC_ENABLED:
+        vector_result = run(
+            [str(ZVEC_PYTHON), str(SCRIPT_ROOT / "agent_memory_zvec_index.py"), "--scan", "--prune", "--json"],
+            900,
+            offline_env() if REQUIRE_LOCAL_MODEL else None,
+        )
         actions.append({"action": "rebuild_zvec", "ok": vector_result["ok"], "detail": vector_result["detail"]})
     return actions
 

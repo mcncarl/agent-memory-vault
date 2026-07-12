@@ -32,6 +32,24 @@ def git(root: Path, *args: str) -> str:
 
 
 class DurabilityGuardTests(unittest.TestCase):
+    def test_derived_repair_uses_configured_semantic_python(self) -> None:
+        configured_python = Path("/configured/vector/python")
+        with mock.patch.object(doctor, "SEMANTIC_ENABLED", True), mock.patch.object(
+            doctor, "ZVEC_PYTHON", configured_python
+        ), mock.patch.object(
+            doctor,
+            "run",
+            side_effect=[
+                {"ok": True, "detail": "sqlite rebuilt"},
+                {"ok": True, "detail": "zvec rebuilt"},
+            ],
+        ) as run_mock:
+            actions = doctor.repair_derived()
+        self.assertEqual([item["action"] for item in actions], ["rebuild_sqlite_fts", "rebuild_zvec"])
+        vector_command = run_mock.call_args_list[1].args[0]
+        self.assertEqual(vector_command[0], str(configured_python))
+        self.assertTrue(vector_command[1].endswith("agent_memory_zvec_index.py"))
+
     def test_semantic_python_detects_missing_interpreter(self) -> None:
         with mock.patch.object(doctor, "ZVEC_PYTHON", Path("/definitely/missing/python")):
             ok, detail = doctor.verify_semantic_python_runtime()
