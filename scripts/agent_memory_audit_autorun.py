@@ -183,8 +183,10 @@ def notify(title: str, message: str) -> None:
     )
 
 
-def run_doctor(timeout: int) -> dict[str, Any]:
+def run_doctor(timeout: int, allow_dirty_memory: bool = False) -> dict[str, Any]:
     command = [PYTHON, str(DOCTOR_SCRIPT), "--json"]
+    if allow_dirty_memory:
+        command.append("--allow-dirty-memory")
     result = run_command(command, timeout=timeout)
     doctor_payload: dict[str, Any] = {}
     parse_error = ""
@@ -261,7 +263,7 @@ def run_audit(args: argparse.Namespace, last_run: dt.datetime | None) -> dict[st
         payload["detail"] = "audit command failed"
 
     if not args.skip_doctor:
-        doctor_report = run_doctor(args.doctor_timeout)
+        doctor_report = run_doctor(args.doctor_timeout, allow_dirty_memory=args.reason == "closeout")
         payload["doctor_status"] = doctor_report["status"]
         payload["doctor_summary"] = doctor_report["summary"]
         payload["doctor_ok"] = doctor_report["ok"]

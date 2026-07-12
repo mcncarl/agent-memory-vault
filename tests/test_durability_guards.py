@@ -134,6 +134,14 @@ class DurabilityGuardTests(unittest.TestCase):
         self.assertEqual(detail["stale"][0]["rel_path"], "stale.md")
         self.assertNotIn("session_hash", detail["stale"][0])
 
+    def test_precommit_dirty_baseline_is_only_allowed_when_explicit(self) -> None:
+        strict = doctor.memory_git_baseline_result(1, True, allow_dirty_memory=False)
+        closeout = doctor.memory_git_baseline_result(1, True, allow_dirty_memory=True)
+        self.assertEqual(strict[0], "warn")
+        self.assertEqual(closeout[0], "pass")
+        self.assertFalse(strict[2]["allowed_precommit"])
+        self.assertTrue(closeout[2]["allowed_precommit"])
+
     def test_stale_claim_preview_and_expiry_are_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp).resolve()

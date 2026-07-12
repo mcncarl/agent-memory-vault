@@ -100,6 +100,20 @@ class AuditAutorunDoctorTests(unittest.TestCase):
         self.assertEqual(run_mock.call_count, 1)
         self.assertEqual(payload["doctor_status"], "skipped")
 
+    def test_closeout_doctor_allows_expected_precommit_memory(self) -> None:
+        doctor_result = {
+            "ok": True,
+            "returncode": 0,
+            "stdout": json.dumps({"status": "ok", "summary": {"pass": 26, "warn": 0, "fail": 0}}),
+            "stderr": "",
+        }
+        with mock.patch.object(autorun, "run_command", return_value=doctor_result) as run_mock, mock.patch.object(
+            autorun, "write_doctor_report"
+        ):
+            report = autorun.run_doctor(30, allow_dirty_memory=True)
+        self.assertEqual(report["status"], "ok")
+        self.assertIn("--allow-dirty-memory", run_mock.call_args.args[0])
+
 
 if __name__ == "__main__":
     unittest.main()

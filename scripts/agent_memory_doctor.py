@@ -298,6 +298,30 @@ def git_remote_has_credential() -> bool:
     return False
 
 
+def memory_git_baseline_result(
+    dirty_count: int,
+    git_ok: bool,
+    allow_dirty_memory: bool,
+) -> tuple[str, str, dict[str, Any]]:
+    if dirty_count and allow_dirty_memory:
+        return (
+            "pass",
+            f"Memory Git baseline has {dirty_count} expected pre-commit dirty files.",
+            {"dirty_count": dirty_count, "allowed_precommit": True},
+        )
+    if dirty_count:
+        return (
+            "warn",
+            f"Memory Git baseline has {dirty_count} dirty files.",
+            {"dirty_count": dirty_count, "allowed_precommit": False},
+        )
+    return (
+        "pass" if git_ok else "fail",
+        "Memory Git baseline is clean.",
+        {"dirty_count": 0, "allowed_precommit": allow_dirty_memory},
+    )
+
+
 def git_remote_backup_health(memory_pathspec: str, now: dt.datetime | None = None) -> tuple[bool, dict[str, Any]]:
     upstream_result = run(
         ["git", "-C", str(GIT_ROOT), "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
@@ -425,7 +449,7 @@ def repair_derived() -> list[dict[str, Any]]:
     return actions
 
 
-def collect_checks() -> list[dict[str, Any]]:
+def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     required = [
         "agent_memory_index.py",
@@ -644,12 +668,15 @@ def collect_checks() -> list[dict[str, Any]]:
         30,
     )
     dirty_lines = [line for line in str(git_status.get("stdout", "")).splitlines() if line]
+    dirty_status, dirty_message, dirty_detail = memory_git_baseline_result(
+        len(dirty_lines), bool(git_status["ok"]), allow_dirty_memory
+    )
     add(
         checks,
         "memory_git_baseline",
-        "warn" if dirty_lines else ("pass" if git_status["ok"] else "fail"),
-        f"Memory Git baseline has {len(dirty_lines)} dirty files." if dirty_lines else "Memory Git baseline is clean.",
-        {"dirty_count": len(dirty_lines)},
+        dirty_status,
+        dirty_message,
+        dirty_detail,
     )
     backup_ok, backup_detail = git_remote_backup_health(memory_pathspec)
     unpushed_memory = int(backup_detail.get("ahead_memory", 0) or 0)
@@ -708,13 +735,18 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Read-only health report for the complete Agent Memory pipeline.")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--repair-derived", action="store_true", help="Rebuild derived indexes without editing Markdown facts.")
+    parser.add_argument(
+        "--allow-dirty-memory",
+        action="store_true",
+        help="Treat the current pre-commit memory changes as expected; intended only for closeout piggyback checks.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     repairs = repair_derived() if args.repair_derived else []
-    checks = collect_checks()
+    checks = collect_checks(allow_dirty_memory=args.allow_dirty_memory)
     statuses = {str(item["status"]) for item in checks}
     status = "error" if "fail" in statuses else ("warning" if "warn" in statuses else "ok")
     payload = {"time": utc_now(), "version": VERSION, "status": status, "summary": {name: sum(1 for item in checks if item["status"] == name) for name in ("pass", "warn", "fail")}, "checks": checks, "repair_actions": repairs}

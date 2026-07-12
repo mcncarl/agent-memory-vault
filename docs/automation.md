@@ -27,6 +27,8 @@ python3 scripts/agent_memory_audit_autorun.py \
 
 If the last successful audit is recent, autorun exits with `skipped_recent`. When the interval is due, it runs content audit first and then Doctor, writing `latest-audit.json` and `latest-doctor.json`. A Doctor warning does not rewrite Markdown or invalidate the successful content-audit timestamp, but it is included in the report and notification.
 
+The `closeout` trigger runs Doctor before the scoped Git commit, so autorun passes `--allow-dirty-memory` only for that transient pre-commit check. Manual and `launchd` Doctor runs remain strict; the flag does not suppress index, model, dependency, remote-backup, hook, or other health checks.
+
 If another tool auto-commits the vault before closeout runs, closeout compares the last successful `git_observed_through` value with current `HEAD` and processes those committed file changes as well. This lets Obsidian Git keep its backup schedule without stealing the memory pipeline's indexing baseline.
 
 ## Stop Hook Modes
