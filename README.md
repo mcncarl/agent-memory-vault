@@ -125,6 +125,8 @@ python3 scripts/memoryctl --actor codex closeout
 python3 scripts/memoryctl --actor codex prewrite "准备写入的记忆摘要"
 ```
 
+`prewrite` 会把长描述压缩成有界检索查询，但仍用完整输入做敏感内容检查和最终相似度判断。若主 SQLite 搜索不可用，它会返回 `status=error` 与 `recommendation_unavailable_reason=reconcile_search_unhealthy`，不会把基础设施故障误判为 `ADD` 或 `ASK_USER`；可选向量后端的普通故障仍只作为 warning 降级。
+
 audit 可以手动运行，也可以由 closeout 捎带触发：
 
 ```bash
