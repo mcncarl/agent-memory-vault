@@ -4,7 +4,7 @@ Agent Memory Vault can run without background automation. The recommended automa
 
 1. `closeout` piggyback: every important task-end closeout checks whether audit is due.
 2. Optional Stop hook: shared Claude/Codex setups run full closeout only for files claimed by the current session.
-3. Optional macOS `launchd` fallback: runs audit weekly even if no Agent session happens.
+3. Optional macOS `launchd` fallback: runs the due content audit plus a read-only infrastructure Doctor weekly even if no Agent session happens.
 
 Automation should only produce reminders, reports, logs, and local audit decisions. It should not directly rewrite Markdown facts.
 
@@ -25,7 +25,7 @@ python3 scripts/agent_memory_audit_autorun.py \
   --json
 ```
 
-If the last successful audit is recent, autorun exits with `skipped_recent`.
+If the last successful audit is recent, autorun exits with `skipped_recent`. When the interval is due, it runs content audit first and then Doctor, writing `latest-audit.json` and `latest-doctor.json`. A Doctor warning does not rewrite Markdown or invalidate the successful content-audit timestamp, but it is included in the report and notification.
 
 If another tool auto-commits the vault before closeout runs, closeout compares the last successful `git_observed_through` value with current `HEAD` and processes those committed file changes as well. This lets Obsidian Git keep its backup schedule without stealing the memory pipeline's indexing baseline.
 
@@ -36,7 +36,7 @@ Stop is turn-scoped in both Claude Code and Codex, so the hook must stay quiet a
 Reminder mode:
 
 - Remind only when Markdown files under the memory vault changed and the SQLite index is older than those files.
-- Call `agent_memory_audit_autorun.py`; its interval gate decides whether a real audit is due.
+- Call `agent_memory_audit_autorun.py`; its interval gate decides whether a real content audit plus read-only Doctor is due.
 - Stamp each session or day so the same reminder is not repeated constantly.
 - Do not let the hook invent or rewrite memory facts.
 

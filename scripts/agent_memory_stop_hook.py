@@ -260,7 +260,7 @@ def run_due_audit() -> None:
             [sys.executable, str(AUDIT_AUTORUN), "--reason", "hook", "--min-interval-days", "7", "--notify", "--json"],
             text=True,
             capture_output=True,
-            timeout=12,
+            timeout=180,
             env=clean_env(),
             check=False,
         )

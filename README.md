@@ -141,6 +141,8 @@ python3 scripts/agent_memory_audit.py
 python3 scripts/agent_memory_audit_autorun.py --reason manual --json
 ```
 
+当 7 天闸门真正到期时，autorun 会在内容 audit 后顺带运行一次只读 Doctor，把基础设施结果写到 `reports/latest-doctor.json`。因此远端备份滞后、旧会话认领、模型/Python 断链和 Hook 漂移不只靠人工发现；有内容 finding 或 Doctor 变黄时才通知。
+
 全链路健康检查：
 
 ```bash

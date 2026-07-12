@@ -25,7 +25,7 @@ keywords:
 - `agent_memory_closeout.py`：任务结束收尾，负责检查、对账、刷新索引、捎带 audit 和可选 scoped commit。
 - `agent_memory_claim.py`：记录当前会话负责的记忆文件，并预览或显式过期异常退出遗留的旧认领。
 - `agent_memory_audit.py`：定期体检，发现过期记忆、重复标题、open-loop 噪声和已过时状态。
-- `agent_memory_audit_autorun.py`：audit 自动触发器，只在超过设定间隔时运行。
+- `agent_memory_audit_autorun.py`：自动触发器，只在超过设定间隔时运行内容 audit，并顺带执行只读 Doctor，把基础设施健康报告写入 `latest-doctor.json`。
 - `agent_memory_doctor.py`：统一体检 Markdown、SQLite、FTS、INDEX、Zvec、远端备份、会话认领、语义 Python、验证来源和自动化状态。
 - `agent_memory_stop_hook.py`：Stop 事件节流提醒；到期 audit 仍由 7 天闸门决定是否执行。
 - `agent_memory_evolution.py`：Agent case 和 skill 候选状态统计。
