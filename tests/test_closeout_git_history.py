@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import sqlite3
+from contextlib import closing
 import subprocess
 import sys
 import tempfile
@@ -186,7 +187,7 @@ class CloseoutReconcileStatusTests(unittest.TestCase):
             path=note,
         )
         self.module.STATE_DB = self.vault.parent / "state.sqlite"
-        with sqlite3.connect(self.module.STATE_DB) as conn:
+        with closing(sqlite3.connect(self.module.STATE_DB)) as conn, conn:
             conn.execute(
                 "CREATE TABLE memory_file_observations (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL)"
             )
@@ -194,7 +195,7 @@ class CloseoutReconcileStatusTests(unittest.TestCase):
         self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
 
         digest = hashlib.sha256(note.read_bytes()).hexdigest()
-        with sqlite3.connect(self.module.STATE_DB) as conn:
+        with closing(sqlite3.connect(self.module.STATE_DB)) as conn, conn:
             conn.execute(
                 "INSERT INTO memory_file_observations(path, sha256) VALUES (?, ?)",
                 (str(note), digest),

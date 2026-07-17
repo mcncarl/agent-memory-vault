@@ -4,22 +4,20 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
-import os
 import re
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_memory_env import env_value
+from agent_memory_env import env_value, expand_path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_VAULT_ROOT = REPO_ROOT / "templates" / "vault"
-VAULT_ROOT = Path(os.path.expandvars(env_value("ROOT", str(DEFAULT_VAULT_ROOT)))).expanduser().resolve()
+VAULT_ROOT = expand_path(env_value("ROOT", str(DEFAULT_VAULT_ROOT))).resolve()
 AGENT_ROOT = VAULT_ROOT / "agent"
-STATE_DB = Path(
-    os.path.expandvars(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
-).expanduser().resolve()
+STATE_DB = expand_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite")).resolve()
 
 CASE_CANDIDATE_DIR = AGENT_ROOT / "case-candidates"
 CASE_DIR = AGENT_ROOT / "cases"
@@ -372,7 +370,7 @@ def main() -> int:
         args.scan = True
         args.report = True
 
-    with connect() as conn:
+    with closing(connect()) as conn, conn:
         if args.init or args.scan:
             init_db(conn)
         if args.scan:

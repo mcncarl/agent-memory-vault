@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
 import json
 import os
 import subprocess
@@ -12,22 +11,17 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from agent_memory_env import env_value
+from agent_memory_env import env_value, expand_path
+from agent_memory_lock import try_lock, unlock
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
-CONFIG_ROOT = Path(
-    os.path.expandvars(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))
-).expanduser().resolve()
+CONFIG_ROOT = expand_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory")).resolve()
 AUDIT_SCRIPT = SCRIPT_ROOT / "agent_memory_audit.py"
 DOCTOR_SCRIPT = SCRIPT_ROOT / "agent_memory_doctor.py"
 PYTHON = env_value("PYTHON", sys.executable)
-RUN_LOG = Path(
-    os.path.expandvars(env_value("AUDIT_RUN_LOG", str(CONFIG_ROOT / "logs" / "audit_runs.jsonl")))
-).expanduser().resolve()
-LATEST_REPORT = Path(
-    os.path.expandvars(env_value("AUDIT_REPORT", str(CONFIG_ROOT / "reports" / "latest-audit.json")))
-).expanduser().resolve()
+RUN_LOG = expand_path(env_value("AUDIT_RUN_LOG", str(CONFIG_ROOT / "logs" / "audit_runs.jsonl"))).resolve()
+LATEST_REPORT = expand_path(env_value("AUDIT_REPORT", str(CONFIG_ROOT / "reports" / "latest-audit.json"))).resolve()
 LATEST_DOCTOR_REPORT = CONFIG_ROOT / "reports" / "latest-doctor.json"
 LOCK_PATH = CONFIG_ROOT / "locks" / "audit.lock"
 
@@ -45,14 +39,16 @@ def audit_lock():
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOCK_PATH.open("a+", encoding="utf-8") as handle:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            acquired = try_lock(handle)
+        except OSError:
+            acquired = False
+        if not acquired:
             yield False
             return
         try:
             yield True
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock(handle)
 
 
 def parse_time(value: str) -> dt.datetime | None:
@@ -96,7 +92,8 @@ def run_command(command: list[str], timeout: int = 180) -> dict[str, Any]:
         if not any(token in key.upper() for token in ("KEY", "TOKEN", "SECRET", "PASSWORD", "COOKIE", "CREDENTIAL"))
         and "PROXY" not in key.upper()
     }
-    env.setdefault("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    if os.name != "nt":
+        env.setdefault("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
     try:
         completed = subprocess.run(
             command,
@@ -170,6 +167,8 @@ def write_doctor_report(payload: dict[str, Any]) -> None:
 
 
 def notify(title: str, message: str) -> None:
+    if sys.platform != "darwin":
+        return
     safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
     safe_message = message.replace("\\", "\\\\").replace('"', '\\"')
     subprocess.run(

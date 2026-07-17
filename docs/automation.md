@@ -238,6 +238,19 @@ Unload it:
 launchctl unload ~/Library/LaunchAgents/com.example.agent-memory-vault-audit.plist
 ```
 
+## Windows Task Scheduler Fallback
+
+Windows 使用当前用户的 Limited 权限计划任务，不要求管理员权限：
+
+```powershell
+.\scripts\audit-task.ps1 install
+.\scripts\audit-task.ps1 status
+.\scripts\audit-task.ps1 run
+.\scripts\audit-task.ps1 uninstall
+```
+
+安装是幂等的，同名任务会被更新。任务直接执行配置的 Python 和 `agent_memory_audit_autorun.py`，不经过 shell 字符串拼接；含空格路径由 Scheduled Task action 分开保存。Codex Stop Hook 的 PowerShell 安装方式见 [windows.md](windows.md)。
+
 ## Reading Results
 
 The latest report is local:

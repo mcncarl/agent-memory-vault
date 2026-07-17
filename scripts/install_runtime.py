@@ -23,13 +23,16 @@ CORE_FILES = (
     "agent_memory_env.py",
     "agent_memory_evolution.py",
     "agent_memory_index.py",
+    "agent_memory_lock.py",
     "agent_memory_retrieval_benchmark.py",
     "agent_memory_search.py",
     "agent_memory_session_hook.py",
     "agent_memory_stop_hook.py",
     "agent_memory_zvec_index.py",
+    "audit-task.ps1",
     "bootstrap.py",
     "install_runtime.py",
+    "stop-hook.ps1",
     "memoryctl",
 )
 SUPPORT_FILES = ("requirements-vector.lock",)

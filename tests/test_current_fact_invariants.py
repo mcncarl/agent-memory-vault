@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,7 +21,7 @@ class CurrentFactInvariantTest(unittest.TestCase):
             tmp = Path(raw_tmp)
             vault = tmp / "vault"
             runtime = tmp / "runtime"
-            subprocess.run(["cp", "-R", str(TEMPLATE), str(vault)], check=True)
+            shutil.copytree(TEMPLATE, vault)
             runtime.joinpath("config").mkdir(parents=True)
             invariants = runtime / "config" / "system-invariants.json"
             invariants.write_text(
@@ -49,11 +50,11 @@ class CurrentFactInvariantTest(unittest.TestCase):
             config.write_text(
                 "\n".join(
                     [
-                        f'memory_root = "{vault}"',
-                        f'config_root = "{runtime}"',
-                        f'state_db = "{runtime / "state.sqlite"}"',
-                        f'audit_db = "{runtime / "audit.sqlite"}"',
-                        f'invariants_file = "{invariants}"',
+                        f'memory_root = "{vault.as_posix()}"',
+                        f'config_root = "{runtime.as_posix()}"',
+                        f'state_db = "{(runtime / "state.sqlite").as_posix()}"',
+                        f'audit_db = "{(runtime / "audit.sqlite").as_posix()}"',
+                        f'invariants_file = "{invariants.as_posix()}"',
                     ]
                 )
                 + "\n",

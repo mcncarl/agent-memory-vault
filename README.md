@@ -78,6 +78,19 @@ python3 scripts/agent_memory_check.py
 python3 scripts/agent_memory_doctor.py
 ```
 
+### Windows Installation
+
+要求 Windows 10/11、Python 3.10+、Git，以及 PowerShell 7 或 Windows PowerShell 5.1。Obsidian 可选。
+
+```powershell
+git clone https://github.com/mcncarl/agent-memory-vault.git
+cd agent-memory-vault
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 `
+  -MemoryRoot "$HOME\Documents\Agent Memory Vault"
+```
+
+这里的 `Bypass` 只对当前 PowerShell 进程生效，不会永久修改 Execution Policy。安装器真实初始化 Vault、SQLite/FTS、INDEX、Runtime 并运行 doctor；可用 `-InstallCodexHook -AutoCloseout -InstallAuditTask` 增加原生 Stop Hook 和 Task Scheduler audit。完整说明、诊断和故障排查见 [docs/windows.md](docs/windows.md)，代码审计见 [docs/windows-compatibility-audit.md](docs/windows-compatibility-audit.md)。
+
 需要让多个 Agent 从固定本机入口调用时，可把 GitHub 仓库作为唯一源码安装到 Runtime；升级时重复运行同一命令即可，私人 TOML 和本机适配器不会被覆盖：
 
 ```bash

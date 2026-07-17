@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
 import hashlib
 import json
 import os
@@ -18,25 +17,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_memory_env import env_value
+from agent_memory_env import env_value, expand_path, load_config
+from agent_memory_lock import try_lock, unlock
 from agent_memory_claim import active_claim_rows, complete_claim_paths, record_file_observations
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
 TEMPLATE_REPO_ROOT = SCRIPT_ROOT.parent
 DEFAULT_VAULT_ROOT = TEMPLATE_REPO_ROOT / "templates" / "vault"
-VAULT_ROOT = Path(
-    os.path.expandvars(env_value("ROOT", str(DEFAULT_VAULT_ROOT)))
-).expanduser().resolve()
-CONFIG_ROOT = Path(
-    os.path.expandvars(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))
-).expanduser().resolve()
-STATE_DB = Path(
-    os.path.expandvars(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite")))
-).expanduser().resolve()
-LOG_PATH = Path(
-    os.path.expandvars(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))
-).expanduser().resolve()
+VAULT_ROOT = expand_path(env_value("ROOT", str(DEFAULT_VAULT_ROOT))).resolve()
+CONFIG_ROOT = expand_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory")).resolve()
+STATE_DB = expand_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite"))).resolve()
+LOG_PATH = expand_path(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl"))).resolve()
 LOCK_PATH = CONFIG_ROOT / "locks" / "closeout.lock"
 
 
@@ -47,9 +39,7 @@ def find_default_git_root() -> Path:
     return VAULT_ROOT.parent.resolve()
 
 
-REPO_ROOT = Path(
-    os.path.expandvars(env_value("GIT_ROOT", str(find_default_git_root())))
-).expanduser().resolve()
+REPO_ROOT = expand_path(env_value("GIT_ROOT", str(find_default_git_root()))).resolve()
 
 CHECK_SCRIPT = SCRIPT_ROOT / "agent_memory_check.py"
 INDEX_SCRIPT = SCRIPT_ROOT / "agent_memory_index.py"
@@ -59,6 +49,8 @@ AGENT_EVOLUTION_SCRIPT = SCRIPT_ROOT / "agent_memory_evolution.py"
 AUDIT_AUTORUN_SCRIPT = SCRIPT_ROOT / "agent_memory_audit_autorun.py"
 PYTHON = env_value("PYTHON", sys.executable)
 ZVEC_PYTHON = env_value("ZVEC_PYTHON", PYTHON)
+SEMANTIC_CONFIG = load_config().get("semantic_retrieval", {})
+SEMANTIC_ENABLED = bool(SEMANTIC_CONFIG.get("enabled", False)) if isinstance(SEMANTIC_CONFIG, dict) else False
 
 MEMORY_TOP_LEVELS = {"用户记忆", "项目", "工作流", "决策", "agent"}
 TOP_LEVEL_MEMORY_FILES = {"AGENTS.md", "INDEX.md", "README.md", "STRUCTURE.md"}
@@ -148,15 +140,19 @@ def run_command(
     timeout: int = 120,
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    command_env = os.environ.copy() if env is None else env.copy()
+    command_env.setdefault("PYTHONIOENCODING", "utf-8")
     started_at = utc_now()
     started = time.monotonic()
     try:
         completed = subprocess.run(
             command,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout,
-            env=env,
+            env=command_env,
             check=False,
         )
         return {
@@ -200,16 +196,17 @@ def closeout_lock(timeout: float = 15.0):
         deadline = time.monotonic() + max(timeout, 0.0)
         while True:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"another memory closeout is still running: {LOCK_PATH}")
-                time.sleep(0.1)
+                if try_lock(handle):
+                    break
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"another memory closeout is still running: {LOCK_PATH}")
+            time.sleep(0.1)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock(handle)
 
 
 def decode_status_line(line: str) -> GitEntry | None:
@@ -370,7 +367,7 @@ def explicit_entries(paths: list[str]) -> tuple[list[GitEntry], list[str]]:
 
 def relative_to_vault(path: Path) -> str:
     try:
-        return str(path.relative_to(VAULT_ROOT))
+        return path.relative_to(VAULT_ROOT).as_posix()
     except ValueError:
         return str(path)
 
@@ -666,6 +663,8 @@ def run_index(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def run_zvec(files: list[Path], args: argparse.Namespace) -> dict[str, Any]:
+    if not SEMANTIC_ENABLED:
+        return {"ok": True, "skipped": True, "detail": "semantic_retrieval_disabled"}
     if args.skip_zvec:
         return {"ok": True, "skipped": True, "detail": "skip_zvec"}
     if args.dry_run:
@@ -778,9 +777,12 @@ def unobserved_history_entries(entries: list[GitEntry]) -> list[GitEntry]:
     if not entries or not STATE_DB.exists():
         return entries
     try:
-        with sqlite3.connect(STATE_DB, timeout=5) as conn:
+        conn = sqlite3.connect(STATE_DB, timeout=5)
+        try:
             conn.execute("PRAGMA busy_timeout=5000")
             rows = conn.execute("SELECT path, sha256 FROM memory_file_observations").fetchall()
+        finally:
+            conn.close()
     except sqlite3.Error:
         return entries
     observed = {str(Path(str(path)).resolve()): str(digest) for path, digest in rows}
@@ -1082,6 +1084,9 @@ def parse_args() -> argparse.Namespace:
     args.audit_limit = max(args.audit_limit, 1)
     args.audit_stale_days = max(args.audit_stale_days, 1)
     args.audit_open_loop_threshold = max(args.audit_open_loop_threshold, 1)
+    if not SEMANTIC_ENABLED:
+        args.no_zvec = True
+        args.skip_zvec = True
     if args.prewrite:
         args.dry_run = True
     return args

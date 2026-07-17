@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from agent_memory_env import env_value
+from agent_memory_env import env_value, expand_path
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if args.command == "version":
-        config_root = Path(os.path.expandvars(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))).expanduser()
+        config_root = expand_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))
         manifest_path = config_root / "config" / "runtime-manifest.json"
         try:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -111,7 +111,7 @@ def main() -> int:
         forwarded.extend(["--agent-scope", args.actor])
     env = os.environ.copy()
     env["MEMORY_ACTOR"] = args.actor
-    return subprocess.run([str(target), *forwarded], env=env, check=False).returncode
+    return subprocess.run([sys.executable, str(target), *forwarded], env=env, check=False).returncode
 
 
 if __name__ == "__main__":

@@ -4,15 +4,14 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import sys
 from pathlib import Path
+
+from agent_memory_env import expand_path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_ROOT = REPO_ROOT / "templates" / "vault"
-
-
-def expand_path(raw: str) -> Path:
-    return Path(os.path.expandvars(raw)).expanduser().resolve()
 
 
 def replacements(args: argparse.Namespace) -> dict[str, str]:
@@ -20,7 +19,7 @@ def replacements(args: argparse.Namespace) -> dict[str, str]:
         "{{USER_ID}}": args.user_id,
         "{{AGENT_ID}}": args.agent_id,
         "{{APP_ID}}": args.app_id,
-        "{{STATE_DB}}": str(expand_path(args.state_db)),
+        "{{STATE_DB}}": str(expand_path(args.state_db).resolve()),
     }
 
 
@@ -57,14 +56,14 @@ def write_env(args: argparse.Namespace, memory_root: Path) -> None:
     if env_path.exists() and not args.overwrite_env:
         print(f"SKIP env_exists {env_path}")
         return
-    config_root = expand_path(args.config_root)
-    git_root = expand_path(args.git_root) if args.git_root else memory_root
+    config_root = expand_path(args.config_root).resolve()
+    git_root = expand_path(args.git_root).resolve() if args.git_root else memory_root
     content = "\n".join(
         [
             f"AGENT_MEMORY_ROOT={memory_root}",
             f"AGENT_MEMORY_GIT_ROOT={git_root}",
             f"AGENT_MEMORY_CONFIG_ROOT={config_root}",
-            f"AGENT_MEMORY_STATE_DB={expand_path(args.state_db)}",
+            f"AGENT_MEMORY_STATE_DB={expand_path(args.state_db).resolve()}",
             f"AGENT_MEMORY_USER_ID={args.user_id}",
             f"AGENT_MEMORY_AGENT_ID={args.agent_id}",
             f"AGENT_MEMORY_APP_ID={args.app_id}",
@@ -115,7 +114,7 @@ def main() -> int:
     if not TEMPLATE_ROOT.is_dir():
         raise SystemExit(f"Template root not found: {TEMPLATE_ROOT}")
 
-    memory_root = expand_path(args.memory_root)
+    memory_root = expand_path(args.memory_root).resolve()
     memory_root.mkdir(parents=True, exist_ok=True)
     created, skipped = copy_template(memory_root, replacements(args), args.overwrite)
     print(f"memory_root={memory_root}")
@@ -126,16 +125,20 @@ def main() -> int:
         write_env(args, memory_root)
 
     print("next_commands:")
-    print("  source .env")
-    print("  git -C \"$AGENT_MEMORY_GIT_ROOT\" init  # optional, if the vault is not already in a git repo")
-    print("  python3 scripts/agent_memory_evolution.py --init --scan --report")
-    print("  python3 scripts/agent_memory_index.py --init --scan --report")
-    print("  python3 scripts/agent_memory_closeout.py --dry-run")
-    print("  python3 scripts/agent_memory_check.py")
-    print("  python3 scripts/agent_memory_doctor.py")
+    if os.name == "nt":
+        print("  # .env is loaded by Python; no PowerShell import is required")
+        print(f'  git -C "{memory_root}" init  # optional, if the vault is not already in a git repo')
+    else:
+        print("  source .env")
+        print("  git -C \"$AGENT_MEMORY_GIT_ROOT\" init  # optional, if the vault is not already in a git repo")
+    print(f"  {sys.executable} scripts/agent_memory_evolution.py --init --scan --report")
+    print(f"  {sys.executable} scripts/agent_memory_index.py --init --scan --report")
+    print(f"  {sys.executable} scripts/agent_memory_closeout.py --dry-run")
+    print(f"  {sys.executable} scripts/agent_memory_check.py")
+    print(f"  {sys.executable} scripts/agent_memory_doctor.py")
     print("optional_semantic_retrieval:")
-    print("  python3 -m pip install -r requirements-vector.lock")
-    print("  python3 scripts/agent_memory_zvec_index.py --init --scan --prune")
+    print(f"  {sys.executable} -m pip install -r requirements-vector.lock")
+    print(f"  {sys.executable} scripts/agent_memory_zvec_index.py --init --scan --prune")
     return 0
 
 
