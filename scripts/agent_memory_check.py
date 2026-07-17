@@ -6,21 +6,20 @@ import json
 import os
 import re
 import sqlite3
+from contextlib import closing
 import subprocess
 import sys
 from pathlib import Path
 
-from agent_memory_env import env_value
+from agent_memory_env import env_value, expand_path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts"
 DEFAULT_VAULT_ROOT = REPO_ROOT / "templates" / "vault"
-VAULT_ROOT = Path(os.path.expandvars(env_value("ROOT", str(DEFAULT_VAULT_ROOT)))).expanduser().resolve()
-GIT_ROOT = Path(os.path.expandvars(env_value("GIT_ROOT", str(REPO_ROOT)))).expanduser().resolve()
-STATE_DB = Path(
-    os.path.expandvars(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
-).expanduser().resolve()
+VAULT_ROOT = expand_path(env_value("ROOT", str(DEFAULT_VAULT_ROOT))).resolve()
+GIT_ROOT = expand_path(env_value("GIT_ROOT", str(REPO_ROOT))).resolve()
+STATE_DB = expand_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite")).resolve()
 PUBLIC_TEMPLATE_MODE = DEFAULT_VAULT_ROOT.is_dir() and VAULT_ROOT == DEFAULT_VAULT_ROOT.resolve()
 
 
@@ -182,7 +181,7 @@ def check_state_db() -> tuple[bool, str]:
     if not STATE_DB.exists():
         return False, "missing"
     try:
-        with sqlite3.connect(STATE_DB) as conn:
+        with closing(sqlite3.connect(STATE_DB)) as conn, conn:
             conn.execute("PRAGMA busy_timeout=10000")
             rows = conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')").fetchall()
     except sqlite3.Error as exc:
@@ -197,7 +196,7 @@ def check_state_db() -> tuple[bool, str]:
 
 
 def normalize_path(raw_path: str) -> Path:
-    path = Path(os.path.expandvars(raw_path)).expanduser()
+    path = expand_path(raw_path)
     if not path.is_absolute():
         path = Path.cwd() / path
     return path.resolve()
@@ -275,8 +274,12 @@ def check_public_repo_files() -> list[str]:
     failures: list[str] = []
     forbidden_names = {".env"}
     forbidden_suffixes = {".sqlite", ".db", ".key", ".pem"}
+    local_only_dirs = {
+        ".agent-memory", ".venv", "build", "dist", "local-vault", "model-cache",
+        "node_modules", "private", "secrets", "tmp", "vector-store", "zvec",
+    }
     for path in REPO_ROOT.rglob("*"):
-        if ".git" in path.parts:
+        if ".git" in path.parts or any(part in local_only_dirs for part in path.parts):
             continue
         if path.is_file() and path.name in forbidden_names:
             failures.append(f"FORBIDDEN public_file {path}")

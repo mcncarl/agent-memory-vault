@@ -12,15 +12,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agent_memory_env import env_value
+from agent_memory_env import env_value, expand_path
 from agent_memory_claim import active_claim_rows, all_active_claim_rows
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-VAULT_ROOT = Path(os.path.expandvars(env_value("ROOT", str(REPO_ROOT / "templates" / "vault")))).expanduser().resolve()
-CONFIG_ROOT = Path(os.path.expandvars(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))).expanduser().resolve()
-STATE_DB = Path(os.path.expandvars(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite")))).expanduser().resolve()
-LOG_PATH = Path(os.path.expandvars(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))).expanduser().resolve()
+VAULT_ROOT = expand_path(env_value("ROOT", str(REPO_ROOT / "templates" / "vault"))).resolve()
+CONFIG_ROOT = expand_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory")).resolve()
+STATE_DB = expand_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite"))).resolve()
+LOG_PATH = expand_path(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl"))).resolve()
 CLOSEOUT_SCRIPT = REPO_ROOT / "scripts" / "agent_memory_closeout.py"
 AUDIT_AUTORUN = REPO_ROOT / "scripts" / "agent_memory_audit_autorun.py"
 STAMP_ROOT = CONFIG_ROOT / "hooks"
@@ -33,7 +33,7 @@ def default_git_root() -> Path:
     return VAULT_ROOT.parent.resolve()
 
 
-GIT_ROOT = Path(os.path.expandvars(env_value("GIT_ROOT", str(default_git_root())))).expanduser().resolve()
+GIT_ROOT = expand_path(env_value("GIT_ROOT", str(default_git_root()))).resolve()
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,6 +83,8 @@ def run_git(args: list[str], timeout: int = 8) -> subprocess.CompletedProcess[st
         return subprocess.run(
             ["git", "-C", str(GIT_ROOT), "-c", "core.quotepath=false", *args],
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout,
             check=False,
@@ -167,9 +169,12 @@ def unobserved_paths(paths: list[Path]) -> list[Path]:
     if not paths or not STATE_DB.exists():
         return paths
     try:
-        with sqlite3.connect(STATE_DB, timeout=5) as conn:
+        conn = sqlite3.connect(STATE_DB, timeout=5)
+        try:
             conn.execute("PRAGMA busy_timeout=5000")
             rows = conn.execute("SELECT path, sha256 FROM memory_file_observations").fetchall()
+        finally:
+            conn.close()
     except (OSError, sqlite3.Error):
         return paths
     indexed = {str(Path(str(path)).resolve()): str(digest) for path, digest in rows}

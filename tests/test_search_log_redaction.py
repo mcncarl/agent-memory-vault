@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import closing
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,8 @@ class SearchLogRedactionTest(unittest.TestCase):
             state_db = tmp / "state.sqlite"
             config = tmp / "agent-memory.toml"
             config.write_text(
-                f'memory_root = "{REPO_ROOT / "templates" / "vault"}"\nstate_db = "{state_db}"\n',
+                f'memory_root = "{(REPO_ROOT / "templates" / "vault").as_posix()}"\n'
+                f'state_db = "{state_db.as_posix()}"\n',
                 encoding="utf-8",
             )
             env = os.environ.copy()
@@ -35,7 +37,7 @@ class SearchLogRedactionTest(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(initialized.returncode, 0, initialized.stderr)
-            with sqlite3.connect(state_db) as conn:
+            with closing(sqlite3.connect(state_db)) as conn, conn:
                 conn.execute(
                     "INSERT INTO memory_search_log(query,result_count,created_at) VALUES (?,?,?)",
                     ("private legacy query", 0, "2026-07-11T00:00:00+00:00"),
@@ -50,7 +52,7 @@ class SearchLogRedactionTest(unittest.TestCase):
             )
             self.assertEqual(redacted.returncode, 0, redacted.stderr)
             self.assertEqual(json.loads(redacted.stdout), {"redacted": 1, "remaining_raw": 0})
-            with sqlite3.connect(state_db) as conn:
+            with closing(sqlite3.connect(state_db)) as conn, conn:
                 query, digest, length = conn.execute(
                     "SELECT query, query_sha256, query_length FROM memory_search_log"
                 ).fetchone()

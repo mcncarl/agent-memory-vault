@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import shutil
+from contextlib import closing
 import subprocess
 import sys
 import tempfile
@@ -25,7 +27,10 @@ TEMPLATE = REPO_ROOT / "templates" / "vault"
 
 
 def run(command: list[str], *, cwd: Path, env: dict[str, str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True, timeout=timeout, check=False)
+    return subprocess.run(
+        command, cwd=cwd, env=env, text=True, encoding="utf-8",
+        capture_output=True, timeout=timeout, check=False,
+    )
 
 
 class ActorSessionIsolationTest(unittest.TestCase):
@@ -54,7 +59,7 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
             vault = git_root / "AgentMemory"
             runtime = tmp / "runtime"
             git_root.mkdir(parents=True)
-            subprocess.run(["cp", "-R", str(TEMPLATE), str(vault)], check=True)
+            shutil.copytree(TEMPLATE, vault)
             subprocess.run(["git", "init", "-q", str(git_root)], check=True)
             subprocess.run(["git", "-C", str(git_root), "config", "user.name", "Agent Memory Test"], check=True)
             subprocess.run(["git", "-C", str(git_root), "config", "user.email", "test@example.invalid"], check=True)
@@ -67,17 +72,17 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
             config_path.write_text(
                 "\n".join(
                     [
-                        f'memory_root = "{vault}"',
-                        f'git_root = "{git_root}"',
-                        f'config_root = "{runtime}"',
-                        f'state_db = "{runtime / "state.sqlite"}"',
-                        f'closeout_log = "{runtime / "logs" / "closeout.jsonl"}"',
-                        f'audit_run_log = "{runtime / "logs" / "audit_runs.jsonl"}"',
-                        'python = "' + sys.executable + '"',
+                        f'memory_root = "{vault.as_posix()}"',
+                        f'git_root = "{git_root.as_posix()}"',
+                        f'config_root = "{runtime.as_posix()}"',
+                        f'state_db = "{(runtime / "state.sqlite").as_posix()}"',
+                        f'closeout_log = "{(runtime / "logs" / "closeout.jsonl").as_posix()}"',
+                        f'audit_run_log = "{(runtime / "logs" / "audit_runs.jsonl").as_posix()}"',
+                        f'python = "{Path(sys.executable).as_posix()}"',
                         "",
                         "[semantic_retrieval]",
                         "enabled = false",
-                        'python = "' + sys.executable + '"',
+                        f'python = "{Path(sys.executable).as_posix()}"',
                     ]
                 )
                 + "\n",
@@ -85,6 +90,7 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
             )
             env = os.environ.copy()
             env["AGENT_MEMORY_CONFIG_FILE"] = str(config_path)
+            env["PYTHONIOENCODING"] = "utf-8"
 
             evolved = run(
                 [sys.executable, str(SCRIPTS / "agent_memory_evolution.py"), "--init", "--scan"],
@@ -129,6 +135,7 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
 
             listed = run(
                 [
+                    sys.executable,
                     str(SCRIPTS / "memoryctl"),
                     "--actor",
                     "claude",
@@ -175,6 +182,7 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
                 cwd=REPO_ROOT,
                 env=env,
                 text=True,
+                encoding="utf-8",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -183,6 +191,7 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
                 cwd=REPO_ROOT,
                 env=env,
                 text=True,
+                encoding="utf-8",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -220,7 +229,7 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
                 {"AgentMemory/项目/_模板-项目.md", "AgentMemory/工作流/Agent记忆收尾决策规则.md"},
             )
 
-            with sqlite3.connect(runtime / "state.sqlite") as conn:
+            with closing(sqlite3.connect(runtime / "state.sqlite")) as conn, conn:
                 active = conn.execute(
                     "SELECT COUNT(*) FROM memory_session_claims WHERE status='active'"
                 ).fetchone()[0]

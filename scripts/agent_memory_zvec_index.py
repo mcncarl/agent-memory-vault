@@ -4,12 +4,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
 import hashlib
 import importlib.util
 import json
 import math
-import os
 import re
 import sqlite3
 import sys
@@ -18,22 +16,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_memory_env import env_value
+from agent_memory_env import env_value, expand_path
+from agent_memory_lock import try_lock, unlock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts"
-STATE_DB = Path(
-    os.path.expandvars(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
-).expanduser().resolve()
-DEFAULT_COLLECTION_PATH = Path(
-    os.path.expandvars(
-        env_value("VECTOR_DIR", "$HOME/.config/agent-memory/zvec/memory_chunks_embeddinggemma_768")
-    )
-).expanduser().resolve()
-DEFAULT_LOCK_PATH = Path(
-    os.path.expandvars(env_value("ZVEC_LOCK", "$HOME/.config/agent-memory/locks/zvec.lock"))
-).expanduser().resolve()
+STATE_DB = expand_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite")).resolve()
+DEFAULT_COLLECTION_PATH = expand_path(
+    env_value("VECTOR_DIR", "$HOME/.config/agent-memory/zvec/memory_chunks_embeddinggemma_768")
+).resolve()
+DEFAULT_LOCK_PATH = expand_path(env_value("ZVEC_LOCK", "$HOME/.config/agent-memory/locks/zvec.lock")).resolve()
 DEFAULT_MODEL = env_value("EMBEDDING_MODEL", "google/embeddinggemma-300m")
 DEFAULT_EMBEDDING_DIM = int(env_value("EMBEDDING_DIM", "768"))
 DEFAULT_DEVICE = env_value("EMBEDDING_DEVICE", "cpu")
@@ -109,20 +102,20 @@ def utc_now() -> str:
 def zvec_lock(exclusive: bool, timeout: float):
     DEFAULT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with DEFAULT_LOCK_PATH.open("a+", encoding="utf-8") as handle:
-        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         deadline = time.monotonic() + max(timeout, 0.0)
         while True:
             try:
-                fcntl.flock(handle.fileno(), operation | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"zvec lock timed out: {DEFAULT_LOCK_PATH}")
-                time.sleep(0.05)
+                if try_lock(handle, exclusive=exclusive):
+                    break
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"zvec lock timed out: {DEFAULT_LOCK_PATH}")
+            time.sleep(0.05)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            unlock(handle)
 
 
 def sha256_text(text: str) -> str:
@@ -392,7 +385,7 @@ def load_changed_docs(conn: sqlite3.Connection, raw_paths: list[str], vault_root
     docs: list[IndexedDoc] = []
     errors: list[str] = []
     for raw_path in raw_paths:
-        path = Path(os.path.expandvars(raw_path)).expanduser()
+        path = expand_path(raw_path)
         if not path.is_absolute():
             path = Path.cwd() / path
         path = path.resolve()

@@ -7,25 +7,27 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from agent_memory_env import env_value, load_config
+from agent_memory_env import env_value, expand_path, load_config
 
 
 VERSION = "2.2"
 REPO_ROOT = Path(__file__).resolve().parents[1]
-VAULT_ROOT = Path(os.path.expandvars(env_value("ROOT", str(REPO_ROOT / "templates" / "vault")))).expanduser().resolve()
-GIT_ROOT = Path(os.path.expandvars(env_value("GIT_ROOT", str(REPO_ROOT)))).expanduser().resolve()
-CONFIG_ROOT = Path(os.path.expandvars(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))).expanduser().resolve()
-STATE_DB = Path(os.path.expandvars(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite")))).expanduser().resolve()
+VAULT_ROOT = expand_path(env_value("ROOT", str(REPO_ROOT / "templates" / "vault"))).resolve()
+GIT_ROOT = expand_path(env_value("GIT_ROOT", str(REPO_ROOT))).resolve()
+CONFIG_ROOT = expand_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory")).resolve()
+STATE_DB = expand_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite"))).resolve()
 SCRIPT_ROOT = REPO_ROOT / "scripts"
-AUDIT_LOG = Path(os.path.expandvars(env_value("AUDIT_RUN_LOG", str(CONFIG_ROOT / "logs" / "audit_runs.jsonl")))).expanduser().resolve()
-CLOSEOUT_LOG = Path(os.path.expandvars(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))).expanduser().resolve()
+AUDIT_LOG = expand_path(env_value("AUDIT_RUN_LOG", str(CONFIG_ROOT / "logs" / "audit_runs.jsonl"))).resolve()
+CLOSEOUT_LOG = expand_path(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl"))).resolve()
 RUNTIME_MANIFEST = CONFIG_ROOT / "config" / "runtime-manifest.json"
 HOST_CONFIG = load_config().get("host", {})
 if not isinstance(HOST_CONFIG, dict):
@@ -34,13 +36,11 @@ SEMANTIC_CONFIG = load_config().get("semantic_retrieval", {})
 if not isinstance(SEMANTIC_CONFIG, dict):
     SEMANTIC_CONFIG = {}
 SEMANTIC_ENABLED = bool(SEMANTIC_CONFIG.get("enabled", False))
-ZVEC_PYTHON = Path(
-    os.path.expandvars(env_value("ZVEC_PYTHON", str(CONFIG_ROOT / ".venv" / "bin" / "python")))
-).expanduser()
-EMBEDDING_MODEL = Path(os.path.expandvars(env_value("EMBEDDING_MODEL", ""))).expanduser()
-MODEL_MANIFEST = Path(os.path.expandvars(env_value("MODEL_MANIFEST", str(CONFIG_ROOT / "models" / "embeddinggemma-300m" / "model-manifest.json")))).expanduser().resolve()
+ZVEC_PYTHON = expand_path(env_value("ZVEC_PYTHON", str(CONFIG_ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))))
+EMBEDDING_MODEL = expand_path(env_value("EMBEDDING_MODEL", ""))
+MODEL_MANIFEST = expand_path(env_value("MODEL_MANIFEST", str(CONFIG_ROOT / "models" / "embeddinggemma-300m" / "model-manifest.json"))).resolve()
 MODEL_REVISION = env_value("MODEL_REVISION", "")
-DEPENDENCY_LOCK = Path(os.path.expandvars(env_value("DEPENDENCY_LOCK", str(CONFIG_ROOT / "requirements-vector.lock")))).expanduser().resolve()
+DEPENDENCY_LOCK = expand_path(env_value("DEPENDENCY_LOCK", str(CONFIG_ROOT / "requirements-vector.lock"))).resolve()
 REQUIRE_LOCAL_MODEL = env_value("REQUIRE_LOCAL_MODEL", "false").strip().lower() in {"1", "true", "yes", "on"}
 EXCLUDED_VECTOR_TYPES = {"routing", "directory_index", "template", "agent_case_candidate", "skill_candidate"}
 EXCLUDED_VECTOR_STATUS = {"archived", "deleted", "obsolete", "outdated", "deprecated", "stale"}
@@ -55,7 +55,10 @@ def utc_now() -> str:
 
 def run(command: list[str], timeout: int = 300, env: dict[str, str] | None = None) -> dict[str, Any]:
     try:
-        completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout, env=env, check=False)
+        completed = subprocess.run(
+            command, text=True, encoding="utf-8", errors="replace", capture_output=True,
+            timeout=timeout, env=env, check=False,
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "returncode": 127, "detail": type(exc).__name__}
     return {"ok": completed.returncode == 0, "returncode": completed.returncode, "stdout": completed.stdout, "detail": (completed.stderr or completed.stdout).strip()[:500]}
@@ -73,6 +76,11 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def markdown_sha256(path: Path) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def offline_env() -> dict[str, str]:
     env = os.environ.copy()
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
@@ -84,7 +92,7 @@ def offline_env() -> dict[str, str]:
 
 def verify_model_manifest() -> tuple[bool, dict[str, Any]]:
     manifest = read_json_object(MODEL_MANIFEST)
-    root = Path(os.path.expandvars(str(manifest.get("root", "")))).expanduser().resolve() if manifest else Path()
+    root = expand_path(str(manifest.get("root", ""))).resolve() if manifest else Path()
     files = manifest.get("files") if isinstance(manifest, dict) else None
     missing: list[str] = []
     size_mismatch: list[str] = []
@@ -248,7 +256,7 @@ def configured_path(name: str) -> Path | None:
     raw = HOST_CONFIG.get(name)
     if not isinstance(raw, str) or not raw.strip():
         return None
-    return Path(os.path.expandvars(raw)).expanduser().resolve()
+    return expand_path(raw).resolve()
 
 
 def local_endpoint_reachable(raw_url: str) -> tuple[bool, dict[str, Any]]:
@@ -453,6 +461,7 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     required = [
         "agent_memory_index.py",
+        "agent_memory_lock.py",
         "agent_memory_search.py",
         "agent_memory_closeout.py",
         "agent_memory_check.py",
@@ -468,6 +477,23 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     ]
     missing = [name for name in required if not (SCRIPT_ROOT / name).is_file()]
     add(checks, "runtime_files", "fail" if missing else "pass", "Runtime files complete." if not missing else "Runtime files missing.", {"missing": missing})
+    version_ok = sys.version_info >= (3, 10)
+    add(checks, "python_runtime", "pass" if version_ok else "fail", f"Python {sys.version.split()[0]} is active.")
+    git_ok = bool(shutil.which("git"))
+    add(checks, "git_runtime", "pass" if git_ok else "fail", "Git is available." if git_ok else "Git was not found in PATH.")
+    if os.name == "nt":
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        add(checks, "windows_powershell", "pass" if powershell else "fail", "PowerShell is available." if powershell else "PowerShell was not found.")
+        hooks_path = Path.home() / ".codex" / "hooks.json"
+        hooks_text = hooks_path.read_text(encoding="utf-8-sig", errors="replace") if hooks_path.is_file() else ""
+        hook_ok = "stop-hook.ps1" in hooks_text or "agent_memory_stop_hook.py" in hooks_text
+        add(checks, "codex_stop_hook", "pass" if hook_ok else "warn", "Codex Stop Hook is configured." if hook_ok else "Codex Stop Hook is not installed.", {"path": str(hooks_path)})
+        task_name = str(HOST_CONFIG.get("audit_task_name", "AgentMemoryVaultAudit"))
+        task_result = run(
+            [powershell, "-NoProfile", "-Command", f"Get-ScheduledTask -TaskName '{task_name}' -ErrorAction Stop | Out-Null"],
+            15,
+        ) if powershell else {"ok": False}
+        add(checks, "audit_scheduled_task", "pass" if task_result.get("ok") else "warn", "Windows audit task is installed." if task_result.get("ok") else "Windows audit task is not installed.", {"task_name": task_name})
     if REPO_ROOT.resolve() == CONFIG_ROOT.resolve():
         manifest = read_json_object(RUNTIME_MANIFEST)
         expected = manifest.get("files") if isinstance(manifest, dict) else None
@@ -526,7 +552,7 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     db_by_path = {str(row["path"]): row for row in docs}
     missing_db = sorted(path.relative_to(VAULT_ROOT).as_posix() for raw, path in actual_by_path.items() if raw not in db_by_path)
     stale_db = sorted(str(row["rel_path"]) for raw, row in db_by_path.items() if raw not in actual_by_path)
-    mismatch = sorted(str(row["rel_path"]) for raw, row in db_by_path.items() if raw in actual_by_path and file_sha256(actual_by_path[raw]) != str(row["sha256"]))
+    mismatch = sorted(str(row["rel_path"]) for raw, row in db_by_path.items() if raw in actual_by_path and markdown_sha256(actual_by_path[raw]) != str(row["sha256"]))
     add(checks, "markdown_sqlite_parity", "pass" if not (missing_db or stale_db or mismatch) else "fail", f"Markdown={len(actual)}, SQLite={len(docs)}.", {"missing": missing_db, "stale": stale_db, "hash_mismatch": mismatch})
     fts = {str(row[0]) for row in conn.execute("SELECT DISTINCT path FROM memory_fts")}
     add(checks, "sqlite_fts_parity", "pass" if fts == set(db_by_path) else "fail", f"FTS covers {len(fts)}/{len(docs)} docs.")

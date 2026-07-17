@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+from contextlib import closing
 import subprocess
 import sys
 import time
@@ -16,16 +17,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent_memory_env import env_value
+from agent_memory_env import env_value, expand_path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts"
 DEFAULT_VAULT_ROOT = REPO_ROOT / "templates" / "vault"
-VAULT_ROOT = Path(os.path.expandvars(env_value("ROOT", str(DEFAULT_VAULT_ROOT)))).expanduser().resolve()
-STATE_DB = Path(
-    os.path.expandvars(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
-).expanduser().resolve()
+VAULT_ROOT = expand_path(env_value("ROOT", str(DEFAULT_VAULT_ROOT))).resolve()
+STATE_DB = expand_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite")).resolve()
 ZVEC_SCRIPT = SCRIPT_ROOT / "agent_memory_zvec_index.py"
 ZVEC_PYTHON = env_value("ZVEC_PYTHON", sys.executable)
 
@@ -267,7 +266,7 @@ def zvec_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]
     if not rows:
         return [], []
     results: list[SearchResult] = []
-    with connect() as conn:
+    with closing(connect()) as conn, conn:
         for rank, row in enumerate(rows, 1):
             if not isinstance(row, dict):
                 continue
@@ -313,7 +312,7 @@ def rg_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]]:
         return [], [completed.stderr.strip() or f"rg failed: {completed.returncode}"]
     results: list[SearchResult] = []
     seen: set[str] = set()
-    with connect() as conn:
+    with closing(connect()) as conn, conn:
         for line in completed.stdout.splitlines():
             parts = line.split(":", 2)
             if len(parts) != 3:
@@ -384,7 +383,7 @@ def result_matches_filters(result: SearchResult, args: argparse.Namespace) -> bo
 
 def log_search(query: str, rows: list[SearchResult], duration_ms: int) -> None:
     try:
-        with connect() as conn:
+        with closing(connect()) as conn, conn:
             memory_index.init_db(conn)
             digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
             sources = sorted({source for row in rows for source in row.sources})
@@ -406,7 +405,7 @@ def log_search(query: str, rows: list[SearchResult], duration_ms: int) -> None:
 
 def redact_legacy_search_logs() -> dict[str, int]:
     """Irreversibly remove legacy query text while retaining useful metadata."""
-    with connect() as conn:
+    with closing(connect()) as conn, conn:
         memory_index.init_db(conn)
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(

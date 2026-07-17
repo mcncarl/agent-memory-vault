@@ -87,7 +87,7 @@ class AgentMemoryEnvironmentTests(unittest.TestCase):
                 self.assertEqual(env_value("ROOT", "/default"), "/dotenv/vault")
                 self.assertEqual(
                     env_value("STATE_DB", "/default/state.sqlite"),
-                    "$HOME/.config/dotenv-memory/state.sqlite",
+                    str(agent_memory_env.DEFAULT_HOME / ".config" / "dotenv-memory" / "state.sqlite"),
                 )
         reset_config_cache()
 

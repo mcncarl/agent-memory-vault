@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sqlite3
+from contextlib import closing
 import subprocess
 import sys
 import tempfile
@@ -152,7 +153,7 @@ class DurabilityGuardTests(unittest.TestCase):
             state_db = tmp / "state.sqlite"
             with mock.patch.object(claim, "VAULT_ROOT", vault), mock.patch.object(claim, "STATE_DB", state_db):
                 claim.claim_paths("codex", "old-session", [str(note)])
-                with sqlite3.connect(state_db) as conn:
+                with closing(sqlite3.connect(state_db)) as conn, conn:
                     conn.execute(
                         "UPDATE memory_session_claims SET updated_at='2000-01-01T00:00:00+00:00'"
                     )
@@ -160,7 +161,7 @@ class DurabilityGuardTests(unittest.TestCase):
                 self.assertEqual(claim.all_active_claim_rows(max_age_hours=24), [])
                 rows, applied = claim.expire_stale_claims(24, apply=False)
                 self.assertEqual((len(rows), applied), (1, 0))
-                with sqlite3.connect(state_db) as conn:
+                with closing(sqlite3.connect(state_db)) as conn, conn:
                     conn.execute(
                         "UPDATE memory_session_claims SET updated_at=?",
                         (claim.utc_now(),),
@@ -169,14 +170,14 @@ class DurabilityGuardTests(unittest.TestCase):
                 with mock.patch.object(claim, "stale_active_claim_rows", return_value=rows):
                     _, applied = claim.expire_stale_claims(24, apply=True)
                 self.assertEqual(applied, 0)
-                with sqlite3.connect(state_db) as conn:
+                with closing(sqlite3.connect(state_db)) as conn, conn:
                     conn.execute(
                         "UPDATE memory_session_claims SET updated_at='2000-01-01T00:00:00+00:00'"
                     )
                     conn.commit()
                 rows, applied = claim.expire_stale_claims(24, apply=True)
                 self.assertEqual((len(rows), applied), (1, 1))
-                with sqlite3.connect(state_db) as conn:
+                with closing(sqlite3.connect(state_db)) as conn, conn:
                     status = conn.execute("SELECT status FROM memory_session_claims").fetchone()[0]
                 self.assertEqual(status, "expired")
 

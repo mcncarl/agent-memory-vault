@@ -7,19 +7,16 @@ import hashlib
 import json
 import os
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from agent_memory_env import env_value
+from agent_memory_env import env_value, expand_path
 
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
-VAULT_ROOT = Path(
-    os.path.expandvars(env_value("ROOT", str(RUNTIME_ROOT / "templates" / "vault")))
-).expanduser().resolve()
-STATE_DB = Path(
-    os.path.expandvars(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
-).expanduser().resolve()
+VAULT_ROOT = expand_path(env_value("ROOT", str(RUNTIME_ROOT / "templates" / "vault"))).resolve()
+STATE_DB = expand_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite")).resolve()
 ACTOR_SESSION_ENV_KEYS = {
     "codex": ("AGENT_MEMORY_SESSION_ID", "CODEX_THREAD_ID"),
     "claude": ("AGENT_MEMORY_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"),
@@ -114,7 +111,7 @@ def record_file_observations(raw_session_id: str, actor: str, paths: list[Path])
         return 0
     now = utc_now()
     hashed = session_hash(raw_session_id)
-    with connect() as conn:
+    with closing(connect()) as conn, conn:
         for path, rel_path, digest in rows:
             conn.execute(
                 """
@@ -157,7 +154,7 @@ def claim_paths(actor: str, raw_session_id: str, paths: list[str]) -> list[dict[
         raise ValueError("session id is required; pass --session-id or use a supported host session environment")
     normalized = [normalize_claim_path(raw) for raw in paths]
     now = utc_now()
-    with connect() as conn:
+    with closing(connect()) as conn, conn:
         for path, rel_path in normalized:
             conn.execute(
                 """
@@ -190,7 +187,7 @@ def active_claim_rows(raw_session_id: str, actor: str = "") -> list[dict[str, st
         query += " AND actor=?"
         params.append(actor)
     query += " ORDER BY rel_path"
-    with connect() as conn:
+    with closing(connect()) as conn, conn:
         rows = conn.execute(query, params).fetchall()
     return [{key: str(row[key] or "") for key in row.keys()} for row in rows]
 
@@ -208,7 +205,7 @@ def parsed_time(value: str) -> dt.datetime | None:
 def all_active_claim_rows(max_age_hours: float | None = None) -> list[dict[str, str]]:
     if max_age_hours is not None and max_age_hours <= 0:
         raise ValueError("max_age_hours must be positive")
-    with connect() as conn:
+    with closing(connect()) as conn, conn:
         rows = conn.execute(
             """
             SELECT session_hash, actor, path, rel_path, status, claimed_at, updated_at
@@ -238,7 +235,7 @@ def expire_stale_claims(max_age_hours: float = 24, apply: bool = False) -> tuple
         return rows, 0
     now = utc_now()
     changed = 0
-    with connect() as conn:
+    with closing(connect()) as conn, conn:
         for row in rows:
             cursor = conn.execute(
                 """
@@ -258,7 +255,7 @@ def complete_claim_paths(raw_session_id: str, actor: str, paths: list[Path]) -> 
     if not hashed or not paths:
         return 0
     now = utc_now()
-    with connect() as conn:
+    with closing(connect()) as conn, conn:
         placeholders = ",".join("?" for _ in paths)
         params: list[str] = [now, now, hashed, actor, *(str(path.resolve()) for path in paths)]
         cursor = conn.execute(

@@ -8,29 +8,20 @@ import os
 import json
 import re
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_memory_env import env_value
+from agent_memory_env import env_value, expand_path
 
 
-CONFIG_ROOT = Path(
-    os.path.expandvars(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))
-).expanduser().resolve()
-STATE_DB = Path(
-    os.path.expandvars(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite")))
-).expanduser().resolve()
-AUDIT_DB = Path(
-    os.path.expandvars(env_value("AUDIT_DB", str(CONFIG_ROOT / "audit_decisions.sqlite")))
-).expanduser().resolve()
-INVARIANTS_PATH = Path(
-    os.path.expandvars(env_value("INVARIANTS", str(CONFIG_ROOT / "config" / "system-invariants.json")))
-).expanduser().resolve()
+CONFIG_ROOT = expand_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory")).resolve()
+STATE_DB = expand_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite"))).resolve()
+AUDIT_DB = expand_path(env_value("AUDIT_DB", str(CONFIG_ROOT / "audit_decisions.sqlite"))).resolve()
+INVARIANTS_PATH = expand_path(env_value("INVARIANTS", str(CONFIG_ROOT / "config" / "system-invariants.json"))).resolve()
 REPO_ROOT = Path(__file__).resolve().parents[1]
-VAULT_ROOT = Path(
-    os.path.expandvars(env_value("ROOT", str(REPO_ROOT / "templates" / "vault")))
-).expanduser().resolve()
+VAULT_ROOT = expand_path(env_value("ROOT", str(REPO_ROOT / "templates" / "vault"))).resolve()
 
 
 @dataclass
@@ -574,7 +565,7 @@ def collect_findings(args: argparse.Namespace) -> list[Finding]:
     if not STATE_DB.exists():
         raise SystemExit(f"missing state db: {STATE_DB}")
     findings: list[Finding] = []
-    with connect_state() as conn:
+    with closing(connect_state()) as conn, conn:
         add_stale_findings(conn, findings, args.stale_days)
         add_open_loop_findings(conn, findings, args.open_loop_threshold, args.risk_threshold)
         add_duplicate_title_findings(conn, findings)
@@ -583,7 +574,7 @@ def collect_findings(args: argparse.Namespace) -> list[Finding]:
         add_index_parity_findings(conn, findings)
         add_current_fact_invariant_findings(conn, findings)
     findings.sort(key=lambda item: (severity_rank(item.severity), item.kind, item.rel_path), reverse=True)
-    with connect_audit() as audit_conn:
+    with closing(connect_audit()) as audit_conn, audit_conn:
         decisions = load_decisions(audit_conn)
     return apply_decisions(findings, decisions, args.include_acknowledged)[: args.limit]
 
@@ -599,7 +590,7 @@ def record_decision(args: argparse.Namespace) -> dict[str, Any] | None:
     if not selected:
         return None
     decision, finding_id = selected[0]
-    with connect_audit() as conn:
+    with closing(connect_audit()) as conn, conn:
         conn.execute(
             """
             INSERT INTO audit_decisions(finding_id, decision, note, snooze_until, decided_at)
@@ -616,7 +607,7 @@ def record_decision(args: argparse.Namespace) -> dict[str, Any] | None:
 
 
 def list_decisions() -> list[dict[str, Any]]:
-    with connect_audit() as conn:
+    with closing(connect_audit()) as conn, conn:
         rows = conn.execute(
             "SELECT finding_id, decision, note, snooze_until, decided_at FROM audit_decisions ORDER BY decided_at DESC"
         ).fetchall()
