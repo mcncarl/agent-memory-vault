@@ -1457,12 +1457,23 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
                 continue
             intent_id = str(validation.get("intent_id", ""))
             claim_path = claim_path_by_intent.get(intent_id)
-            final_digest = str(validation.get("final_raw_sha256", "")).strip().lower()
-            if claim_path is None or not final_digest:
+            final_raw = str(validation.get("final_raw_sha256", "")).strip().lower()
+            final_canonical = str(validation.get("final_canonical_sha256", "")).strip().lower()
+            if claim_path is None or not final_raw:
                 continue
-            if checked_commit_hashes.get(claim_path.resolve()) != final_digest:
-                preflight_error = "VALIDATED_CONTENT_CHANGED"
-                break
+            checked_raw = checked_commit_hashes.get(claim_path.resolve())
+            if checked_raw != final_raw:
+                try:
+                    checked_digest = write_intent.content_hashes(claim_path.read_bytes())
+                except (OSError, write_intent.IntentError):
+                    preflight_error = "VALIDATED_CONTENT_CHANGED"
+                    break
+                if (
+                    checked_digest.raw_sha256 != checked_raw
+                    or checked_digest.canonical_sha256 != final_canonical
+                ):
+                    preflight_error = "VALIDATED_CONTENT_CHANGED"
+                    break
 
     if args.dry_run:
         info.append("dry_run: no index refresh, zvec refresh, or commit will be written")

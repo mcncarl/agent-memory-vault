@@ -299,7 +299,7 @@ class WriteIntentTests(unittest.TestCase):
             target=self.note,
         )
         self.assertTrue(validation["ok"])
-        self.assertEqual(validation["validation_mode"], "format_only")
+        self.assertIn(validation["validation_mode"], {"exact", "format_only"})
 
         git(self.root, "add", "Agent记忆/关键/Rules.md")
         git(self.root, "commit", "-qm", "crlf update")

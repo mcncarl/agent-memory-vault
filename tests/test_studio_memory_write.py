@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -509,7 +510,8 @@ class StudioMemoryWriteTests(unittest.TestCase):
     def test_read_target_returns_exact_content_without_touching_runtime_state(self) -> None:
         session = "content-studio-read-session"
         existing = self.box.vault / "项目" / "Existing.md"
-        expected = existing.read_text(encoding="utf-8")
+        expected_bytes = existing.read_bytes()
+        expected = expected_bytes.decode("utf-8")
         state_before = {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
             for path in self.box.runtime.glob("state.sqlite*")
@@ -540,7 +542,7 @@ class StudioMemoryWriteTests(unittest.TestCase):
         self.assertEqual(found["status"], "found")
         self.assertTrue(found["exists"])
         self.assertEqual(found["content"], expected)
-        self.assertEqual(found["raw_sha256"], hashlib.sha256(expected.encode()).hexdigest())
+        self.assertEqual(found["raw_sha256"], hashlib.sha256(expected_bytes).hexdigest())
         self.assertEqual(found["git_head"], git(self.box.git_root, "rev-parse", "HEAD"))
         self.assertEqual(missing_process.returncode, 0, missing_process.stderr + missing_process.stdout)
         self.assertEqual(missing["status"], "missing")
@@ -614,7 +616,7 @@ class StudioMemoryWriteTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertEqual(git(self.box.git_root, "status", "--porcelain"), "")
         proposal_id = str(prepared["proposal_id"])
-        with sqlite3.connect(self.box.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             intent = conn.execute(
                 "SELECT proposal_canonical_snapshot, approval_required, reconcile_action, "
                 "actor, session_hash, asserted_by FROM memory_write_intents WHERE intent_id=?",
@@ -647,7 +649,7 @@ class StudioMemoryWriteTests(unittest.TestCase):
             git(self.box.git_root, "log", "-1", "--format=%H", "--", f"AgentMemory/{target_rel}"),
             applied["git_commit"],
         )
-        with sqlite3.connect(self.box.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             stored = conn.execute(
                 "SELECT i.status, r.outcome, r.approval_ref_sha256 "
                 "FROM memory_write_intents i JOIN memory_write_receipts r USING(intent_id) "
@@ -849,7 +851,7 @@ class StudioMemoryWriteTests(unittest.TestCase):
         self.assertNotIn(secret, blocked_process.stdout)
         self.assertFalse((self.box.vault / "项目" / "Secret.md").exists())
 
-        with sqlite3.connect(self.box.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             intent_count = conn.execute("SELECT COUNT(*) FROM memory_write_intents").fetchone()[0]
         self.assertEqual(intent_count, 0)
         self.assertEqual(git(self.box.git_root, "status", "--porcelain"), "")
@@ -960,7 +962,7 @@ class StudioMemoryWriteTests(unittest.TestCase):
         scoped_process, scoped = self.box.write("prepare", request, session=session)
         self.assertEqual(scoped_process.returncode, 2)
         self.assertEqual(scoped["reason_code"], "AGENT_SCOPE_MISMATCH")
-        with sqlite3.connect(self.box.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM memory_write_intents").fetchone()[0],
                 0,
@@ -1103,7 +1105,7 @@ class StudioMemoryWriteTests(unittest.TestCase):
         self.assertIn(concurrent_marker, target.read_text(encoding="utf-8"))
         self.assertNotEqual(target.read_text(encoding="utf-8"), request["proposal_markdown"])
         self.assertEqual(list(target.parent.glob(".agent-memory-studio-*")), [])
-        with sqlite3.connect(self.box.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             intent_status = conn.execute(
                 "SELECT status FROM memory_write_intents WHERE intent_id=?",
                 (prepared["proposal_id"],),

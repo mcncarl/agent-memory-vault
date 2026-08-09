@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -149,7 +150,7 @@ class DeletionObservationCommandTests(unittest.TestCase):
         expected_sentinel = f"deleted:{self.deletion_commit}:{prior_sha256}"
         self.assertEqual(parse_deleted_observation(expected_sentinel), (self.deletion_commit, prior_sha256))
         self.assertIsNone(parse_deleted_observation(f"deleted:{self.deletion_commit}:bad"))
-        with sqlite3.connect(self.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.state_db)) as conn, conn:
             audit = conn.execute(
                 """
                 SELECT actor, user_authorized, deletion_commit, prior_sha256,
@@ -172,7 +173,7 @@ class DeletionObservationCommandTests(unittest.TestCase):
         repeated = self.observe(apply=True)
         self.assertEqual(repeated.returncode, 0, repeated.stderr + repeated.stdout)
         self.assertEqual(json.loads(repeated.stdout)["applied"], 0)
-        with sqlite3.connect(self.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.state_db)) as conn, conn:
             count = conn.execute("SELECT COUNT(*) FROM memory_deletion_observations").fetchone()[0]
         self.assertEqual(count, 1)
 

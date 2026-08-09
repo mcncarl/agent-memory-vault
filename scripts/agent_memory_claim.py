@@ -638,7 +638,7 @@ def _normalize_existing_formal_path(raw: str) -> tuple[Path, str, str]:
     return path, rel_path, repo_path
 
 
-def _git_blob_sha256(commit: str, repo_path: str) -> str:
+def _git_blob_digest(commit: str, repo_path: str) -> write_intent.ContentDigest:
     blob_result = _run_git("rev-parse", "--verify", f"{commit}:{repo_path}")
     blob_oid = blob_result.stdout.decode("ascii", errors="ignore").strip().lower()
     if blob_result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", blob_oid):
@@ -646,7 +646,11 @@ def _git_blob_sha256(commit: str, repo_path: str) -> str:
     content_result = _run_git("cat-file", "blob", blob_oid)
     if content_result.returncode != 0:
         raise ValueError("committed target blob could not be read")
-    return hashlib.sha256(content_result.stdout).hexdigest()
+    return write_intent.content_hashes(content_result.stdout)
+
+
+def _git_blob_sha256(commit: str, repo_path: str) -> str:
+    return _git_blob_digest(commit, repo_path).raw_sha256
 
 
 def _current_git_head() -> str:
@@ -703,7 +707,7 @@ def validate_committed_observation(
     current_sha256 = current_digest.raw_sha256
     current_canonical_sha256 = current_digest.canonical_sha256
     head = _current_git_head()
-    if _git_blob_sha256(head, repo_path) != current_sha256:
+    if _git_blob_digest(head, repo_path).canonical_sha256 != current_canonical_sha256:
         raise ValueError("target content does not match the current HEAD blob")
 
     with connect(read_only=True) as conn:
@@ -874,7 +878,7 @@ def validate_committed_observation(
     latest_commit = latest_result.stdout.decode("ascii", errors="ignore").strip().lower()
     if latest_result.returncode != 0 or latest_commit != proposal_commit:
         raise ValueError("historical proposal commit is not the target path's latest change")
-    if _git_blob_sha256(proposal_commit, repo_path) != current_sha256:
+    if _git_blob_digest(proposal_commit, repo_path).canonical_sha256 != current_canonical_sha256:
         raise ValueError("historical proposal commit blob does not match the current target")
     base_ancestor = _run_git("merge-base", "--is-ancestor", base_head, proposal_commit)
     if base_ancestor.returncode != 0:
@@ -991,7 +995,8 @@ def _store_committed_observation(observation: dict[str, Any]) -> int:
             current_digest.raw_sha256 != observation["sha256"]
             or current_digest.canonical_sha256 != observation["canonical_sha256"]
             or current_head != observation["observed_git_head"]
-            or _git_blob_sha256(current_head, repo_path) != observation["sha256"]
+            or _git_blob_digest(current_head, repo_path).canonical_sha256
+            != observation["canonical_sha256"]
             or latest_result.returncode != 0
             or latest_commit != observation["proposal_commit"]
         ):

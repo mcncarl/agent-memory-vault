@@ -364,7 +364,7 @@ class WriteIntentEndToEndTests(unittest.TestCase):
         )
         self.assertEqual(validated.returncode, 0, validated.stderr + validated.stdout)
         self.assertTrue(self.box.json_payload(validated)["early_commit"])
-        with sqlite3.connect(self.box.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             conn.execute(
                 "UPDATE memory_write_intents SET expires_at=validated_at "
                 "WHERE intent_id=?",
@@ -389,7 +389,7 @@ class WriteIntentEndToEndTests(unittest.TestCase):
         self.assertEqual(blocked.returncode, 2, blocked.stderr + blocked.stdout)
         self.assertIn("active intent or session claim", self.box.json_payload(blocked)["error"])
 
-        with sqlite3.connect(self.box.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             conn.execute(
                 "UPDATE memory_session_claims SET status='expired', completed_at=updated_at "
                 "WHERE path=? AND status='active'",
@@ -399,7 +399,7 @@ class WriteIntentEndToEndTests(unittest.TestCase):
         preview = self.box.ctl("human", "human-maintenance", "observe-committed", *observe_args)
         self.assertEqual(preview.returncode, 0, preview.stderr + preview.stdout)
         self.assertTrue(self.box.json_payload(preview)["preview"])
-        with sqlite3.connect(self.box.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             count_before = conn.execute("SELECT COUNT(*) FROM memory_committed_observations").fetchone()[0]
         self.assertEqual(count_before, 0)
 
@@ -437,7 +437,7 @@ raise SystemExit(3)
         )
         self.assertEqual(raced.returncode, 0, raced.stderr + raced.stdout)
         self.assertIn("gained an active intent or session claim", raced.stdout)
-        with sqlite3.connect(self.box.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             conn.execute(
                 "UPDATE memory_session_claims SET status='expired', completed_at=updated_at "
                 "WHERE session_hash=? AND path=?",
@@ -451,7 +451,7 @@ raise SystemExit(3)
         applied_payload = self.box.json_payload(applied)
         self.assertEqual(applied_payload["applied"], 1)
         self.assertFalse(applied_payload["preview"])
-        with sqlite3.connect(self.box.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             audit = conn.execute(
                 "SELECT actor, user_authorized, intent_id, proposal_commit, evidence_ref_sha256 "
                 "FROM memory_committed_observations"
@@ -472,7 +472,7 @@ raise SystemExit(3)
         self.assertEqual(repeated.returncode, 0, repeated.stderr + repeated.stdout)
         self.assertEqual(self.box.json_payload(repeated)["applied"], 0)
 
-        with sqlite3.connect(self.box.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             conn.execute(
                 "UPDATE memory_write_receipts SET evidence_ref_sha256=? WHERE intent_id=?",
                 ("f" * 64, intent_id),
@@ -490,7 +490,7 @@ raise SystemExit(3)
             "--",
             "AgentMemory/用户记忆/偏好与边界.md",
         )
-        with sqlite3.connect(self.box.state_db) as conn:
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             conn.execute(
                 "UPDATE memory_write_receipts SET evidence_ref_sha256=?, base_git_head=? "
                 "WHERE intent_id=?",
