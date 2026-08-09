@@ -380,7 +380,7 @@ def explicit_entries(paths: list[str]) -> tuple[list[GitEntry], list[str]]:
         else:
             path = path.resolve()
         try:
-            repo_path = str(path.relative_to(REPO_ROOT))
+            repo_path = path.relative_to(REPO_ROOT).as_posix()
         except ValueError:
             warnings.append(f"changed file outside repo skipped: {path}")
             continue
@@ -394,7 +394,7 @@ def explicit_entries(paths: list[str]) -> tuple[list[GitEntry], list[str]]:
 
 def relative_to_vault(path: Path) -> str:
     try:
-        return str(path.relative_to(VAULT_ROOT))
+        return path.relative_to(VAULT_ROOT).as_posix()
     except ValueError:
         return str(path)
 
@@ -1529,6 +1529,16 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         status = "warning"
 
     commit_step: dict[str, Any]
+    early_commit_paths = {
+        claim_path_by_intent[str(validation.get("intent_id", ""))].resolve()
+        for validation in intent_validations
+        if validation.get("ok")
+        and validation.get("early_commit")
+        and str(validation.get("intent_id", "")) in claim_path_by_intent
+    }
+    commit_process_files = [
+        path for path in process_files if path.resolve() not in early_commit_paths
+    ]
     if status == "error":
         commit_step = {"ok": False, "skipped": True, "detail": "skipped_due_to_error"}
     elif blocking_reconcile and not args.commit_warnings:
@@ -1537,7 +1547,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         commit_step = {"ok": True, "skipped": True, "detail": "skipped_due_to_warning"}
     else:
         commit_step = commit_files(
-            process_files,
+            commit_process_files,
             args,
             expected_raw_sha256=checked_commit_hashes,
             expected_head=git_head_before,
