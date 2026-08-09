@@ -934,7 +934,12 @@ def bind_checked_file_hashes(files: list[Path]) -> tuple[dict[Path, str], dict[s
         if candidate.is_symlink():
             raise OSError(f"symlink target rejected: {candidate}")
         path = candidate.resolve()
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         descriptor = os.open(path, flags)
         try:
             metadata = os.fstat(descriptor)
