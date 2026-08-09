@@ -922,10 +922,11 @@ def _hash_object_bytes(data: bytes) -> tuple[bool, str]:
     return completed.returncode == 0 and bool(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id)), object_id
 
 
-def bind_checked_file_hashes(files: list[Path]) -> dict[Path, str]:
-    """Bind every closeout file to the bytes presented for checking."""
+def bind_checked_file_hashes(files: list[Path]) -> tuple[dict[Path, str], dict[str, str]]:
+    """Bind each closeout file to raw and canonical hashes from one read."""
 
     bound: dict[Path, str] = {}
+    canonical_bound: dict[str, str] = {}
     for raw_path in files:
         candidate = raw_path.expanduser()
         if not candidate.is_absolute():
@@ -940,15 +941,20 @@ def bind_checked_file_hashes(files: list[Path]) -> dict[Path, str]:
             if not stat.S_ISREG(metadata.st_mode):
                 raise OSError(f"not a regular file: {path}")
             digest = hashlib.sha256()
+            payload = bytearray()
             while True:
                 block = os.read(descriptor, 1024 * 1024)
                 if not block:
                     break
                 digest.update(block)
+                payload.extend(block)
         finally:
             os.close(descriptor)
         bound[path] = digest.hexdigest()
-    return bound
+        canonical_bound[os.path.normcase(str(path))] = write_intent.content_hashes(
+            bytes(payload)
+        ).canonical_sha256
+    return bound, canonical_bound
 
 
 def _snapshot_commit_files(
@@ -1443,12 +1449,15 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
 
     preflight_error = ownership_error or intent_error
     checked_commit_hashes: dict[Path, str] = {}
+    checked_canonical_hashes: dict[str, str] = {}
     if process_files and not preflight_error:
         try:
             # Bind all ordinary and protected files before validation checks;
             # the isolated snapshot below must still contain these bytes.
-            checked_commit_hashes = bind_checked_file_hashes(process_files)
-        except OSError:
+            checked_commit_hashes, checked_canonical_hashes = bind_checked_file_hashes(
+                process_files
+            )
+        except (OSError, write_intent.IntentError):
             preflight_error = "CHECK_INPUT_BIND_FAILED"
 
     if not preflight_error:
@@ -1457,23 +1466,13 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
                 continue
             intent_id = str(validation.get("intent_id", ""))
             claim_path = claim_path_by_intent.get(intent_id)
-            final_raw = str(validation.get("final_raw_sha256", "")).strip().lower()
             final_canonical = str(validation.get("final_canonical_sha256", "")).strip().lower()
-            if claim_path is None or not final_raw:
+            if claim_path is None or not final_canonical:
                 continue
-            checked_raw = checked_commit_hashes.get(claim_path.resolve())
-            if checked_raw != final_raw:
-                try:
-                    checked_digest = write_intent.content_hashes(claim_path.read_bytes())
-                except (OSError, write_intent.IntentError):
-                    preflight_error = "VALIDATED_CONTENT_CHANGED"
-                    break
-                if (
-                    checked_digest.raw_sha256 != checked_raw
-                    or checked_digest.canonical_sha256 != final_canonical
-                ):
-                    preflight_error = "VALIDATED_CONTENT_CHANGED"
-                    break
+            checked_key = os.path.normcase(str(claim_path.resolve()))
+            if checked_canonical_hashes.get(checked_key) != final_canonical:
+                preflight_error = "VALIDATED_CONTENT_CHANGED"
+                break
 
     if args.dry_run:
         info.append("dry_run: no index refresh, zvec refresh, or commit will be written")
