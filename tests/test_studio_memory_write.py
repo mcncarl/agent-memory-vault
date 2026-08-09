@@ -270,6 +270,7 @@ class StudioWriteSandbox:
             environment.update(extra_env)
         completed = run(
             [
+                sys.executable,
                 str(memoryctl),
                 "--actor",
                 "yichen-content-studio",
@@ -479,6 +480,7 @@ class StudioMemoryWriteTests(unittest.TestCase):
         private_marker = "argv-session-private-marker-94731"
         completed = run(
             [
+                sys.executable,
                 str(MEMORYCTL),
                 "--actor",
                 "yichen-content-studio",

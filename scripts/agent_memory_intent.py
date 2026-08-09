@@ -631,6 +631,11 @@ def _git_blob(commit: str, repo_rel_path: str) -> bytes | None:
     return bytes(result.stdout)
 
 
+def _git_path_matches_worktree(commit: str, repo_rel_path: str) -> bool:
+    """Compare Git and worktree content while honoring checkout filters."""
+    return _run_git("diff", "--quiet", commit, "--", repo_rel_path).returncode == 0
+
+
 def _git_is_ancestor(base: str, head: str) -> bool:
     if base == head:
         return True
@@ -916,7 +921,7 @@ def create_intent(
     if strict_git_base:
         if base_exists != (base_blob is not None):
             raise IntentError("BASE_NOT_AT_GIT_HEAD", "target must be clean at Git HEAD before creating an intent")
-        if base_blob is not None and sha256_bytes(base_blob) != base.raw_sha256:
+        if base_blob is not None and not _git_path_matches_worktree(base_git_head, repo_rel_path):
             raise IntentError("BASE_NOT_AT_GIT_HEAD", "target has uncommitted changes before intent creation")
 
     hours = DEFAULT_TTL_HOURS if ttl_hours is None else float(ttl_hours)
@@ -939,7 +944,7 @@ def create_intent(
                         "BASE_NOT_AT_GIT_HEAD",
                         "target must be clean at Git HEAD before creating an intent",
                     )
-                if locked_blob is not None and sha256_bytes(locked_blob) != locked_base.raw_sha256:
+                if locked_blob is not None and not _git_path_matches_worktree(locked_git_head, repo_rel_path):
                     raise IntentError(
                         "BASE_NOT_AT_GIT_HEAD",
                         "target has uncommitted changes before intent creation",
@@ -1281,7 +1286,7 @@ def validate_closeout(
             exists
             and completed_receipt is not None
             and str(completed_receipt["outcome"]) == "completed"
-            and final.raw_sha256 == str(snapshot["final_raw_sha256"])
+            and final.canonical_sha256 == str(snapshot["final_canonical_sha256"])
         ):
             return {
                 "ok": True,
@@ -1299,7 +1304,7 @@ def validate_closeout(
         raise IntentError("COMPLETED_CONTENT_CHANGED", "target no longer matches the completed write receipt")
     if str(snapshot["status"]) == "validated":
         exists, final = _read_target(canonical)
-        if final.raw_sha256 == str(snapshot["final_raw_sha256"]):
+        if final.canonical_sha256 == str(snapshot["final_canonical_sha256"]):
             early_commit = bool(snapshot["early_commit"])
             proposal_commit = str(snapshot["proposal_commit"])
             version_chain: list[dict[str, Any]] = []
@@ -1311,7 +1316,8 @@ def validate_closeout(
                     version
                     for version in versions
                     if version.get("exists")
-                    and str(version.get("raw_sha256", "")) == str(snapshot["final_raw_sha256"])
+                    and str(version.get("canonical_sha256", ""))
+                    == str(snapshot["final_canonical_sha256"])
                 ]
                 if history.get("ok") and versions and len(safe_versions) == len(versions):
                     early_commit = True
@@ -1571,7 +1577,11 @@ def finalize_receipt(
             resolved_commit = _resolve_git_commit(commit_candidate)
             target = canonical_target(str(intent["target_rel_path"]))
             blob = _git_blob(resolved_commit, _repo_rel_path(target))
-            if blob is None or sha256_bytes(blob) != str(intent["final_raw_sha256"]):
+            committed_digest = content_hashes(blob, max_bytes=MAX_TARGET_BYTES) if blob is not None else None
+            if (
+                committed_digest is None
+                or committed_digest.canonical_sha256 != str(intent["final_canonical_sha256"])
+            ):
                 raise IntentError(
                     "COMMIT_BLOB_MISMATCH",
                     "the committed target blob does not match the validated final content",

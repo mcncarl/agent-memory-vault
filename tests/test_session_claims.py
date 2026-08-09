@@ -69,17 +69,17 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
             config_path.write_text(
                 "\n".join(
                     [
-                        f'memory_root = "{vault}"',
-                        f'git_root = "{git_root}"',
-                        f'config_root = "{runtime}"',
-                        f'state_db = "{runtime / "state.sqlite"}"',
-                        f'closeout_log = "{runtime / "logs" / "closeout.jsonl"}"',
-                        f'audit_run_log = "{runtime / "logs" / "audit_runs.jsonl"}"',
-                        'python = "' + sys.executable + '"',
+                        f"memory_root = {json.dumps(str(vault), ensure_ascii=False)}",
+                        f"git_root = {json.dumps(str(git_root), ensure_ascii=False)}",
+                        f"config_root = {json.dumps(str(runtime), ensure_ascii=False)}",
+                        f"state_db = {json.dumps(str(runtime / 'state.sqlite'), ensure_ascii=False)}",
+                        f"closeout_log = {json.dumps(str(runtime / 'logs' / 'closeout.jsonl'), ensure_ascii=False)}",
+                        f"audit_run_log = {json.dumps(str(runtime / 'logs' / 'audit_runs.jsonl'), ensure_ascii=False)}",
+                        f"python = {json.dumps(sys.executable)}",
                         "",
                         "[semantic_retrieval]",
                         "enabled = false",
-                        'python = "' + sys.executable + '"',
+                        f"python = {json.dumps(sys.executable)}",
                     ]
                 )
                 + "\n",
@@ -131,6 +131,7 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
 
             listed = run(
                 [
+                    sys.executable,
                     str(SCRIPTS / "memoryctl"),
                     "--actor",
                     "claude",

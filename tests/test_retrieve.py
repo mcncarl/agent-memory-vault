@@ -63,9 +63,9 @@ class TempVault:
         self.config = root / "agent-memory.toml"
         (self.vault / "项目").mkdir(parents=True)
         self.config.write_text(
-            f'memory_root = "{self.vault}"\n'
-            f'git_root = "{self.vault}"\n'
-            f'state_db = "{self.state_db}"\n',
+            f"memory_root = {json.dumps(str(self.vault), ensure_ascii=False)}\n"
+            f"git_root = {json.dumps(str(self.vault), ensure_ascii=False)}\n"
+            f"state_db = {json.dumps(str(self.state_db), ensure_ascii=False)}\n",
             encoding="utf-8",
         )
         self.env = os.environ.copy()

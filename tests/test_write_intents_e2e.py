@@ -201,7 +201,7 @@ class IntentSandbox:
         return payload
 
     def ctl_command(self, actor: str, command: str, *args: str) -> list[str]:
-        return [str(MEMORYCTL), "--actor", actor, command, *args]
+        return [sys.executable, str(MEMORYCTL), "--actor", actor, command, *args]
 
     def ctl(
         self,

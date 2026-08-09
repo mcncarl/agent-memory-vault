@@ -22,7 +22,8 @@ class SearchLogRedactionTest(unittest.TestCase):
             state_db = tmp / "state.sqlite"
             config = tmp / "agent-memory.toml"
             config.write_text(
-                f'memory_root = "{REPO_ROOT / "templates" / "vault"}"\nstate_db = "{state_db}"\n',
+                f"memory_root = {json.dumps(str(REPO_ROOT / 'templates' / 'vault'))}\n"
+                f"state_db = {json.dumps(str(state_db))}\n",
                 encoding="utf-8",
             )
             env = os.environ.copy()

@@ -50,9 +50,9 @@ class RuntimeInstallTests(unittest.TestCase):
             self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
             config = runtime / "config" / "agent-memory.toml"
             config.write_text(
-                f'memory_root = "{vault}"\n'
-                f'git_root = "{vault}"\n'
-                f'state_db = "{runtime / "state.sqlite"}"\n',
+                f"memory_root = {json.dumps(str(vault), ensure_ascii=False)}\n"
+                f"git_root = {json.dumps(str(vault), ensure_ascii=False)}\n"
+                f"state_db = {json.dumps(str(runtime / 'state.sqlite'), ensure_ascii=False)}\n",
                 encoding="utf-8",
             )
             if os.name != "nt":

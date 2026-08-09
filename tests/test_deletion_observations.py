@@ -73,10 +73,10 @@ class DeletionObservationCommandTests(unittest.TestCase):
         config_path.write_text(
             "\n".join(
                 (
-                    f'memory_root = "{self.vault}"',
-                    f'git_root = "{self.git_root}"',
-                    f'config_root = "{self.runtime}"',
-                    f'state_db = "{self.state_db}"',
+                    f"memory_root = {json.dumps(str(self.vault), ensure_ascii=False)}",
+                    f"git_root = {json.dumps(str(self.git_root), ensure_ascii=False)}",
+                    f"config_root = {json.dumps(str(self.runtime), ensure_ascii=False)}",
+                    f"state_db = {json.dumps(str(self.state_db), ensure_ascii=False)}",
                 )
             )
             + "\n",
@@ -85,6 +85,7 @@ class DeletionObservationCommandTests(unittest.TestCase):
         self.env = os.environ.copy()
         self.env["AGENT_MEMORY_CONFIG_FILE"] = str(config_path)
         self.env["HOME"] = str(self.root)
+        self.env["USERPROFILE"] = str(self.root)
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -226,7 +227,10 @@ class DeletionObservationCommandTests(unittest.TestCase):
                 "DELETION_OBSERVATION_LOCK",
                 self.runtime / "locks" / "closeout.lock",
             ),
-            mock.patch.dict(os.environ, {"HOME": str(self.root)}),
+            mock.patch.dict(
+                os.environ,
+                {"HOME": str(self.root), "USERPROFILE": str(self.root)},
+            ),
         )
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
             observation = claim.validate_deletion_observation(

@@ -277,6 +277,41 @@ class WriteIntentTests(unittest.TestCase):
             self.create(target=new_target)
         self.assertEqual(caught.exception.reason_code, "BASE_NOT_AT_GIT_HEAD")
 
+    def test_crlf_checkout_matches_git_and_finalizes_against_canonical_blob(self) -> None:
+        git(self.root, "config", "core.autocrlf", "true")
+        self.note.write_bytes(b"# Rules\r\n\r\nOriginal.\r\n")
+        git(self.root, "add", "Agent记忆/关键/Rules.md")
+        self.assertEqual(git(self.root, "diff", "--cached", "--name-only"), "")
+        self.assertTrue(
+            self.module._git_path_matches_worktree(
+                git(self.root, "rev-parse", "HEAD"),
+                "Agent记忆/关键/Rules.md",
+            )
+        )
+
+        intent = self.create()
+        self.bind(intent)
+        self.note.write_bytes(b"# Rules\r\n\r\nUpdated.\r\n")
+        validation = self.module.validate_closeout(
+            intent["intent_id"],
+            actor="codex",
+            raw_session_id=self.session,
+            target=self.note,
+        )
+        self.assertTrue(validation["ok"])
+        self.assertEqual(validation["validation_mode"], "format_only")
+
+        git(self.root, "add", "Agent记忆/关键/Rules.md")
+        git(self.root, "commit", "-qm", "crlf update")
+        receipt = self.module.finalize_receipt(
+            intent["intent_id"],
+            actor="codex",
+            raw_session_id=self.session,
+            outcome="completed",
+            reason_code="WRITE_COMPLETED",
+        )
+        self.assertEqual(receipt["outcome"], "completed")
+
     def test_approval_binds_actor_session_target_and_proposal(self) -> None:
         intent = self.create(approval_required=True)
         with self.assertRaises(self.module.IntentError) as caught:

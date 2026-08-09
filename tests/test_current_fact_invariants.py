@@ -50,11 +50,11 @@ class CurrentFactInvariantTest(unittest.TestCase):
             config.write_text(
                 "\n".join(
                     [
-                        f'memory_root = "{vault}"',
-                        f'config_root = "{runtime}"',
-                        f'state_db = "{runtime / "state.sqlite"}"',
-                        f'audit_db = "{runtime / "audit.sqlite"}"',
-                        f'invariants_file = "{invariants}"',
+                        f"memory_root = {json.dumps(str(vault), ensure_ascii=False)}",
+                        f"config_root = {json.dumps(str(runtime), ensure_ascii=False)}",
+                        f"state_db = {json.dumps(str(runtime / 'state.sqlite'), ensure_ascii=False)}",
+                        f"audit_db = {json.dumps(str(runtime / 'audit.sqlite'), ensure_ascii=False)}",
+                        f"invariants_file = {json.dumps(str(invariants), ensure_ascii=False)}",
                     ]
                 )
                 + "\n",

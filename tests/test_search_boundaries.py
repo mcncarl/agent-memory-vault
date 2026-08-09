@@ -268,7 +268,8 @@ class SearchBoundaryTests(unittest.TestCase):
 
             config = tmp / "agent-memory.toml"
             config.write_text(
-                f'memory_root = "{vault}"\nstate_db = "{state_db}"\n',
+                f"memory_root = {json.dumps(str(vault), ensure_ascii=False)}\n"
+                f"state_db = {json.dumps(str(state_db), ensure_ascii=False)}\n",
                 encoding="utf-8",
             )
             env = os.environ.copy()
@@ -361,7 +362,8 @@ class SearchBoundaryTests(unittest.TestCase):
                 conn.execute("INSERT INTO legacy_marker(value) VALUES ('unchanged')")
             config = tmp / "agent-memory.toml"
             config.write_text(
-                f'memory_root = "{tmp}"\nstate_db = "{state_db}"\n',
+                f"memory_root = {json.dumps(str(tmp), ensure_ascii=False)}\n"
+                f"state_db = {json.dumps(str(state_db), ensure_ascii=False)}\n",
                 encoding="utf-8",
             )
             env = os.environ.copy()
