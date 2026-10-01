@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agent_memory_env import env_value, expand_path
+from agent_memory_env import assert_runtime_ready, env_value, expand_path
 from agent_memory_lock import try_lock, unlock
 import agent_memory_intent as write_intent
 from agent_memory_state import absolute_path, secure_sqlite_connect
@@ -45,7 +45,7 @@ ACTOR_SESSION_ENV_KEYS = {
     "human": ("AGENT_MEMORY_SESSION_ID",),
     "migration": ("AGENT_MEMORY_SESSION_ID",),
     "test": ("AGENT_MEMORY_SESSION_ID",),
-    "yichen-content-studio": ("AGENT_MEMORY_SESSION_ID",),
+    "ailu": ("AGENT_MEMORY_SESSION_ID",),
 }
 
 
@@ -59,6 +59,12 @@ def file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _observed_file_sha256(path: Path) -> str:
+    """Avoid shadowing the public ``file_sha256`` closeout argument."""
+
+    return file_sha256(path)
 
 
 def deleted_observation_sentinel(deletion_commit: str, prior_sha256: str) -> str:
@@ -94,20 +100,89 @@ def session_hash(value: str) -> str:
 
 
 def connect(*, read_only: bool = False) -> sqlite3.Connection:
-    conn = secure_sqlite_connect(
-        STATE_DB,
-        timeout=10,
-        create=not read_only,
-        read_only=read_only,
-        row_factory=sqlite3.Row,
-        pragmas=("PRAGMA busy_timeout=10000",),
-    )
     if not read_only:
-        ensure_schema(conn)
+        assert_runtime_ready("state-write")
+    if not STATE_DB.exists():
+        raise write_intent.IntentError(
+            write_intent.STATE_SCHEMA_REASON_CODE,
+            "installed state database is missing; run the installer migration",
+        )
+    try:
+        conn = secure_sqlite_connect(
+            STATE_DB,
+            timeout=10,
+            create=False,
+            read_only=read_only,
+            row_factory=sqlite3.Row,
+            pragmas=("PRAGMA busy_timeout=10000",),
+        )
+    except OSError as exc:
+        if not STATE_DB.exists():
+            raise write_intent.IntentError(
+                write_intent.STATE_SCHEMA_REASON_CODE,
+                "installed state database is missing; run the installer migration",
+            ) from exc
+        raise
+    try:
+        # DDL belongs exclusively to the backed-up installer migration.
+        # Ordinary claim writes fail closed on any schema drift.
+        assert_schema_ready(conn)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def assert_schema_ready(conn: sqlite3.Connection) -> None:
+    """Verify claim/list state without creating or altering SQLite objects."""
+
+    write_intent.assert_schema_ready(conn)
+    required_tables = {
+        "memory_session_claims",
+        "memory_file_observations",
+        "memory_deletion_observations",
+        "memory_committed_observations",
+        "memory_closeout_incidents",
+    }
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    with contextlib.closing(sqlite3.connect(":memory:")) as expected:
+        ensure_schema(expected)
+        required_columns = {
+            table: {str(row[1]) for row in expected.execute(f"PRAGMA table_info({table})")}
+            for table in required_tables
+        }
+        required_indexes = {
+            str(row[0])
+            for row in expected.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
+            )
+            if str(row[0]).startswith("idx_memory_session_claims_")
+        }
+    actual_indexes = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
+        )
+    }
+    malformed = not required_tables.issubset(tables) or not required_indexes.issubset(actual_indexes)
+    if not malformed:
+        malformed = any(
+            not columns.issubset(
+                {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+            )
+            for table, columns in required_columns.items()
+        )
+    if malformed:
+        raise write_intent.IntentError(
+            write_intent.STATE_SCHEMA_REASON_CODE,
+            "installed claim schema is missing or outdated; run the installer migration",
+        )
+
+
+def ensure_schema(conn: sqlite3.Connection, *, commit: bool = True) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS memory_session_claims (
@@ -120,6 +195,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           updated_at TEXT NOT NULL,
           completed_at TEXT,
           intent_id TEXT NOT NULL DEFAULT '',
+          target_key TEXT NOT NULL DEFAULT '',
+          fencing_token INTEGER NOT NULL DEFAULT 0,
+          claim_kind TEXT NOT NULL DEFAULT 'legacy',
           PRIMARY KEY (session_hash, path)
         )
         """
@@ -132,6 +210,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           sha256 TEXT NOT NULL,
           actor TEXT NOT NULL,
           session_hash TEXT NOT NULL DEFAULT '',
+          intent_id TEXT NOT NULL DEFAULT '',
+          fencing_token INTEGER NOT NULL DEFAULT 0,
+          git_commit TEXT NOT NULL DEFAULT '',
           observed_at TEXT NOT NULL
         )
         """
@@ -179,18 +260,74 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_closeout_incidents (
+          incident_id TEXT PRIMARY KEY,
+          intent_id TEXT NOT NULL,
+          target_key TEXT NOT NULL,
+          rel_path TEXT NOT NULL,
+          expected_sha256 TEXT NOT NULL,
+          observed_sha256 TEXT NOT NULL DEFAULT '',
+          git_commit TEXT NOT NULL,
+          reason_code TEXT NOT NULL,
+          detected_at TEXT NOT NULL,
+          resolved_at TEXT,
+          resolution_intent_id TEXT NOT NULL DEFAULT '',
+          resolution_git_commit TEXT NOT NULL DEFAULT '',
+          UNIQUE(intent_id, reason_code)
+        )
+        """
+    )
+    incident_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(memory_closeout_incidents)")
+    }
+    if "resolution_intent_id" not in incident_columns:
+        conn.execute(
+            "ALTER TABLE memory_closeout_incidents "
+            "ADD COLUMN resolution_intent_id TEXT NOT NULL DEFAULT ''"
+        )
+    if "resolution_git_commit" not in incident_columns:
+        conn.execute(
+            "ALTER TABLE memory_closeout_incidents "
+            "ADD COLUMN resolution_git_commit TEXT NOT NULL DEFAULT ''"
+        )
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_memory_session_claims_active "
         "ON memory_session_claims(status, actor, session_hash)"
     )
     columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_session_claims)")}
     if "intent_id" not in columns:
         conn.execute("ALTER TABLE memory_session_claims ADD COLUMN intent_id TEXT NOT NULL DEFAULT ''")
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_session_claims)")}
+    if "target_key" not in columns:
+        conn.execute("ALTER TABLE memory_session_claims ADD COLUMN target_key TEXT NOT NULL DEFAULT ''")
+    if "fencing_token" not in columns:
+        conn.execute("ALTER TABLE memory_session_claims ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0")
+    if "claim_kind" not in columns:
+        conn.execute("ALTER TABLE memory_session_claims ADD COLUMN claim_kind TEXT NOT NULL DEFAULT 'legacy'")
+    observation_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(memory_file_observations)")
+    }
+    if "intent_id" not in observation_columns:
+        conn.execute("ALTER TABLE memory_file_observations ADD COLUMN intent_id TEXT NOT NULL DEFAULT ''")
+    if "fencing_token" not in observation_columns:
+        conn.execute("ALTER TABLE memory_file_observations ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0")
+    if "git_commit" not in observation_columns:
+        conn.execute("ALTER TABLE memory_file_observations ADD COLUMN git_commit TEXT NOT NULL DEFAULT ''")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_session_claims_active_intent "
         "ON memory_session_claims(intent_id) WHERE intent_id<>'' AND status='active'"
     )
-    write_intent.ensure_schema(conn)
-    conn.commit()
+    # Legacy rows are deliberately allowed to remain blank until the explicit
+    # v2 migrator verifies canonical-path collisions. Every v2 claim is bound
+    # to a non-empty target_key and is therefore exclusive immediately.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_session_claims_active_target "
+        "ON memory_session_claims(target_key) WHERE target_key<>'' AND status='active'"
+    )
+    write_intent.ensure_schema(conn, commit=False)
+    if commit:
+        conn.commit()
 
 
 def record_file_observations(raw_session_id: str, actor: str, paths: list[Path]) -> int:
@@ -1101,13 +1238,13 @@ def claim_paths(actor: str, raw_session_id: str, paths: list[str], intent_id: st
         raise ValueError("one write intent can bind exactly one claimed file")
     for path, rel_path in normalized:
         if (
-            write_intent.PROTECTED_PATHS
-            and write_intent.ENFORCEMENT_MODE == "enforce"
+            write_intent.ENFORCEMENT_MODE == "enforce"
             and write_intent.is_protected_target(path)
             and not intent_id
         ):
             raise ValueError(f"protected memory requires a bound write intent before editing: {rel_path}")
     now = utc_now()
+    claim_bindings: dict[str, tuple[str, int, str]] = {}
     try:
         with connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1122,7 +1259,26 @@ def claim_paths(actor: str, raw_session_id: str, paths: list[str], intent_id: st
                 )
                 if str(bound.get("target_key", "")) != write_intent.canonical_target(normalized[0][0]).target_key:
                     raise ValueError("write intent target does not match claimed file")
+                claim_bindings[str(normalized[0][0])] = (
+                    str(bound.get("target_key", "")),
+                    int(bound.get("fencing_token") or 0),
+                    "intent",
+                )
             for path, rel_path in normalized:
+                target = write_intent.canonical_target(path)
+                target_key, fencing_token, claim_kind = claim_bindings.get(
+                    str(path),
+                    (target.target_key, 0, "legacy"),
+                )
+                if intent_id and (not target_key or fencing_token <= 0):
+                    raise ValueError("bound write intent is missing a valid path fence")
+                conflict = conn.execute(
+                    "SELECT actor, session_hash FROM memory_session_claims "
+                    "WHERE target_key=? AND status='active' AND NOT (session_hash=? AND path=?) LIMIT 1",
+                    (target_key, hashed, str(path)),
+                ).fetchone()
+                if conflict is not None:
+                    raise ValueError(f"ACTIVE_TARGET_CONFLICT: another session owns {rel_path}")
                 existing = conn.execute(
                     "SELECT status, intent_id FROM memory_session_claims WHERE session_hash=? AND path=?",
                     (hashed, str(path)),
@@ -1137,14 +1293,18 @@ def claim_paths(actor: str, raw_session_id: str, paths: list[str], intent_id: st
                 conn.execute(
                     """
                     INSERT INTO memory_session_claims (
-                      session_hash, actor, path, rel_path, status, claimed_at, updated_at, completed_at, intent_id
-                    ) VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, ?)
+                      session_hash, actor, path, rel_path, status, claimed_at, updated_at,
+                      completed_at, intent_id, target_key, fencing_token, claim_kind
+                    ) VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, ?, ?, ?, ?)
                     ON CONFLICT(session_hash, path) DO UPDATE SET
                       actor=excluded.actor,
                       rel_path=excluded.rel_path,
                       status='active',
                       updated_at=excluded.updated_at,
                       completed_at=NULL,
+                      target_key=excluded.target_key,
+                      fencing_token=excluded.fencing_token,
+                      claim_kind=excluded.claim_kind,
                       intent_id=CASE
                         WHEN memory_session_claims.status='active'
                              AND memory_session_claims.intent_id<>''
@@ -1153,7 +1313,10 @@ def claim_paths(actor: str, raw_session_id: str, paths: list[str], intent_id: st
                         ELSE excluded.intent_id
                       END
                     """,
-                    (hashed, actor, str(path), rel_path, now, now, intent_id),
+                    (
+                        hashed, actor, str(path), rel_path, now, now, intent_id,
+                        target_key, fencing_token, claim_kind,
+                    ),
                 )
             conn.commit()
     except write_intent.IntentError as exc:
@@ -1170,14 +1333,24 @@ def claim_paths(actor: str, raw_session_id: str, paths: list[str], intent_id: st
             except (write_intent.IntentError, OSError, sqlite3.Error):
                 pass
         raise
-    return [{"path": str(path), "rel_path": rel_path, "intent_id": intent_id} for path, rel_path in normalized]
+    return [
+        {
+            "path": str(path),
+            "rel_path": rel_path,
+            "intent_id": intent_id,
+            "target_key": claim_bindings.get(str(path), (write_intent.canonical_target(path).target_key, 0, "legacy"))[0],
+            "fencing_token": str(claim_bindings.get(str(path), ("", 0, "legacy"))[1]),
+            "claim_kind": claim_bindings.get(str(path), ("", 0, "legacy"))[2],
+        }
+        for path, rel_path in normalized
+    ]
 
 
 def active_claim_rows(
     raw_session_id: str,
     actor: str = "",
     *,
-    read_only: bool = False,
+    read_only: bool = True,
     max_age_hours: float | None = None,
 ) -> list[dict[str, str]]:
     if max_age_hours is not None and max_age_hours <= 0:
@@ -1186,26 +1359,23 @@ def active_claim_rows(
     if not hashed:
         return []
     params: list[str] = [hashed]
-    try:
-        with connect(read_only=read_only) as conn:
-            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_session_claims)")}
-            if not columns:
-                return []
-            intent_expression = "intent_id" if "intent_id" in columns else "'' AS intent_id"
-            query = (
-                "SELECT session_hash, actor, path, rel_path, status, claimed_at, updated_at, "
-                f"{intent_expression} FROM memory_session_claims "
-                "WHERE session_hash=? AND status='active'"
-            )
-            if actor:
-                query += " AND actor=?"
-                params.append(actor)
-            query += " ORDER BY rel_path"
-            rows = conn.execute(query, params).fetchall()
-    except (OSError, sqlite3.Error):
-        if read_only and not STATE_DB.exists():
-            return []
-        raise
+    with connect(read_only=read_only) as conn:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_session_claims)")}
+        intent_expression = "intent_id" if "intent_id" in columns else "'' AS intent_id"
+        target_expression = "target_key" if "target_key" in columns else "'' AS target_key"
+        fence_expression = "fencing_token" if "fencing_token" in columns else "0 AS fencing_token"
+        kind_expression = "claim_kind" if "claim_kind" in columns else "'legacy' AS claim_kind"
+        query = (
+            "SELECT session_hash, actor, path, rel_path, status, claimed_at, updated_at, "
+            f"{intent_expression}, {target_expression}, {fence_expression}, {kind_expression} "
+            "FROM memory_session_claims "
+            "WHERE session_hash=? AND status='active'"
+        )
+        if actor:
+            query += " AND actor=?"
+            params.append(actor)
+        query += " ORDER BY rel_path"
+        rows = conn.execute(query, params).fetchall()
     payloads = [{key: str(row[key] or "") for key in row.keys()} for row in rows]
     if max_age_hours is None:
         return payloads
@@ -1230,25 +1400,22 @@ def parsed_time(value: str) -> dt.datetime | None:
 def all_active_claim_rows(
     max_age_hours: float | None = None,
     *,
-    read_only: bool = False,
+    read_only: bool = True,
 ) -> list[dict[str, str]]:
     if max_age_hours is not None and max_age_hours <= 0:
         raise ValueError("max_age_hours must be positive")
-    try:
-        with connect(read_only=read_only) as conn:
-            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_session_claims)")}
-            if not columns:
-                return []
-            intent_expression = "intent_id" if "intent_id" in columns else "'' AS intent_id"
-            rows = conn.execute(
-                "SELECT session_hash, actor, path, rel_path, status, claimed_at, updated_at, "
-                f"{intent_expression} FROM memory_session_claims "
-                "WHERE status='active' ORDER BY actor, session_hash, rel_path"
-            ).fetchall()
-    except (OSError, sqlite3.Error):
-        if read_only and not STATE_DB.exists():
-            return []
-        raise
+    with connect(read_only=read_only) as conn:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_session_claims)")}
+        intent_expression = "intent_id" if "intent_id" in columns else "'' AS intent_id"
+        target_expression = "target_key" if "target_key" in columns else "'' AS target_key"
+        fence_expression = "fencing_token" if "fencing_token" in columns else "0 AS fencing_token"
+        kind_expression = "claim_kind" if "claim_kind" in columns else "'legacy' AS claim_kind"
+        rows = conn.execute(
+            "SELECT session_hash, actor, path, rel_path, status, claimed_at, updated_at, "
+            f"{intent_expression}, {target_expression}, {fence_expression}, {kind_expression} "
+            "FROM memory_session_claims "
+            "WHERE status='active' ORDER BY actor, session_hash, rel_path"
+        ).fetchall()
     payloads = [{key: str(row[key] or "") for key in row.keys()} for row in rows]
     if max_age_hours is None:
         return payloads
@@ -1259,7 +1426,16 @@ def all_active_claim_rows(
 def stale_active_claim_rows(max_age_hours: float = 24) -> list[dict[str, str]]:
     if max_age_hours <= 0:
         raise ValueError("max_age_hours must be positive")
-    rows = all_active_claim_rows()
+    # Intent-backed claims are projections of a renewable path lease.  Their
+    # lifetime is governed atomically by memory_write_intents.expires_at, not
+    # by the claim row's updated_at timestamp.  The legacy maintenance command
+    # may only age out unbound pre-v2 claims; expiring an intent projection here
+    # would strand a live lease and make the active-target index inconsistent.
+    rows = [
+        row
+        for row in all_active_claim_rows(read_only=True)
+        if row.get("claim_kind") != "intent" or not row.get("intent_id")
+    ]
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max_age_hours)
     return [row for row in rows if (parsed_time(row["updated_at"]) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)) < cutoff]
 
@@ -1277,12 +1453,149 @@ def expire_stale_claims(max_age_hours: float = 24, apply: bool = False) -> tuple
                 UPDATE memory_session_claims
                 SET status='expired', completed_at=?, updated_at=?
                 WHERE session_hash=? AND path=? AND status='active' AND updated_at=?
+                  AND (claim_kind<>'intent' OR intent_id='')
                 """,
                 (now, now, row["session_hash"], row["path"], row["updated_at"]),
             )
             changed += int(cursor.rowcount)
         conn.commit()
     return rows, changed
+
+
+def _terminal_claim_disposition_locked(
+    conn: sqlite3.Connection,
+    *,
+    expected_session_hash: str,
+    expected_path: str,
+    expected_intent_id: str,
+    expected_status: str,
+    expected_updated_at: str,
+) -> dict[str, Any]:
+    claim = conn.execute(
+        "SELECT * FROM memory_session_claims WHERE session_hash=? AND path=?",
+        (expected_session_hash, expected_path),
+    ).fetchone()
+    if claim is None:
+        raise ValueError("CLAIM_DISPOSITION_NOT_FOUND")
+    for key, expected in (
+        ("intent_id", expected_intent_id),
+        ("status", expected_status),
+        ("updated_at", expected_updated_at),
+    ):
+        if str(claim[key] or "") != expected:
+            raise ValueError("CLAIM_DISPOSITION_CAS_MISMATCH")
+    if expected_status != "active" or str(claim["claim_kind"]) != "intent":
+        raise ValueError("CLAIM_DISPOSITION_NOT_TERMINAL_PROJECTION")
+    bound = conn.execute(
+        "SELECT * FROM memory_write_intents WHERE intent_id=?",
+        (expected_intent_id,),
+    ).fetchone()
+    receipt = conn.execute(
+        "SELECT * FROM memory_write_receipts WHERE intent_id=?",
+        (expected_intent_id,),
+    ).fetchone()
+    if bound is None or receipt is None:
+        raise ValueError("CLAIM_DISPOSITION_AUDIT_CHAIN_MISSING")
+    terminal = str(bound["status"])
+    if terminal not in {"completed", "failed", "cancelled", "expired"}:
+        raise ValueError("CLAIM_DISPOSITION_INTENT_NOT_TERMINAL")
+    binding_ok = (
+        str(receipt["outcome"]) == terminal
+        and str(receipt["actor"]) == str(claim["actor"])
+        and str(receipt["session_hash"]) == expected_session_hash
+        and str(receipt["target_key"]) == str(claim["target_key"])
+        and int(receipt["fencing_token"] or 0) == int(claim["fencing_token"] or 0)
+        and str(bound["actor"]) == str(claim["actor"])
+        and str(bound["session_hash"]) == expected_session_hash
+        and str(bound["target_key"]) == str(claim["target_key"])
+        and int(bound["fencing_token"] or 0) == int(claim["fencing_token"] or 0)
+    )
+    if not binding_ok:
+        raise ValueError("CLAIM_DISPOSITION_AUDIT_CHAIN_MISMATCH")
+    if terminal == "completed":
+        git_commit = str(receipt["git_commit"])
+        target = write_intent.canonical_target(str(bound["target_rel_path"]))
+        blob = write_intent._git_blob(
+            write_intent._resolve_git_commit(git_commit),
+            write_intent._repo_rel_path(target),
+        )
+        digest = (
+            write_intent.content_hashes(blob, max_bytes=write_intent.MAX_TARGET_BYTES)
+            if blob is not None
+            else None
+        )
+        if (
+            digest is None
+            or digest.raw_sha256 != str(bound["final_raw_sha256"])
+            or digest.canonical_sha256 != str(bound["final_canonical_sha256"])
+            or str(receipt["final_raw_sha256"]) != str(bound["final_raw_sha256"])
+            or str(receipt["final_canonical_sha256"]) != str(bound["final_canonical_sha256"])
+        ):
+            raise ValueError("CLAIM_DISPOSITION_COMMIT_BLOB_MISMATCH")
+    return {
+        "session_hash": expected_session_hash,
+        "path": expected_path,
+        "rel_path": str(claim["rel_path"]),
+        "intent_id": expected_intent_id,
+        "claim_status": expected_status,
+        "intent_status": terminal,
+        "updated_at": expected_updated_at,
+        "fencing_token": int(claim["fencing_token"] or 0),
+        "receipt_id": str(receipt["receipt_id"]),
+        "git_commit": str(receipt["git_commit"]),
+    }
+
+
+def terminal_claim_disposition(
+    *,
+    expected_session_hash: str,
+    expected_path: str,
+    expected_intent_id: str,
+    expected_status: str,
+    expected_updated_at: str,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Preview or CAS-complete one stale terminal intent projection."""
+
+    if not re.fullmatch(r"[0-9a-f]{16}", expected_session_hash):
+        raise ValueError("CLAIM_DISPOSITION_SESSION_HASH_INVALID")
+    with connect(read_only=not apply) as conn:
+        if apply:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            preview = _terminal_claim_disposition_locked(
+                conn,
+                expected_session_hash=expected_session_hash,
+                expected_path=expected_path,
+                expected_intent_id=expected_intent_id,
+                expected_status=expected_status,
+                expected_updated_at=expected_updated_at,
+            )
+            applied = 0
+            if apply:
+                now = utc_now()
+                cursor = conn.execute(
+                    "UPDATE memory_session_claims SET status='completed', completed_at=?, updated_at=? "
+                    "WHERE session_hash=? AND path=? AND intent_id=? AND status=? AND updated_at=?",
+                    (
+                        now,
+                        now,
+                        expected_session_hash,
+                        expected_path,
+                        expected_intent_id,
+                        expected_status,
+                        expected_updated_at,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("CLAIM_DISPOSITION_CAS_MISMATCH")
+                conn.commit()
+                applied = 1
+            return {"ok": True, "preview": not apply, "applied": applied, "claim": preview}
+        except Exception:
+            if apply and conn.in_transaction:
+                conn.rollback()
+            raise
 
 
 def complete_claim_paths(raw_session_id: str, actor: str, paths: list[Path]) -> int:
@@ -1306,11 +1619,461 @@ def complete_claim_paths(raw_session_id: str, actor: str, paths: list[Path]) -> 
         return int(cursor.rowcount)
 
 
+def _normalize_closeout_item(item: dict[str, Any], default_git_commit: str) -> dict[str, Any]:
+    intent_id = str(item.get("intent_id", "")).strip()
+    fencing_token = item.get("fencing_token")
+    if not intent_id:
+        raise write_intent.IntentError("INTENT_NOT_FOUND", "closeout item requires intent_id")
+    if not isinstance(fencing_token, int) or isinstance(fencing_token, bool) or fencing_token <= 0:
+        raise write_intent.IntentError("LEASE_FENCED", "a positive fencing token is required")
+    supplied_sha256 = str(item.get("file_sha256", "")).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", supplied_sha256) is None:
+        raise write_intent.IntentError("FILE_SHA256_INVALID", "file_sha256 must be a lowercase SHA-256")
+    canonical = write_intent.canonical_target(str(item.get("target", "")))
+    target_path = canonical.path.resolve()
+    if canonical.rel_path != str(item.get("rel_path", "")):
+        raise write_intent.IntentError("CLAIM_PATH_MISMATCH", "rel_path does not match the canonical target")
+    requested_commit = str(item.get("git_commit", "") or default_git_commit).strip()
+    if not requested_commit:
+        raise write_intent.IntentError("GIT_COMMIT_INVALID", "closeout item requires git_commit")
+    return {
+        "intent_id": intent_id,
+        "fencing_token": fencing_token,
+        "canonical": canonical,
+        "target_path": target_path,
+        "file_sha256": supplied_sha256,
+        "git_commit": requested_commit,
+        "detail_code": str(item.get("detail_code", "")),
+        "reason_code": str(item.get("reason_code", "WRITE_COMPLETED")),
+    }
+
+
+def finalize_closeout_batch(
+    items: list[dict[str, Any]],
+    *,
+    actor: str,
+    raw_session_id: str,
+    git_commit: str = "",
+) -> dict[str, Any]:
+    """Finalize every item in one all-or-nothing state transaction."""
+
+    hashed = session_hash(raw_session_id)
+    if not hashed:
+        raise write_intent.IntentError("SESSION_REQUIRED", "session id is required")
+    if not items or len(items) > 100:
+        raise write_intent.IntentError("CLOSEOUT_BATCH_INVALID", "closeout batch must contain 1 to 100 items")
+    normalized = [_normalize_closeout_item(item, git_commit) for item in items]
+    intent_ids = [str(item["intent_id"]) for item in normalized]
+    target_keys = [str(item["canonical"].target_key) for item in normalized]
+    if len(intent_ids) != len(set(intent_ids)) or len(target_keys) != len(set(target_keys)):
+        raise write_intent.IntentError("CLOSEOUT_BATCH_DUPLICATE", "closeout batch contains duplicate intents or targets")
+
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        prepared: list[dict[str, Any]] = []
+        try:
+            # Phase 1: verify every item and every audit-chain endpoint before
+            # the first receipt, observation, or claim is mutated.
+            for item in normalized:
+                intent_id = str(item["intent_id"])
+                fencing_token = int(item["fencing_token"])
+                canonical = item["canonical"]
+                target_path = item["target_path"]
+                supplied_sha256 = str(item["file_sha256"])
+                if not target_path.is_file() or _observed_file_sha256(target_path) != supplied_sha256:
+                    raise write_intent.IntentError(
+                        "OBSERVATION_CONTENT_CHANGED",
+                        "target bytes changed before batch closeout",
+                    )
+                intent_row = conn.execute(
+                    "SELECT * FROM memory_write_intents WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+                if intent_row is None:
+                    raise write_intent.IntentError("INTENT_NOT_FOUND", f"write intent not found: {intent_id}")
+                if str(intent_row["actor"]) != actor or str(intent_row["session_hash"]) != hashed:
+                    raise write_intent.IntentError(
+                        "INTENT_SESSION_MISMATCH",
+                        "intent belongs to a different actor or session",
+                    )
+                if (
+                    str(intent_row["target_key"]) != canonical.target_key
+                    or int(intent_row["fencing_token"] or 0) != fencing_token
+                ):
+                    raise write_intent.IntentError("LEASE_FENCED", "intent target fence does not match closeout")
+                resolved_commit = write_intent._resolve_git_commit(str(item["git_commit"]))
+                blob = write_intent._git_blob(
+                    resolved_commit,
+                    write_intent._repo_rel_path(canonical),
+                )
+                committed_digest = (
+                    write_intent.content_hashes(blob, max_bytes=write_intent.MAX_TARGET_BYTES)
+                    if blob is not None
+                    else None
+                )
+                if (
+                    committed_digest is None
+                    or supplied_sha256 != str(intent_row["final_raw_sha256"])
+                    or committed_digest.raw_sha256 != str(intent_row["final_raw_sha256"])
+                    or committed_digest.canonical_sha256 != str(intent_row["final_canonical_sha256"])
+                ):
+                    raise write_intent.IntentError(
+                        "COMMIT_BLOB_MISMATCH",
+                        "committed target blob does not match validated final content",
+                    )
+
+                existing_receipt = conn.execute(
+                    "SELECT * FROM memory_write_receipts WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+                if existing_receipt is not None:
+                    observation = conn.execute(
+                        "SELECT sha256, actor, session_hash, intent_id, fencing_token, git_commit "
+                        "FROM memory_file_observations WHERE path=?",
+                        (str(target_path),),
+                    ).fetchone()
+                    completed_claim = conn.execute(
+                        "SELECT status FROM memory_session_claims "
+                        "WHERE session_hash=? AND actor=? AND path=? AND intent_id=? "
+                        "AND target_key=? AND fencing_token=?",
+                        (hashed, actor, str(target_path), intent_id, canonical.target_key, fencing_token),
+                    ).fetchone()
+                    if not (
+                        str(existing_receipt["outcome"]) == "completed"
+                        and int(existing_receipt["fencing_token"] or 0) == fencing_token
+                        and str(existing_receipt["git_commit"]) == resolved_commit
+                        and observation is not None
+                        and str(observation["sha256"]) == supplied_sha256
+                        and str(observation["actor"]) == actor
+                        and str(observation["session_hash"]) == hashed
+                        and str(observation["intent_id"]) == intent_id
+                        and int(observation["fencing_token"] or 0) == fencing_token
+                        and str(observation["git_commit"]) == resolved_commit
+                        and completed_claim is not None
+                        and str(completed_claim["status"]) == "completed"
+                    ):
+                        raise write_intent.IntentError(
+                            "CLOSEOUT_TERMINAL_MISMATCH",
+                            "terminal closeout state does not match the requested audit chain",
+                        )
+                else:
+                    write_intent.assert_current_lease(
+                        intent_id,
+                        actor=actor,
+                        raw_session_id=raw_session_id,
+                        fencing_token=fencing_token,
+                        target=target_path,
+                        require_unexpired=True,
+                        connection=conn,
+                    )
+                    if str(intent_row["status"]) != "validated":
+                        raise write_intent.IntentError(
+                            "INTENT_NOT_VALIDATED",
+                            "a successful receipt requires a validated intent",
+                        )
+                    claim = conn.execute(
+                        "SELECT status, intent_id, target_key, fencing_token FROM memory_session_claims "
+                        "WHERE session_hash=? AND actor=? AND path=?",
+                        (hashed, actor, str(target_path)),
+                    ).fetchone()
+                    if claim is None or str(claim["status"]) != "active":
+                        raise write_intent.IntentError("CLAIM_NOT_ACTIVE", "closeout requires the exact active claim")
+                    if (
+                        str(claim["intent_id"]) != intent_id
+                        or str(claim["target_key"]) != canonical.target_key
+                        or int(claim["fencing_token"] or 0) != fencing_token
+                    ):
+                        raise write_intent.IntentError(
+                            "CLAIM_BINDING_MISMATCH",
+                            "active claim does not project the current intent lease",
+                        )
+                prepared.append({**item, "existing_receipt": existing_receipt, "resolved_commit": resolved_commit})
+
+            # Re-read all bytes after full validation and immediately before the
+            # first state mutation, so no earlier item can hide a later drift.
+            for item in prepared:
+                target_path = item["target_path"]
+                if not target_path.is_file() or _observed_file_sha256(target_path) != str(item["file_sha256"]):
+                    raise write_intent.IntentError(
+                        "OBSERVATION_CONTENT_CHANGED",
+                        "target bytes changed during batch validation",
+                    )
+
+            results: list[dict[str, Any]] = []
+            observed = 0
+            completed = 0
+            resolved_incidents = 0
+            now = utc_now()
+            for item in prepared:
+                canonical = item["canonical"]
+                target_path = item["target_path"]
+                intent_id = str(item["intent_id"])
+                fencing_token = int(item["fencing_token"])
+                existing_receipt = item["existing_receipt"]
+                if existing_receipt is not None:
+                    receipt = {key: existing_receipt[key] for key in existing_receipt.keys()}
+                    receipt["idempotent"] = True
+                    receipt["requested_outcome_mismatch"] = False
+                    results.append({
+                        "receipt": receipt,
+                        "observed": 0,
+                        "completed": 0,
+                        "idempotent": True,
+                        "fencing_token": fencing_token,
+                        "target_key": canonical.target_key,
+                    })
+                    continue
+                receipt = write_intent.finalize_receipt(
+                    intent_id,
+                    actor=actor,
+                    raw_session_id=raw_session_id,
+                    outcome="completed",
+                    reason_code=str(item["reason_code"]),
+                    git_commit=str(item["resolved_commit"]),
+                    detail_code=str(item["detail_code"]),
+                    fencing_token=fencing_token,
+                    connection=conn,
+                    commit=False,
+                )
+                observation_cursor = conn.execute(
+                    """
+                    INSERT INTO memory_file_observations (
+                      path, rel_path, sha256, actor, session_hash,
+                      intent_id, fencing_token, git_commit, observed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(path) DO UPDATE SET
+                      rel_path=excluded.rel_path, sha256=excluded.sha256,
+                      actor=excluded.actor, session_hash=excluded.session_hash,
+                      intent_id=excluded.intent_id, fencing_token=excluded.fencing_token,
+                      git_commit=excluded.git_commit, observed_at=excluded.observed_at
+                    WHERE memory_file_observations.fencing_token <= excluded.fencing_token
+                    """,
+                    (
+                        str(target_path), canonical.rel_path, str(item["file_sha256"]), actor,
+                        hashed, intent_id, fencing_token, str(receipt["git_commit"]), now,
+                    ),
+                )
+                if observation_cursor.rowcount != 1:
+                    raise write_intent.IntentError(
+                        "OBSERVATION_FENCED",
+                        "a newer path fence already owns the file observation",
+                    )
+                claim_cursor = conn.execute(
+                    "UPDATE memory_session_claims SET status='completed', completed_at=?, updated_at=? "
+                    "WHERE session_hash=? AND actor=? AND path=? AND status='active' "
+                    "AND intent_id=? AND target_key=? AND fencing_token=?",
+                    (
+                        now, now, hashed, actor, str(target_path), intent_id,
+                        canonical.target_key, fencing_token,
+                    ),
+                )
+                if claim_cursor.rowcount != 1:
+                    raise write_intent.IntentError(
+                        "CLAIM_STATE_CHANGED",
+                        "claim changed while closeout was being finalized",
+                    )
+                # An unresolved post-finalize drift can only be cleared by a
+                # newer, exact ADOPT of the same canonical target. Phase 1 has
+                # already proven that current raw bytes, validated final raw,
+                # and the committed Git blob are identical. Keep resolution in
+                # this same transaction as the new receipt/observation/claim;
+                # there is intentionally no naked manual-resolve API.
+                intent_row = conn.execute(
+                    "SELECT reconcile_action FROM memory_write_intents WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+                item_resolved = 0
+                if intent_row is not None and str(intent_row["reconcile_action"]).upper() == "ADOPT":
+                    resolution_cursor = conn.execute(
+                        "UPDATE memory_closeout_incidents SET resolved_at=?, "
+                        "resolution_intent_id=?, resolution_git_commit=? "
+                        "WHERE target_key=? AND resolved_at IS NULL",
+                        (
+                            now,
+                            intent_id,
+                            str(receipt["git_commit"]),
+                            canonical.target_key,
+                        ),
+                    )
+                    item_resolved = int(resolution_cursor.rowcount)
+                    resolved_incidents += item_resolved
+                observed += 1
+                completed += 1
+                results.append({
+                    "receipt": receipt,
+                    "observed": 1,
+                    "completed": 1,
+                    "idempotent": False,
+                    "fencing_token": fencing_token,
+                    "target_key": canonical.target_key,
+                    "resolved_incidents": item_resolved,
+                })
+            conn.commit()
+            incidents: list[dict[str, str]] = []
+            # The receipt is immutable once committed. A same-user filesystem
+            # writer can still race immediately after that commit, so detect and
+            # durably record the post-commit drift for Doctor/Stop to fail closed.
+            for item in prepared:
+                target_path = item["target_path"]
+                expected_sha256 = str(item["file_sha256"])
+                observed_sha256 = ""
+                if target_path.is_file():
+                    try:
+                        observed_sha256 = _observed_file_sha256(target_path)
+                    except OSError:
+                        observed_sha256 = ""
+                if observed_sha256 == expected_sha256:
+                    continue
+                incident_id = hashlib.sha256(
+                    f"closeout-drift:{item['intent_id']}:{expected_sha256}".encode("utf-8")
+                ).hexdigest()[:32]
+                incident = {
+                    "incident_id": incident_id,
+                    "intent_id": str(item["intent_id"]),
+                    "target_key": str(item["canonical"].target_key),
+                    "rel_path": str(item["canonical"].rel_path),
+                    "expected_sha256": expected_sha256,
+                    "observed_sha256": observed_sha256,
+                    "git_commit": str(item["resolved_commit"]),
+                    "reason_code": "POST_FINALIZE_CONTENT_DRIFT",
+                    "detected_at": utc_now(),
+                }
+                with connect() as incident_conn:
+                    incident_conn.execute(
+                        "INSERT OR IGNORE INTO memory_closeout_incidents ("
+                        "incident_id, intent_id, target_key, rel_path, expected_sha256, "
+                        "observed_sha256, git_commit, reason_code, detected_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        tuple(incident[key] for key in (
+                            "incident_id", "intent_id", "target_key", "rel_path",
+                            "expected_sha256", "observed_sha256", "git_commit",
+                            "reason_code", "detected_at",
+                        )),
+                    )
+                    incident_conn.commit()
+                incidents.append(incident)
+            return {
+                "items": results,
+                "receipts": [item["receipt"] for item in results],
+                "observed": observed,
+                "completed": completed,
+                "count": len(results),
+                "idempotent": all(bool(item["idempotent"]) for item in results),
+                "incidents": incidents,
+                "resolved_incidents": resolved_incidents,
+                "ok": not incidents,
+            }
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+
+
+def finalize_closeout_transaction(
+    *,
+    intent_id: str,
+    actor: str,
+    raw_session_id: str,
+    fencing_token: int,
+    target: str | Path,
+    git_commit: str,
+    file_sha256: str,
+    rel_path: str,
+    detail_code: str = "",
+    reason_code: str = "WRITE_COMPLETED",
+) -> dict[str, Any]:
+    """Backward-compatible one-item wrapper over the atomic batch API."""
+
+    payload = finalize_closeout_batch(
+        [{
+            "intent_id": intent_id,
+            "fencing_token": fencing_token,
+            "target": str(target),
+            "git_commit": git_commit,
+            "file_sha256": file_sha256,
+            "rel_path": rel_path,
+            "detail_code": detail_code,
+            "reason_code": reason_code,
+        }],
+        actor=actor,
+        raw_session_id=raw_session_id,
+    )
+    return dict(payload["items"][0])
+
+
+def _enrich_claim_lease_rows(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    current = dt.datetime.now(dt.timezone.utc)
+    enriched: list[dict[str, Any]] = []
+    with connect(read_only=True) as conn:
+        for row in rows:
+            payload: dict[str, Any] = dict(row)
+            intent_id = str(row.get("intent_id", ""))
+            if not intent_id:
+                payload["lease_state"] = "legacy"
+                payload["blocks_stop"] = True
+                enriched.append(payload)
+                continue
+            bound = conn.execute(
+                "SELECT actor, session_hash, target_key, fencing_token, status, expires_at "
+                "FROM memory_write_intents WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+            if bound is None:
+                payload["lease_state"] = "intent_missing"
+                payload["blocks_stop"] = True
+                enriched.append(payload)
+                continue
+            status = str(bound["status"])
+            payload["intent_status"] = status
+            payload["expires_at"] = str(bound["expires_at"])
+            if status not in write_intent.ACTIVE_STATUSES:
+                payload["lease_state"] = "intent_terminal"
+            elif (
+                str(bound["actor"]) != str(row["actor"])
+                or str(bound["session_hash"]) != str(row["session_hash"])
+                or str(bound["target_key"]) != str(row.get("target_key", ""))
+                or int(bound["fencing_token"] or 0) != int(row.get("fencing_token") or 0)
+            ):
+                payload["lease_state"] = "claim_binding_mismatch"
+            else:
+                expiry = write_intent.parse_time(str(bound["expires_at"]))
+                if expiry is not None and expiry <= current:
+                    payload["lease_state"] = "lease_expired"
+                else:
+                    latest = conn.execute(
+                        "SELECT last_fence FROM memory_path_fences WHERE target_key=?",
+                        (str(bound["target_key"]),),
+                    ).fetchone()
+                    payload["lease_state"] = (
+                        "live"
+                        if latest is not None
+                        and int(latest[0]) == int(bound["fencing_token"] or 0)
+                        else "lease_fenced"
+                    )
+            payload["blocks_stop"] = payload["lease_state"] != "live"
+            enriched.append(payload)
+    return enriched
+
+
+def active_claim_lease_rows(raw_session_id: str, actor: str = "") -> list[dict[str, Any]]:
+    """Return this session's active claims with read-only intent/fence health."""
+
+    return _enrich_claim_lease_rows(active_claim_rows(raw_session_id, actor, read_only=True))
+
+
+def all_active_claim_lease_rows() -> list[dict[str, Any]]:
+    """Return all active claims with health derivable without raw session ids."""
+
+    return _enrich_claim_lease_rows(all_active_claim_rows(read_only=True))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Track per-session ownership of shared memory files.")
     parser.add_argument(
         "--actor",
-        choices=("codex", "claude", "human", "migration", "test", "yichen-content-studio"),
+        choices=("codex", "claude", "human", "migration", "test", "ailu"),
         default="codex",
     )
     parser.add_argument("--session-id", default="")
@@ -1354,6 +2117,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def enforce_low_level_cli_policy(actor: str, action: str) -> None:
+    if actor in write_intent.CANONICAL_WRITER_ACTORS and action not in {"list", "list-all"}:
+        raise ValueError(
+            "LOW_LEVEL_GATEWAY_MUTATION_FORBIDDEN: automatic writers must use the high-level write gateway"
+        )
+
+
 def main() -> int:
     args = parse_args()
     raw_session_id = session_value(args.session_id, args.actor)
@@ -1361,10 +2131,12 @@ def main() -> int:
     observation: dict[str, Any] | None = None
     observation_kind = ""
     try:
+        assert_runtime_ready("claim")
+        enforce_low_level_cli_policy(args.actor, args.action)
         if args.action == "claim":
             rows = claim_paths(args.actor, raw_session_id, args.file, args.intent_id)
         elif args.action == "list-all":
-            rows = all_active_claim_rows()
+            rows = all_active_claim_rows(read_only=True)
         elif args.action == "expire-stale":
             rows, applied = expire_stale_claims(args.older_than_hours, args.apply)
         elif args.action == "observe-deletion":
@@ -1416,13 +2188,20 @@ def main() -> int:
         else:
             if not raw_session_id:
                 raise ValueError("session id is required; pass --session-id or use a supported host session environment")
-            rows = active_claim_rows(raw_session_id, args.actor)
+            rows = active_claim_rows(raw_session_id, args.actor, read_only=True)
     except (ValueError, OSError, sqlite3.Error) as exc:
-        payload: dict[str, Any] = {"ok": False, "error": str(exc), "action": args.action}
+        reason_code = getattr(exc, "reason_code", "CLAIM_ERROR")
+        payload: dict[str, Any] = {
+            "ok": False,
+            "reason_code": reason_code,
+            "error": str(exc),
+            "action": args.action,
+            "degraded": reason_code == write_intent.STATE_SCHEMA_REASON_CODE,
+        }
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
-            print(f"claim_error={exc}")
+            print(f"claim_error={reason_code} {exc}")
         return 2
     payload = {
         "ok": True,

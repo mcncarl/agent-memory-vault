@@ -16,41 +16,87 @@ user_id = "demo-user"
 agent_id = "shared"
 app_id = "agent-memory"
 
+[host]
+audit_launchagent_label = "com.agent-memory-vault.audit"
+audit_launchagent = "~/Library/LaunchAgents/com.agent-memory-vault.audit.plist"
+
 [closeout]
 ordinary_memory_candidate_pool = false
 ask_before_skill_promotion = true
 run_sqlite_index_after_closeout = true
-run_audit_after_interval_days = 7
 commit_scoped_memory_files = true
 
-[write_intents]
-# Disabled by default for upgrades. Start with a few exact high-impact paths;
-# do not protect the entire vault or use broad wildcards as a first rollout.
-enabled = false
-enforcement = "off" # off | advisory | enforce
+[observability]
+# Phase-one measurement is additive and non-blocking. It stores only controlled
+# labels, counters, and one-way task/memory references; no prompt or excerpt.
+enabled = true
+stale_adoption_enforcement = "shadow" # shadow | enforce
+metadata_enforcement = "shadow" # shadow | enforce
+shadow_min_days = 7
+
+[shadow]
+# Private, unique attestation files bind the observation window to the exact
+# installed Runtime manifest. These cutover fields remain empty until the
+# migration-only seven-day gate performs its single atomic config transition.
+state_dir = "~/.config/agent-memory/shadow"
+status = "observing"
+shadow_started_at = ""
+runtime_installed_at = ""
+manifest_sha256 = ""
+cutover_evidence_sha256 = ""
+cutover_evidence_file = ""
+cutover_from_config_sha256 = ""
+cutover_config_backup = ""
+cutover_at = ""
+
+[write_gateway]
+# Safe default for a fresh v2 installation: every automatic Markdown write is
+# mediated by a current path fence and an active intent. Upgrades must pass the
+# explicit plan/apply/verify migration before ordinary commands become ready.
+mode = "enforce" # off | advisory | enforce
+writer_protocol_version = 2
+state_schema_required = 4
+canonical_actors = ["codex", "claude", "ailu"]
+path_fencing = true
+claims_are_projection = true
+full_vault = true
 ttl_hours = 24
 max_proposal_bytes = 2097152
 max_target_bytes = 8388608
 max_snapshot_bytes = 262144
-protected_paths = [
-  "AGENTS.md",
-  "用户记忆/偏好与边界.md",
-  "工作流/Agent记忆收尾决策规则.md",
-  "工作流/Agent记忆字段规范.md",
-]
+
+# Migration compatibility only. Runtime code reads [write_gateway] first.
+[write_intents]
+enabled = false
+enforcement = "off"
+protected_paths = []
 
 [semantic_retrieval]
 enabled = false
+semantic_mode = "auto" # auto | off | required
+ranking_version = "hybrid-v2-shadow" # hybrid-v1 | hybrid-v2-shadow | hybrid-v2
 vector_dir = "~/.config/agent-memory/zvec/memory_chunks_embeddinggemma_768"
 embedding_model = "google/embeddinggemma-300m"
 embedding_dim = 768
 embedding_device = "cpu"
 python = "python3"
 lock_path = "~/.config/agent-memory/locks/zvec.lock"
+zvec_lock_timeout_seconds = 2
+zvec_max_distance = 0.72
 require_local_model = false
-model_revision = ""
+# Exact EmbeddingGemma snapshot commit; replace only together with a freshly
+# verified private model manifest for the new revision.
+model_revision = "57c266a740f537b4dc058e1b0cda161fd15afa75"
 model_manifest = "~/.config/agent-memory/models/embeddinggemma-300m/model-manifest.json"
 dependency_lock = "~/.config/agent-memory/requirements-vector.lock"
+candidate_pool_min = 64
+candidate_pool_factor = 16
+candidate_pool_scope_min = 128
+candidate_pool_max = 512
+embedding_worker_socket = "~/.config/agent-memory/run/embedding.sock"
+embedding_worker_idle_seconds = 600
+embedding_worker_cold_timeout_seconds = 12
+embedding_worker_warm_timeout_seconds = 2
 run_vector_index_after_closeout = false
 
 [privacy]

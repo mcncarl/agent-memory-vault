@@ -25,6 +25,7 @@ from agent_memory_state import (
     secure_sqlite_connect,
     sqlite_permission_report,
 )
+from tests.state_fixture import initialize_full_state
 
 
 def mode(path: Path) -> int:
@@ -112,6 +113,7 @@ class StatePermissionTests(unittest.TestCase):
                     "AGENT_MEMORY_STATE_DB": str(state_db),
                 }
             )
+            initialize_full_state(state_db)
             indexed = subprocess.run(
                 [sys.executable, str(SCRIPTS / "agent_memory_index.py"), "--init", "--scan"],
                 cwd=REPO_ROOT,

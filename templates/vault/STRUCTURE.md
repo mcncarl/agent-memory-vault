@@ -9,6 +9,7 @@ agent_scope: shared
 session_id: ""
 status: active
 sensitivity: normal
+temporal_policy: structural
 verified_at: 2026-06-20
 keywords:
   - structure

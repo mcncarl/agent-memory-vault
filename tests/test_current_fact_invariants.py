@@ -13,12 +13,16 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "scripts"
 TEMPLATE = REPO_ROOT / "templates" / "vault"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from state_fixture import initialize_full_state
 
 
 class CurrentFactInvariantTest(unittest.TestCase):
     def test_audit_detects_and_clears_current_summary_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
-            tmp = Path(raw_tmp)
+            tmp = Path(raw_tmp).resolve()
             vault = tmp / "vault"
             runtime = tmp / "runtime"
             shutil.copytree(TEMPLATE, vault)
@@ -51,6 +55,7 @@ class CurrentFactInvariantTest(unittest.TestCase):
                 "\n".join(
                     [
                         f"memory_root = {json.dumps(str(vault), ensure_ascii=False)}",
+                        f"git_root = {json.dumps(str(vault), ensure_ascii=False)}",
                         f"config_root = {json.dumps(str(runtime), ensure_ascii=False)}",
                         f"state_db = {json.dumps(str(runtime / 'state.sqlite'), ensure_ascii=False)}",
                         f"audit_db = {json.dumps(str(runtime / 'audit.sqlite'), ensure_ascii=False)}",
@@ -60,8 +65,27 @@ class CurrentFactInvariantTest(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            initialize_full_state(runtime / "state.sqlite")
             env = os.environ.copy()
             env["AGENT_MEMORY_CONFIG_FILE"] = str(config)
+            audit_init = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "agent_memory_migrate.py"),
+                    "audit-init",
+                    "--json",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                audit_init.returncode,
+                0,
+                audit_init.stderr + audit_init.stdout,
+            )
             target = vault / "项目" / "current-facts.md"
             target.write_text(
                 """---
@@ -90,7 +114,7 @@ verified_at: 2026-07-11
                     capture_output=True,
                     check=False,
                 )
-                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 
             def audit_kinds() -> set[str]:
                 result = subprocess.run(
@@ -101,7 +125,7 @@ verified_at: 2026-07-11
                     capture_output=True,
                     check=False,
                 )
-                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
                 payload = json.loads(result.stdout)
                 return {
                     item["kind"]

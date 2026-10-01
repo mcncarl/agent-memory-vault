@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import agent_memory_closeout as closeout
+from tests.state_fixture import initialize_full_state
 
 
 def prewrite_args(text: str, *, create_intent: bool = False) -> Namespace:
@@ -65,9 +66,112 @@ class ReconcileHealthTests(unittest.TestCase):
         self.assertEqual(warnings, [warning])
         self.assertEqual(backend_status["sqlite"]["status"], "error")
 
+    def test_hybrid_lane_status_requires_the_lexical_lanes_behind_the_ranking(self) -> None:
+        def search_result(payload: dict[str, object], *, ok: bool = True) -> dict[str, object]:
+            return {
+                "ok": ok,
+                "returncode": 0 if ok else 2,
+                "stdout": json.dumps(payload),
+                "stderr": "",
+            }
+
+        lanes = {
+            "legacy_sqlite": "ok",
+            "unicode_fts": "disabled",
+            "trigram_fts": "disabled",
+            "zvec": "disabled",
+            "rg": "disabled",
+        }
+        cases = (
+            ("checkpoint healthy", {"ranking_version": "hybrid-v1", "backend_status": lanes}, True, "ok"),
+            (
+                "checkpoint lane failed",
+                {"ranking_version": "hybrid-v1", "backend_status": {**lanes, "legacy_sqlite": "failed"}},
+                True,
+                "error",
+            ),
+            (
+                "hybrid semantic lane is advisory",
+                {
+                    "ranking_version": "hybrid-v2",
+                    "backend_status": {
+                        **lanes,
+                        "legacy_sqlite": "disabled",
+                        "unicode_fts": "ok",
+                        "trigram_fts": "ok",
+                        "zvec": "failed",
+                    },
+                },
+                True,
+                "ok",
+            ),
+            (
+                "hybrid lexical lane failed",
+                {
+                    "ranking_version": "hybrid-v2",
+                    "backend_status": {
+                        **lanes,
+                        "legacy_sqlite": "disabled",
+                        "unicode_fts": "ok",
+                        "trigram_fts": "failed",
+                    },
+                },
+                True,
+                "error",
+            ),
+            (
+                "contract failure payload",
+                {"ok": False, "ranking_version": "hybrid-v1", "backend_status": lanes},
+                False,
+                "error",
+            ),
+        )
+        for name, payload, process_ok, expected in cases:
+            with self.subTest(name):
+                with mock.patch.object(
+                    closeout,
+                    "run_command",
+                    return_value=search_result({"results": [], "warnings": [], **payload}, ok=process_ok),
+                ):
+                    _rows, warnings, backend_status = closeout.search_memory("ordinary query")
+                self.assertEqual(backend_status["sqlite"]["status"], expected)
+                if not process_ok:
+                    self.assertTrue(warnings)
+
+    def test_ailu_candidate_lane_reports_lexical_health(self) -> None:
+        import agent_memory_retrieve as memory_retrieve
+
+        for lane_status, expected in (("ok", "ok"), ("failed", "error")):
+            with self.subTest(lane_status=lane_status):
+                namespace = Namespace(
+                    _backend_status={"legacy_sqlite": lane_status, "zvec": "disabled"},
+                    _effective_ranking_version="hybrid-v1",
+                )
+                with (
+                    mock.patch.object(
+                        memory_retrieve,
+                        "validate_ailu_scope_request",
+                        return_value=("ailu", "example-project"),
+                    ),
+                    mock.patch.object(
+                        memory_retrieve,
+                        "_run_candidate_search",
+                        return_value=([], [], namespace),
+                    ),
+                ):
+                    rows, _warnings, backend_status = closeout.search_memory(
+                        "ordinary query",
+                        app_id="ailu",
+                        project_id="example-project",
+                        canonical_actor="ailu",
+                    )
+                self.assertEqual(rows, [])
+                self.assertEqual(backend_status["sqlite"]["status"], expected)
+
     def test_unhealthy_sqlite_blocks_prewrite_and_intent_creation(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             state_db = Path(raw_tmp) / "state.sqlite"
+            initialize_full_state(state_db)
             with (
                 mock.patch.object(closeout, "STATE_DB", state_db),
                 mock.patch.object(
@@ -107,6 +211,7 @@ class ReconcileHealthTests(unittest.TestCase):
         text = "Cross-platform image workflow keeps verified output records. " * 600
         with tempfile.TemporaryDirectory() as raw_tmp:
             state_db = Path(raw_tmp) / "state.sqlite"
+            initialize_full_state(state_db)
             with (
                 mock.patch.object(closeout, "STATE_DB", state_db),
                 mock.patch.object(closeout, "search_memory", side_effect=healthy_search),

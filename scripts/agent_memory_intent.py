@@ -8,14 +8,18 @@ diffs; public intent output and immutable receipts never return that text.
 from __future__ import annotations
 
 import argparse
+import base64
+import contextlib
 import datetime as dt
 import difflib
 import fnmatch
 import hashlib
+import hmac
 import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import unicodedata
 import uuid
@@ -23,19 +27,43 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from agent_memory_env import env_value, expand_path, load_config
+from agent_memory_env import assert_runtime_ready, env_value, expand_path, load_config
 import agent_memory_safety as memory_safety
-from agent_memory_state import StateSecurityError, secure_sqlite_connect
+from agent_memory_state import (
+    STATE_SCHEMA_VERSION,
+    StateSecurityError,
+    ensure_observability_v2_schema,
+    search_log_privacy_guard_report,
+    secure_sqlite_connect,
+    side_effect_free_sqlite_fingerprint,
+)
 
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 VAULT_ROOT = expand_path(env_value("ROOT", str(RUNTIME_ROOT / "templates" / "vault")))
 GIT_ROOT = expand_path(env_value("GIT_ROOT", str(VAULT_ROOT)))
 STATE_DB = expand_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+WRITER_PROTOCOL_VERSION = 2
+STATE_SCHEMA_REASON_CODE = "STATE_SCHEMA_MIGRATION_REQUIRED"
+CANONICAL_WRITER_ACTORS = ("codex", "claude", "ailu")
+SUPPORTED_LEDGER_ACTORS = (*CANONICAL_WRITER_ACTORS, "human", "migration", "test")
+HUMAN_CONFIRMATION_CAPABILITY_APPROVER = "human_confirmation_capability_v1"
+SENSITIVE_CONFIRMATION_ACTIONS = {"ADOPT", "MIGRATE_LEGACY_SCOPE"}
+SENSITIVE_CONFIRMATION_OPERATIONS = {"status_transition", "governance_migration"}
 
 
 def _configured_write_intents() -> dict[str, Any]:
-    payload = load_config().get("write_intents", {})
+    config = load_config()
+    gateway = config.get("write_gateway", {})
+    if isinstance(gateway, dict) and gateway:
+        legacy = config.get("write_intents", {})
+        merged = dict(legacy) if isinstance(legacy, dict) else {}
+        mode = str(gateway.get("mode", "enforce")).strip().lower()
+        merged.update(gateway)
+        merged["enabled"] = mode != "off"
+        merged["enforcement"] = mode
+        return merged
+    payload = config.get("write_intents", {})
     return payload if isinstance(payload, dict) else {}
 
 
@@ -46,6 +74,7 @@ if isinstance(_configured_paths, str):
 elif not isinstance(_configured_paths, (list, tuple)):
     _configured_paths = ()
 
+FULL_VAULT_GATEWAY = bool(_WRITE_INTENT_CONFIG.get("full_vault", False))
 PROTECTED_PATHS: tuple[str, ...] = tuple(str(item) for item in _configured_paths if str(item).strip())
 INTENTS_ENABLED = bool(_WRITE_INTENT_CONFIG.get("enabled", False))
 _configured_enforcement = str(_WRITE_INTENT_CONFIG.get("enforcement", "off")).strip().lower()
@@ -54,6 +83,15 @@ MAX_PROPOSAL_BYTES = int(_WRITE_INTENT_CONFIG.get("max_proposal_bytes", 2 * 1024
 MAX_TARGET_BYTES = int(_WRITE_INTENT_CONFIG.get("max_target_bytes", 8 * 1024 * 1024))
 MAX_SNAPSHOT_BYTES = int(_WRITE_INTENT_CONFIG.get("max_snapshot_bytes", 256 * 1024))
 DEFAULT_TTL_HOURS = float(_WRITE_INTENT_CONFIG.get("ttl_hours", 24))
+EXPIRED_VALIDATED_RECOVERY_REASON = "EXPIRED_VALIDATED_RECOVERY_PENDING"
+EXPIRED_VALIDATED_RECOVERY_COMPLETED_REASON = (
+    "EXPIRED_VALIDATED_RECOVERY_COMPLETED"
+)
+EXPIRED_VALIDATED_RECOVERY_TTL_SECONDS = 10 * 60
+EXPIRED_VALIDATED_RECOVERY_REPAIR_REASON = (
+    "EXPIRED_VALIDATED_RECOVERY_REPAIR_PENDING"
+)
+EXPIRED_VALIDATED_RECOVERY_REPAIR_TTL_SECONDS = 5 * 60
 MAX_DIFF_LINES = 120
 MAX_DIFF_CHARS = 16 * 1024
 
@@ -341,21 +379,151 @@ def _bounded_mismatch(
     return result
 
 
-def connect(state_db: Path | None = None, *, read_only: bool = False) -> sqlite3.Connection:
+def assert_schema_ready(conn: sqlite3.Connection) -> None:
+    """Verify the installed state schema without creating or altering it."""
+
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    required_tables = {
+        "meta",
+        "memory_write_intents",
+        "memory_write_receipts",
+        "memory_path_fences",
+        "memory_session_claims",
+        "memory_file_observations",
+        "memory_safety_log",
+        "memory_closeout_incidents",
+        "generated_index_closeout_transactions",
+    }
+    intent_columns = (
+        {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_write_intents)")}
+        if "memory_write_intents" in tables
+        else set()
+    )
+    receipt_columns = (
+        {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_write_receipts)")}
+        if "memory_write_receipts" in tables
+        else set()
+    )
+    state_version = None
+    writer_version = None
+    if "meta" in tables:
+        try:
+            state_version = conn.execute(
+                "SELECT value FROM meta WHERE key='agent_memory_state_schema_version'"
+            ).fetchone()
+            writer_version = conn.execute(
+                "SELECT value FROM meta WHERE key='agent_memory_writer_protocol_version'"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise IntentError(
+                STATE_SCHEMA_REASON_CODE,
+                "installed state schema is malformed; run the installer migration",
+            ) from exc
+    # Build the expected projection in an isolated in-memory database.  This
+    # keeps the contract tied to the installer DDL without ever applying that
+    # DDL to the caller's state database.  Comparing column sets (rather than
+    # CREATE TABLE text) remains compatible with additive migrations whose
+    # physical column order differs from a fresh install.
+    with contextlib.closing(sqlite3.connect(":memory:")) as expected:
+        ensure_schema(expected)
+        required_intent_columns = {
+            str(row[1]) for row in expected.execute("PRAGMA table_info(memory_write_intents)")
+        }
+        required_receipt_columns = {
+            str(row[1]) for row in expected.execute("PRAGMA table_info(memory_write_receipts)")
+        }
+        expected_auxiliary_columns = {
+            table: {str(row[1]) for row in expected.execute(f"PRAGMA table_info({table})")}
+            for table in required_tables - {"meta", "memory_write_intents", "memory_write_receipts"}
+        }
+        required_indexes = {
+            str(row[0])
+            for row in expected.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
+            )
+        }
+    actual_auxiliary_columns = {
+        table: (
+            {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+            if table in tables
+            else set()
+        )
+        for table in expected_auxiliary_columns
+    }
+    actual_indexes = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
+        )
+    }
+    privacy_guards_ready = False
+    try:
+        privacy_guards_ready = bool(search_log_privacy_guard_report(conn).get("ready"))
+    except sqlite3.Error:
+        privacy_guards_ready = False
+    if (
+        not required_tables.issubset(tables)
+        or not required_intent_columns.issubset(intent_columns)
+        or not required_receipt_columns.issubset(receipt_columns)
+        or any(
+            not columns.issubset(actual_auxiliary_columns.get(table, set()))
+            for table, columns in expected_auxiliary_columns.items()
+        )
+        or not required_indexes.issubset(actual_indexes)
+        or not privacy_guards_ready
+        or state_version is None
+        or str(state_version[0]) != str(STATE_SCHEMA_VERSION)
+        or writer_version is None
+        or str(writer_version[0]) != str(WRITER_PROTOCOL_VERSION)
+    ):
+        raise IntentError(
+            STATE_SCHEMA_REASON_CODE,
+            "installed state schema is missing or outdated; run the installer migration",
+        )
+
+
+def connect(
+    state_db: Path | None = None,
+    *,
+    read_only: bool = False,
+    side_effect_free: bool = False,
+) -> sqlite3.Connection:
+    if not read_only:
+        assert_runtime_ready("state-write")
     db_path = Path(state_db or STATE_DB).expanduser()
+    if not db_path.exists():
+        raise IntentError(
+            STATE_SCHEMA_REASON_CODE,
+            "installed state database is missing; run the installer migration",
+        )
     try:
         conn = secure_sqlite_connect(
             db_path,
             timeout=10,
-            create=not read_only,
+            create=False,
             read_only=read_only,
+            side_effect_free=side_effect_free,
             row_factory=sqlite3.Row,
             pragmas=("PRAGMA busy_timeout=10000", "PRAGMA foreign_keys=ON"),
         )
     except StateSecurityError as exc:
+        if not db_path.exists():
+            raise IntentError(
+                STATE_SCHEMA_REASON_CODE,
+                "installed state database is missing; run the installer migration",
+            ) from exc
         raise IntentError("STATE_DB_PERMISSION_FAILED", "cannot restrict the intent state database to mode 0600") from exc
-    if not read_only:
-        ensure_schema(conn)
+    try:
+        # Ordinary reads and writes are verify-only.  The explicit installer
+        # migrator calls ensure_schema() after an online backup; no production
+        # command may silently CREATE/ALTER a partially damaged v4 database.
+        assert_schema_ready(conn)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -365,16 +533,28 @@ def _ensure_column(conn: sqlite3.Connection, table: str, name: str, declaration:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone() is not None
+
+
+def ensure_schema(conn: sqlite3.Connection, *, commit: bool = True) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS memory_write_intents (
           intent_id TEXT PRIMARY KEY,
-          schema_version INTEGER NOT NULL DEFAULT 2,
+          schema_version INTEGER NOT NULL DEFAULT 4,
+          writer_protocol_version INTEGER NOT NULL DEFAULT 2,
           actor TEXT NOT NULL,
           session_hash TEXT NOT NULL,
           target_rel_path TEXT NOT NULL,
           target_key TEXT NOT NULL,
+          fencing_token INTEGER NOT NULL DEFAULT 0,
           base_exists INTEGER NOT NULL,
           base_raw_sha256 TEXT NOT NULL,
           base_canonical_sha256 TEXT NOT NULL,
@@ -400,6 +580,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           safety_input_sha256 TEXT NOT NULL DEFAULT '',
           safety_input_length INTEGER NOT NULL DEFAULT 0,
           reconcile_action TEXT NOT NULL DEFAULT '',
+          operation TEXT NOT NULL DEFAULT 'content_update',
+          target_status TEXT NOT NULL DEFAULT '',
+          transition_reason_sha256 TEXT NOT NULL DEFAULT '',
           intent_system_enabled INTEGER NOT NULL DEFAULT 0,
           effective_enforcement TEXT NOT NULL DEFAULT 'off',
           approval_required INTEGER NOT NULL DEFAULT 1,
@@ -433,10 +616,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS memory_write_receipts (
           receipt_id TEXT PRIMARY KEY,
           intent_id TEXT NOT NULL UNIQUE,
+          writer_protocol_version INTEGER NOT NULL DEFAULT 2,
           actor TEXT NOT NULL,
           session_hash TEXT NOT NULL,
           target_rel_path TEXT NOT NULL,
           target_key TEXT NOT NULL,
+          fencing_token INTEGER NOT NULL DEFAULT 0,
           outcome TEXT NOT NULL,
           reason_code TEXT NOT NULL,
           validation_mode TEXT NOT NULL DEFAULT '',
@@ -460,6 +645,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           safety_input_sha256 TEXT NOT NULL DEFAULT '',
           safety_input_length INTEGER NOT NULL DEFAULT 0,
           evidence_ref_sha256 TEXT NOT NULL DEFAULT '',
+          operation TEXT NOT NULL DEFAULT 'content_update',
+          target_status TEXT NOT NULL DEFAULT '',
+          transition_reason_sha256 TEXT NOT NULL DEFAULT '',
           detail_code TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL,
           FOREIGN KEY(intent_id) REFERENCES memory_write_intents(intent_id)
@@ -467,6 +655,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         """
     )
     intent_migrations = {
+        "writer_protocol_version": "INTEGER NOT NULL DEFAULT 1",
+        "fencing_token": "INTEGER NOT NULL DEFAULT 0",
         "proposal_canonical_snapshot": "TEXT NOT NULL DEFAULT ''",
         "proposal_snapshot_truncated": "INTEGER NOT NULL DEFAULT 0",
         "proposal_line_count": "INTEGER NOT NULL DEFAULT 0",
@@ -484,10 +674,15 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "read_token": "TEXT NOT NULL DEFAULT ''",
         "scope_app_id": "TEXT NOT NULL DEFAULT ''",
         "scope_project_id": "TEXT NOT NULL DEFAULT ''",
+        "operation": "TEXT NOT NULL DEFAULT 'content_update'",
+        "target_status": "TEXT NOT NULL DEFAULT ''",
+        "transition_reason_sha256": "TEXT NOT NULL DEFAULT ''",
     }
     for name, declaration in intent_migrations.items():
         _ensure_column(conn, "memory_write_intents", name, declaration)
     receipt_migrations = {
+        "writer_protocol_version": "INTEGER NOT NULL DEFAULT 1",
+        "fencing_token": "INTEGER NOT NULL DEFAULT 0",
         "approval_binding_sha256": "TEXT NOT NULL DEFAULT ''",
         "approval_ref_sha256": "TEXT NOT NULL DEFAULT ''",
         "source_class": "TEXT NOT NULL DEFAULT ''",
@@ -498,9 +693,71 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "safety_input_sha256": "TEXT NOT NULL DEFAULT ''",
         "safety_input_length": "INTEGER NOT NULL DEFAULT 0",
         "evidence_ref_sha256": "TEXT NOT NULL DEFAULT ''",
+        "operation": "TEXT NOT NULL DEFAULT 'content_update'",
+        "target_status": "TEXT NOT NULL DEFAULT ''",
+        "transition_reason_sha256": "TEXT NOT NULL DEFAULT ''",
     }
     for name, declaration in receipt_migrations.items():
         _ensure_column(conn, "memory_write_receipts", name, declaration)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_path_fences (
+          target_key TEXT PRIMARY KEY,
+          last_fence INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL,
+          CHECK (last_fence >= 0)
+        )
+        """
+    )
+    # These projections are part of the state-v4 minimum, so a fresh install
+    # can publish schema 4 before the first write or observability event.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_session_claims (
+          session_hash TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          path TEXT NOT NULL,
+          rel_path TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active',
+          claimed_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          completed_at TEXT,
+          intent_id TEXT NOT NULL DEFAULT '',
+          target_key TEXT NOT NULL DEFAULT '',
+          fencing_token INTEGER NOT NULL DEFAULT 0,
+          claim_kind TEXT NOT NULL DEFAULT 'legacy',
+          PRIMARY KEY (session_hash, path)
+        )
+        """
+    )
+    for name, declaration in {
+        "intent_id": "TEXT NOT NULL DEFAULT ''",
+        "target_key": "TEXT NOT NULL DEFAULT ''",
+        "fencing_token": "INTEGER NOT NULL DEFAULT 0",
+        "claim_kind": "TEXT NOT NULL DEFAULT 'legacy'",
+    }.items():
+        _ensure_column(conn, "memory_session_claims", name, declaration)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_file_observations (
+          path TEXT PRIMARY KEY,
+          rel_path TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          session_hash TEXT NOT NULL DEFAULT '',
+          intent_id TEXT NOT NULL DEFAULT '',
+          fencing_token INTEGER NOT NULL DEFAULT 0,
+          git_commit TEXT NOT NULL DEFAULT '',
+          observed_at TEXT NOT NULL
+        )
+        """
+    )
+    for name, declaration in {
+        "intent_id": "TEXT NOT NULL DEFAULT ''",
+        "fencing_token": "INTEGER NOT NULL DEFAULT 0",
+        "git_commit": "TEXT NOT NULL DEFAULT ''",
+    }.items():
+        _ensure_column(conn, "memory_file_observations", name, declaration)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS memory_safety_log (
@@ -522,6 +779,72 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_closeout_incidents (
+          incident_id TEXT PRIMARY KEY,
+          intent_id TEXT NOT NULL,
+          target_key TEXT NOT NULL,
+          rel_path TEXT NOT NULL,
+          expected_sha256 TEXT NOT NULL,
+          observed_sha256 TEXT NOT NULL DEFAULT '',
+          git_commit TEXT NOT NULL,
+          reason_code TEXT NOT NULL,
+          detected_at TEXT NOT NULL,
+          resolved_at TEXT,
+          resolution_intent_id TEXT NOT NULL DEFAULT '',
+          resolution_git_commit TEXT NOT NULL DEFAULT '',
+          UNIQUE(intent_id, reason_code)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS generated_index_closeout_transactions (
+          transaction_id TEXT PRIMARY KEY,
+          actor TEXT NOT NULL,
+          task_sha256 TEXT NOT NULL,
+          vault_root_sha256 TEXT NOT NULL,
+          git_head TEXT NOT NULL,
+          index_base_sha256 TEXT NOT NULL,
+          full_vault_inputs_sha256 TEXT NOT NULL,
+          lease_fences_sha256 TEXT NOT NULL,
+          capability_sha256 TEXT NOT NULL UNIQUE,
+          issuer_pid INTEGER NOT NULL,
+          consumer_pid INTEGER,
+          status TEXT NOT NULL,
+          issued_at_epoch INTEGER NOT NULL,
+          expires_at_epoch INTEGER NOT NULL,
+          claimed_at_epoch INTEGER,
+          consumed_at_epoch INTEGER,
+          generated_sha256 TEXT NOT NULL DEFAULT '',
+          closeout_git_commit TEXT NOT NULL DEFAULT '',
+          failure_reason TEXT NOT NULL DEFAULT '',
+          failure_at_epoch INTEGER,
+          rollback_evidence_path TEXT NOT NULL DEFAULT '',
+          CHECK (status IN ('registered','issued','claimed','generated_bound','consumed','rolled_back','failed')),
+          CHECK (issuer_pid > 0),
+          CHECK (expires_at_epoch >= issued_at_epoch)
+        )
+        """
+    )
+    for name, declaration in {
+        "resolution_intent_id": "TEXT NOT NULL DEFAULT ''",
+        "resolution_git_commit": "TEXT NOT NULL DEFAULT ''",
+    }.items():
+        _ensure_column(conn, "memory_closeout_incidents", name, declaration)
+    for name, declaration in {
+        "failure_reason": "TEXT NOT NULL DEFAULT ''",
+        "failure_at_epoch": "INTEGER",
+        "rollback_evidence_path": "TEXT NOT NULL DEFAULT ''",
+    }.items():
+        _ensure_column(conn, "generated_index_closeout_transactions", name, declaration)
+    conn.execute(
+        "UPDATE generated_index_closeout_transactions "
+        "SET failure_reason='GENERATED_INDEX_LEGACY_FAILURE', "
+        "failure_at_epoch=COALESCE(failure_at_epoch, expires_at_epoch, issued_at_epoch) "
+        "WHERE status='failed' AND (failure_reason='' OR failure_at_epoch IS NULL)"
+    )
+    conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_write_intents_active_target "
         "ON memory_write_intents(target_key) "
         "WHERE status IN ('pending','approved','bound','validated')"
@@ -534,7 +857,968 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_memory_write_receipts_target "
         "ON memory_write_receipts(target_key, created_at)"
     )
-    conn.commit()
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_session_claims_active_intent "
+        "ON memory_session_claims(intent_id) WHERE intent_id<>'' AND status='active'"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_session_claims_active_target "
+        "ON memory_session_claims(target_key) WHERE target_key<>'' AND status='active'"
+    )
+    ensure_observability_v2_schema(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+        ("agent_memory_state_schema_version", str(STATE_SCHEMA_VERSION)),
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+        ("agent_memory_writer_protocol_version", str(WRITER_PROTOCOL_VERSION)),
+    )
+    if commit:
+        conn.commit()
+
+
+def _allocate_fencing_token(conn: sqlite3.Connection, target_key: str) -> int:
+    """Allocate a monotonic token for one canonical target inside a write transaction."""
+
+    now = utc_now()
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_path_fences(target_key, last_fence, updated_at) VALUES (?, 0, ?)",
+        (target_key, now),
+    )
+    conn.execute(
+        "UPDATE memory_path_fences SET last_fence=last_fence+1, updated_at=? WHERE target_key=?",
+        (now, target_key),
+    )
+    row = conn.execute(
+        "SELECT last_fence FROM memory_path_fences WHERE target_key=?",
+        (target_key,),
+    ).fetchone()
+    token = int(row[0]) if row is not None else 0
+    if token <= 0:
+        raise IntentError("FENCE_ALLOCATION_FAILED", "could not allocate a positive path fencing token")
+    return token
+
+
+def assert_current_lease(
+    intent_id: str,
+    *,
+    actor: str,
+    raw_session_id: str,
+    fencing_token: int | None = None,
+    target: str | Path | None = None,
+    require_unexpired: bool = True,
+    connection: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    """Return the active intent only when it still owns the latest path fence."""
+
+    owns_connection = connection is None
+    conn = connect(read_only=True) if owns_connection else connection
+    if conn is None:
+        raise IntentError("STATE_DB_UNAVAILABLE", "intent state connection is unavailable")
+    try:
+        intent = _fetch_intent(conn, intent_id)
+        if intent is None:
+            raise IntentError("INTENT_NOT_FOUND", f"write intent not found: {intent_id}")
+        _authorize_intent(intent, actor=actor, raw_session_id=raw_session_id)
+        if str(intent.get("status", "")) not in ACTIVE_STATUSES:
+            raise IntentError("LEASE_NOT_ACTIVE", "write intent no longer owns an active path lease")
+        stored_token = int(intent.get("fencing_token") or 0)
+        if stored_token <= 0 or (fencing_token is not None and int(fencing_token) != stored_token):
+            raise IntentError("LEASE_FENCED", "path lease fencing token is stale")
+        canonical = canonical_target(target or str(intent["target_rel_path"]))
+        if canonical.target_key != str(intent["target_key"]):
+            raise IntentError("INTENT_TARGET_MISMATCH", "path lease target does not match the intent")
+        latest = conn.execute(
+            "SELECT last_fence FROM memory_path_fences WHERE target_key=?",
+            (canonical.target_key,),
+        ).fetchone()
+        if latest is None or int(latest[0]) != stored_token:
+            raise IntentError("LEASE_FENCED", "a newer writer owns this path fence")
+        if require_unexpired and _intent_expired(intent):
+            raise IntentError("INTENT_EXPIRED", "path lease has expired")
+        return _public_intent(intent)
+    finally:
+        if owns_connection:
+            conn.close()
+
+
+def renew_lease(
+    intent_id: str,
+    *,
+    actor: str,
+    raw_session_id: str,
+    fencing_token: int,
+    ttl_hours: float | None = None,
+) -> dict[str, Any]:
+    """Extend an active lease without changing its monotonic fencing token."""
+
+    hours = DEFAULT_TTL_HOURS if ttl_hours is None else float(ttl_hours)
+    if hours <= 0:
+        raise IntentError("TTL_INVALID", "intent ttl_hours must be positive")
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        intent = assert_current_lease(
+            intent_id,
+            actor=actor,
+            raw_session_id=raw_session_id,
+            fencing_token=fencing_token,
+            connection=conn,
+        )
+        if str(intent.get("reason_code", "")) in {
+            EXPIRED_VALIDATED_RECOVERY_REASON,
+            EXPIRED_VALIDATED_RECOVERY_REPAIR_REASON,
+        }:
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_RENEW_FORBIDDEN",
+                "the bounded expired-write recovery window cannot be renewed",
+            )
+        now_value = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        expires_at = (now_value + dt.timedelta(hours=hours)).isoformat()
+        cursor = conn.execute(
+            "UPDATE memory_write_intents SET expires_at=?, updated_at=? "
+            "WHERE intent_id=? AND fencing_token=? AND status IN ('pending','approved','bound','validated')",
+            (expires_at, now_value.isoformat(), intent_id, int(intent["fencing_token"])),
+        )
+        if cursor.rowcount != 1:
+            raise IntentError("LEASE_FENCED", "path lease changed while it was being renewed")
+        conn.commit()
+    return show_intent(intent_id)["intent"]
+
+
+def _generated_index_repair_lease_fences_sha256(
+    *,
+    intent_id: str,
+    fencing_token: int,
+    rel_path: str,
+) -> str:
+    projection = [
+        (
+            intent_id,
+            int(fencing_token),
+            hashlib.sha256(rel_path.encode("utf-8")).hexdigest(),
+            "live",
+        )
+    ]
+    return hashlib.sha256(
+        json.dumps(
+            projection,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_generated_index_repair_receipt(
+    conn: sqlite3.Connection,
+    *,
+    intent: dict[str, Any],
+    actor: str,
+    raw_session_id: str,
+    canonical: CanonicalTarget,
+    generated_index_recovery: dict[str, Any] | None,
+    first_recovery_published_at: dt.datetime | None = None,
+    first_recovery_expires_at: dt.datetime | None = None,
+) -> None:
+    """Bind the one repair window to an exact, already-consumed INDEX row."""
+
+    required = {
+        "transaction_id",
+        "status",
+        "git_head",
+        "index_base_sha256",
+        "generated_sha256",
+        "closeout_git_commit",
+        "lease_fences_sha256",
+    }
+    if (
+        not isinstance(generated_index_recovery, dict)
+        or set(generated_index_recovery) != required
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_REPAIR_EVIDENCE_INVALID",
+            "repair recovery requires one exact generated-index receipt",
+        )
+    transaction_id = str(
+        generated_index_recovery.get("transaction_id", "")
+    ).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_REPAIR_EVIDENCE_INVALID",
+            "repair recovery transaction id is invalid",
+        )
+    row = conn.execute(
+        "SELECT * FROM generated_index_closeout_transactions "
+        "WHERE transaction_id=?",
+        (transaction_id,),
+    ).fetchone()
+    if row is None:
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_REPAIR_EVIDENCE_INVALID",
+            "repair recovery transaction is missing",
+        )
+    receipt = _row_dict(row) or {}
+    intent_id = str(intent.get("intent_id", ""))
+    fencing_token = int(intent.get("fencing_token") or 0)
+    expected_fences = _generated_index_repair_lease_fences_sha256(
+        intent_id=intent_id,
+        fencing_token=fencing_token,
+        rel_path=canonical.rel_path,
+    )
+    expected = {
+        "transaction_id": transaction_id,
+        "actor": actor,
+        "task_sha256": hashlib.sha256(
+            raw_session_id.encode("utf-8")
+        ).hexdigest(),
+        "vault_root_sha256": hashlib.sha256(
+            str(VAULT_ROOT.resolve()).encode("utf-8")
+        ).hexdigest(),
+        "git_head": str(generated_index_recovery["git_head"]),
+        "index_base_sha256": str(
+            generated_index_recovery["index_base_sha256"]
+        ),
+        "lease_fences_sha256": expected_fences,
+        "status": "consumed",
+        "generated_sha256": str(
+            generated_index_recovery["generated_sha256"]
+        ),
+        "closeout_git_commit": str(
+            generated_index_recovery["closeout_git_commit"]
+        ),
+    }
+    if any(str(receipt.get(key, "")) != value for key, value in expected.items()):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_REPAIR_EVIDENCE_INVALID",
+            "repair recovery transaction binding changed",
+        )
+    if any(
+        str(generated_index_recovery[key]) != str(receipt.get(key, ""))
+        for key in required - {"transaction_id"}
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_REPAIR_EVIDENCE_INVALID",
+            "repair recovery response does not match durable state",
+        )
+    git_head = str(receipt.get("git_head", ""))
+    index_base = str(receipt.get("index_base_sha256", ""))
+    generated = str(receipt.get("generated_sha256", ""))
+    if (
+        re.fullmatch(r"[0-9a-f]{40,64}", git_head) is None
+        or re.fullmatch(r"[0-9a-f]{64}", index_base) is None
+        or generated != index_base
+        or str(receipt.get("closeout_git_commit", "")) != git_head
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(receipt.get("full_vault_inputs_sha256", "")),
+        )
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(receipt.get("capability_sha256", "")),
+        )
+        is None
+        or int(receipt.get("issuer_pid") or 0) <= 0
+        or int(receipt.get("consumer_pid") or 0) <= 0
+        or receipt.get("claimed_at_epoch") is None
+        or receipt.get("consumed_at_epoch") is None
+        or str(receipt.get("failure_reason", ""))
+        or receipt.get("failure_at_epoch") is not None
+        or str(receipt.get("rollback_evidence_path", ""))
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_REPAIR_EVIDENCE_INVALID",
+            "repair recovery is not one clean exact no-change INDEX consumption",
+        )
+    issued_at = int(receipt.get("issued_at_epoch") or 0)
+    expires_at = int(receipt.get("expires_at_epoch") or 0)
+    claimed_at = int(receipt.get("claimed_at_epoch") or 0)
+    consumed_at = int(receipt.get("consumed_at_epoch") or 0)
+    if (
+        issued_at <= 0
+        or expires_at < issued_at
+        or claimed_at < issued_at
+        or consumed_at < claimed_at
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_REPAIR_EVIDENCE_INVALID",
+            "repair recovery transaction chronology is invalid",
+        )
+    if (
+        first_recovery_published_at is not None
+        and first_recovery_expires_at is not None
+    ):
+        published_epoch = int(first_recovery_published_at.timestamp())
+        first_expiry_epoch = int(first_recovery_expires_at.timestamp())
+        if (
+            issued_at < published_epoch
+            or expires_at > first_expiry_epoch
+            or claimed_at > first_expiry_epoch
+        ):
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_REPAIR_EVIDENCE_INVALID",
+                "generated-index transaction is not bound to the first recovery window",
+            )
+    open_rows = conn.execute(
+        "SELECT transaction_id FROM generated_index_closeout_transactions "
+        "WHERE status IN ('registered','issued','claimed','generated_bound','failed')"
+    ).fetchall()
+    if open_rows:
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_REPAIR_EVIDENCE_INVALID",
+            "another generated-index transaction remains unresolved",
+        )
+
+
+def _stable_regular_target_snapshot(
+    canonical: CanonicalTarget,
+) -> tuple[ContentDigest, tuple[int, ...]]:
+    """Read one non-executable regular target without accepting a path race."""
+
+    try:
+        before = canonical.path.lstat()
+    except OSError as exc:
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_TARGET_DRIFT",
+            "committed recovery target is unavailable",
+        ) from exc
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else before.st_uid
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != current_uid
+        or bool(before.st_mode & 0o111)
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_WORKTREE_UNSAFE",
+            "committed recovery target is not one owner-controlled regular file",
+        )
+    exists, digest = _read_target(canonical)
+    try:
+        after = canonical.path.lstat()
+    except OSError as exc:
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_TARGET_DRIFT",
+            "committed recovery target changed while it was read",
+        ) from exc
+    before_projection = (
+        before.st_dev,
+        before.st_ino,
+        before.st_uid,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_projection = (
+        after.st_dev,
+        after.st_ino,
+        after.st_uid,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if not exists or before_projection != after_projection:
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_TARGET_DRIFT",
+            "committed recovery target changed while it was read",
+        )
+    return digest, after_projection
+
+
+def assert_committed_content_update_recovery_projection(
+    intent: dict[str, Any],
+    *,
+    target: str | Path,
+    expected_current_git_head: str,
+) -> None:
+    """Prove validated -> committed bytes for one ordinary ADD or UPDATE.
+
+    This check is intentionally stricter than normal closeout recovery.  The
+    validated Git head must still contain the exact prepared base, the target
+    must then change at least once, and every target-changing descendant must
+    contain the exact raw and canonical proposal as a regular 100644 blob.
+    Unrelated descendant commits are permitted; path drift, changed-then-
+    reverted history, staged bytes, worktree bytes, and aliases are not.
+    """
+
+    canonical = canonical_target(target)
+    action = str(intent.get("reconcile_action", "")).upper()
+    if (
+        str(intent.get("operation", "")).casefold() != "content_update"
+        or action not in {"ADD", "UPDATE"}
+        or canonical.rel_path != str(intent.get("target_rel_path", ""))
+        or canonical.target_key != str(intent.get("target_key", ""))
+        or str(intent.get("validation_mode", "")) != "exact"
+        or bool(int(intent.get("early_commit") or 0))
+        or str(intent.get("proposal_commit", ""))
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_BINDING_CHANGED",
+            "committed content recovery no longer matches the validated write",
+        )
+    proposal_pair = (
+        str(intent.get("proposal_raw_sha256", "")),
+        str(intent.get("proposal_canonical_sha256", "")),
+    )
+    if (
+        proposal_pair
+        != (
+            str(intent.get("final_raw_sha256", "")),
+            str(intent.get("final_canonical_sha256", "")),
+        )
+        or any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in proposal_pair)
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_BINDING_CHANGED",
+            "committed content recovery proposal hashes changed",
+        )
+    current_head = str(expected_current_git_head).strip().casefold()
+    base_head = str(intent.get("base_git_head", "")).strip().casefold()
+    validated_head = str(intent.get("validated_git_head", "")).strip().casefold()
+    if any(
+        re.fullmatch(r"[0-9a-f]{40,64}", value) is None
+        for value in (base_head, validated_head, current_head)
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_GIT_PROJECTION_UNAVAILABLE",
+            "committed content recovery Git binding is invalid",
+        )
+    if (
+        current_git_head(required=True) != current_head
+        or current_head == validated_head
+        or not _git_is_ancestor(base_head, validated_head)
+        or not _git_is_ancestor(validated_head, current_head)
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_GIT_DIVERGED",
+            "committed content recovery Git ancestry changed",
+        )
+
+    base_exists = bool(int(intent.get("base_exists") or 0))
+    if base_exists != (action == "UPDATE"):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_BINDING_CHANGED",
+            "committed content recovery action no longer matches its base",
+        )
+    base_pair = (
+        str(intent.get("base_raw_sha256", "")),
+        str(intent.get("base_canonical_sha256", "")),
+    )
+    base_at_head_exists, base_at_head = git_target_digest_at_commit(
+        base_head,
+        canonical,
+    )
+    validated_exists, validated_digest = git_target_digest_at_commit(
+        validated_head,
+        canonical,
+    )
+    base_mode_exists, base_mode = git_target_mode_at_commit(base_head, canonical)
+    validated_mode_exists, validated_mode = git_target_mode_at_commit(
+        validated_head,
+        canonical,
+    )
+    base_to_validated = git_version_chain(base_head, validated_head, canonical)
+    if (
+        base_to_validated.get("ok") is not True
+        or bool(base_to_validated.get("versions"))
+        or base_at_head_exists != base_exists
+        or validated_exists != base_exists
+        or base_mode_exists != base_exists
+        or validated_mode_exists != base_exists
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_TARGET_HISTORY_CHANGED",
+            "the target changed before its validated Git head",
+        )
+    if base_exists:
+        if (
+            base_mode != "100644"
+            or validated_mode != "100644"
+            or (base_at_head.raw_sha256, base_at_head.canonical_sha256) != base_pair
+            or (validated_digest.raw_sha256, validated_digest.canonical_sha256)
+            != base_pair
+        ):
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_COMMIT_CONTENT_MISMATCH",
+                "the validated Git target no longer matches the prepared base",
+            )
+    elif base_pair != (EMPTY_RAW_SHA256, EMPTY_RAW_SHA256):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_COMMIT_CONTENT_MISMATCH",
+            "the validated ADD base is not the exact absent-file digest",
+        )
+
+    head_exists, head_digest = git_target_digest_at_commit(current_head, canonical)
+    head_mode_exists, head_mode = git_target_mode_at_commit(current_head, canonical)
+    if (
+        not head_exists
+        or not head_mode_exists
+        or head_mode != "100644"
+        or (head_digest.raw_sha256, head_digest.canonical_sha256) != proposal_pair
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_COMMIT_CONTENT_MISMATCH",
+            "the current Git target is not the exact committed proposal",
+        )
+    history = git_version_chain(validated_head, current_head, canonical)
+    versions = history.get("versions")
+    if history.get("ok") is not True or not isinstance(versions, list) or not versions:
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_TARGET_HISTORY_CHANGED",
+            "committed recovery requires nonempty exact target history",
+        )
+    for version in versions:
+        if (
+            not isinstance(version, dict)
+            or version.get("exists") is not True
+            or (
+                str(version.get("raw_sha256", "")),
+                str(version.get("canonical_sha256", "")),
+            )
+            != proposal_pair
+        ):
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_TARGET_HISTORY_CHANGED",
+                "target-changing history contains bytes other than the proposal",
+            )
+        mode_exists, mode = git_target_mode_at_commit(
+            str(version.get("commit", "")),
+            canonical,
+        )
+        if not mode_exists or mode != "100644":
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_TARGET_HISTORY_CHANGED",
+                "target-changing history contains a non-regular Git mode",
+            )
+
+    live_digest, stable_projection = _stable_regular_target_snapshot(canonical)
+    repo_path = _repo_rel_path(canonical)
+    if (
+        (live_digest.raw_sha256, live_digest.canonical_sha256) != proposal_pair
+        or not _git_path_matches_worktree(current_head, repo_path)
+        or _run_git(
+            "diff",
+            "--cached",
+            "--quiet",
+            current_head,
+            "--",
+            repo_path,
+        ).returncode
+        != 0
+        or current_git_head(required=True) != current_head
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_WORKTREE_DIRTY",
+            "committed recovery target is not clean at the expected Git head",
+        )
+    try:
+        final_stat = canonical.path.lstat()
+    except OSError as exc:
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_TARGET_DRIFT",
+            "committed recovery target changed after validation",
+        ) from exc
+    final_projection = (
+        final_stat.st_dev,
+        final_stat.st_ino,
+        final_stat.st_uid,
+        final_stat.st_mode,
+        final_stat.st_size,
+        final_stat.st_mtime_ns,
+        final_stat.st_ctime_ns,
+    )
+    if final_projection != stable_projection:
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_TARGET_DRIFT",
+            "committed recovery target changed after validation",
+        )
+
+
+def recover_expired_validated_lease(
+    intent_id: str,
+    *,
+    actor: str,
+    raw_session_id: str,
+    target: str | Path,
+    fencing_token: int,
+    expected_expires_at: str,
+    expected_base_raw_sha256: str,
+    expected_base_canonical_sha256: str,
+    expected_base_git_head: str,
+    expected_read_token: str,
+    expected_scope_app_id: str,
+    expected_scope_project_id: str,
+    expected_proposal_raw_sha256: str,
+    expected_proposal_canonical_sha256: str,
+    expected_proposal_size_bytes: int,
+    expected_final_raw_sha256: str,
+    expected_final_canonical_sha256: str,
+    expected_validated_git_head: str,
+    expected_early_commit: bool,
+    expected_proposal_commit: str,
+    expected_evidence_ref_sha256: str,
+    expected_operation: str,
+    expected_reconcile_action: str,
+    expected_approved_by: str = "",
+    expected_approval_ref_sha256: str = "",
+    expected_approval_binding_sha256: str = "",
+    expected_claim_ref_sha256: str = "",
+    expected_current_git_head: str = "",
+    ttl_seconds: int = EXPIRED_VALIDATED_RECOVERY_TTL_SECONDS,
+    generated_index_recovery: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Narrowly reopen an expired, already-validated exact write.
+
+    This is deliberately not a general lease renewal API.  It admits either
+    the existing capability-bound governance repair or one ordinary ADD/UPDATE
+    whose normal approval and exact post-validation Git commit are proven.
+    Immutable review fields, current path fence, and active claim must still
+    agree exactly.  The marker makes a crash after this transaction auditable
+    and idempotently resumable; ordinary unexpired intents cannot enter it.
+    """
+
+    if (
+        not isinstance(ttl_seconds, int)
+        or isinstance(ttl_seconds, bool)
+        or ttl_seconds <= 0
+        or ttl_seconds > EXPIRED_VALIDATED_RECOVERY_TTL_SECONDS
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_TTL_INVALID",
+            "expired validated recovery has a bounded lease window",
+        )
+    governance_recovery = (
+        expected_operation == "governance_migration"
+        and expected_reconcile_action == "UPDATE"
+    )
+    content_update_recovery = (
+        expected_operation == "content_update"
+        and expected_reconcile_action in {"ADD", "UPDATE"}
+    )
+    if actor not in {"codex", "claude"} or not (
+        governance_recovery or content_update_recovery
+    ):
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_OPERATION_INVALID",
+            "expired validated recovery is limited to exact supported closeout",
+        )
+    if content_update_recovery and generated_index_recovery is not None:
+        raise IntentError(
+            "EXPIRED_VALIDATED_RECOVERY_REPAIR_NOT_ALLOWED",
+            "ordinary content recovery cannot consume governance repair evidence",
+        )
+    canonical = canonical_target(target)
+    now_value = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    now = now_value.isoformat()
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        stored = _fetch_intent(conn, intent_id)
+        if stored is None:
+            raise IntentError("INTENT_NOT_FOUND", f"write intent not found: {intent_id}")
+        _authorize_intent(stored, actor=actor, raw_session_id=raw_session_id)
+        if str(stored.get("status", "")) != "validated":
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_STATE_INVALID",
+                "recovery requires one still-active validated intent",
+            )
+        receipt = conn.execute(
+            "SELECT receipt_id FROM memory_write_receipts WHERE intent_id=?",
+            (intent_id,),
+        ).fetchone()
+        if receipt is not None:
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_RECEIPT_CONFLICT",
+                "validated recovery cannot replay a terminal receipt",
+            )
+        stored_reason = str(stored.get("reason_code", ""))
+        already_recovered = stored_reason == EXPIRED_VALIDATED_RECOVERY_REASON
+        repair_recovered = (
+            stored_reason == EXPIRED_VALIDATED_RECOVERY_REPAIR_REASON
+        )
+        if content_update_recovery and repair_recovered:
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_STATE_INVALID",
+                "ordinary content recovery cannot enter the governance repair lane",
+            )
+        if stored_reason not in {
+            "",
+            EXPIRED_VALIDATED_RECOVERY_REASON,
+            EXPIRED_VALIDATED_RECOVERY_REPAIR_REASON,
+        }:
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_STATE_INVALID",
+                "validated recovery marker conflicts with intent state",
+            )
+        stored_expiry = parse_time(str(stored.get("expires_at", "")))
+        if stored_expiry is None:
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_EXPIRY_INVALID",
+                "validated recovery requires one parseable lease expiry",
+            )
+        expired_now = stored_expiry <= now_value
+        published_at: dt.datetime | None = None
+        recovery_window: dt.timedelta | None = None
+        if already_recovered or repair_recovered:
+            published_at = parse_time(str(stored.get("updated_at", "")))
+            recovery_window = (
+                stored_expiry - published_at
+                if published_at is not None
+                else None
+            )
+            maximum_window = (
+                EXPIRED_VALIDATED_RECOVERY_REPAIR_TTL_SECONDS
+                if repair_recovered
+                else EXPIRED_VALIDATED_RECOVERY_TTL_SECONDS
+            )
+            if (
+                published_at is None
+                or published_at > now_value
+                or recovery_window is None
+                or recovery_window <= dt.timedelta(0)
+                or recovery_window
+                > dt.timedelta(seconds=maximum_window)
+            ):
+                raise IntentError(
+                    "EXPIRED_VALIDATED_RECOVERY_EXPIRY_INVALID",
+                    "validated recovery marker has no bounded publication window",
+                )
+            if expired_now:
+                if repair_recovered:
+                    raise IntentError(
+                        "EXPIRED_VALIDATED_RECOVERY_REPAIR_WINDOW_ELAPSED",
+                        "the one repair recovery window has elapsed",
+                    )
+                if generated_index_recovery is None:
+                    raise IntentError(
+                        "EXPIRED_VALIDATED_RECOVERY_WINDOW_ELAPSED",
+                        "the one bounded recovery window has elapsed",
+                    )
+        elif not expired_now:
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_NOT_EXPIRED",
+                "ordinary unexpired writes cannot use recovery",
+            )
+        elif generated_index_recovery is not None:
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_REPAIR_NOT_ALLOWED",
+                "generated-index repair is limited to an elapsed first recovery window",
+            )
+        if str(stored.get("expires_at", "")) != expected_expires_at:
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_STATE_CHANGED",
+                "validated recovery lease changed after preflight",
+            )
+        expected = {
+            "target_rel_path": canonical.rel_path,
+            "target_key": canonical.target_key,
+            "fencing_token": int(fencing_token),
+            "base_raw_sha256": expected_base_raw_sha256,
+            "base_canonical_sha256": expected_base_canonical_sha256,
+            "base_git_head": expected_base_git_head,
+            "read_token": expected_read_token,
+            "scope_app_id": expected_scope_app_id,
+            "scope_project_id": expected_scope_project_id,
+            "proposal_raw_sha256": expected_proposal_raw_sha256,
+            "proposal_canonical_sha256": expected_proposal_canonical_sha256,
+            "proposal_size_bytes": int(expected_proposal_size_bytes),
+            "final_raw_sha256": expected_final_raw_sha256,
+            "final_canonical_sha256": expected_final_canonical_sha256,
+            "validated_git_head": expected_validated_git_head,
+            "early_commit": int(bool(expected_early_commit)),
+            "proposal_commit": expected_proposal_commit,
+            "evidence_ref_sha256": expected_evidence_ref_sha256,
+            "operation": expected_operation,
+            "reconcile_action": expected_reconcile_action,
+        }
+        if any(stored.get(key) != value for key, value in expected.items()):
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_BINDING_CHANGED",
+                "validated recovery no longer matches the reviewed write",
+            )
+        common_binding_invalid = (
+            str(stored.get("validation_mode", "")) != "exact"
+            or not str(stored.get("validated_at", ""))
+            or str(stored.get("bound_base_raw_sha256", ""))
+            != expected_base_raw_sha256
+            or not str(stored.get("claim_ref_sha256", ""))
+            or int(stored.get("approval_required") or 0) != 1
+            or str(stored.get("target_status", ""))
+            or str(stored.get("transition_reason_sha256", ""))
+            or str(stored.get("reason_code", ""))
+            not in {
+                "",
+                EXPIRED_VALIDATED_RECOVERY_REASON,
+                EXPIRED_VALIDATED_RECOVERY_REPAIR_REASON,
+            }
+        )
+        governance_binding_invalid = governance_recovery and (
+            int(stored.get("base_exists") or 0) != 1
+            or not has_valid_confirmation_capability_approval(stored)
+            or str(stored.get("source_class", "")) != "user_direct"
+            or str(stored.get("knowledge_kind", "")) != "rule"
+            or str(stored.get("asserted_by", "")) != "user"
+        )
+        content_binding_invalid = content_update_recovery and (
+            int(stored.get("base_exists") or 0)
+            != int(expected_reconcile_action == "UPDATE")
+            or bool(int(stored.get("early_commit") or 0))
+            or bool(str(stored.get("proposal_commit", "")))
+            or not has_valid_ordinary_approval(stored)
+            or str(stored.get("approved_by", "")) != expected_approved_by
+            or str(stored.get("approval_ref_sha256", ""))
+            != expected_approval_ref_sha256
+            or str(stored.get("approval_binding_sha256", ""))
+            != expected_approval_binding_sha256
+            or str(stored.get("claim_ref_sha256", ""))
+            != expected_claim_ref_sha256
+            or not str(stored.get("source_class", ""))
+            or not str(stored.get("knowledge_kind", ""))
+            or not str(stored.get("asserted_by", ""))
+            or str(stored.get("safety_decision", "")).upper() != "ALLOW"
+            or re.fullmatch(r"[0-9a-f]{64}", expected_approval_ref_sha256)
+            is None
+            or re.fullmatch(r"[0-9a-f]{64}", expected_approval_binding_sha256)
+            is None
+            or re.fullmatch(r"[0-9a-f]{64}", expected_claim_ref_sha256)
+            is None
+        )
+        if common_binding_invalid or governance_binding_invalid or content_binding_invalid:
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_BINDING_CHANGED",
+                "validated recovery lacks exact approval or validation evidence",
+            )
+        latest = conn.execute(
+            "SELECT last_fence FROM memory_path_fences WHERE target_key=?",
+            (canonical.target_key,),
+        ).fetchone()
+        if latest is None or int(latest[0]) != int(fencing_token):
+            raise IntentError("LEASE_FENCED", "a newer writer owns this target fence")
+        claims = conn.execute(
+            "SELECT session_hash, actor, path, rel_path, status, completed_at, "
+            "intent_id, target_key, fencing_token, claim_kind "
+            "FROM memory_session_claims WHERE status='active' "
+            "AND (intent_id=? OR target_key=?)",
+            (intent_id, canonical.target_key),
+        ).fetchall()
+        expected_claim = {
+            "session_hash": session_hash(raw_session_id),
+            "actor": actor,
+            "path": str(canonical.path),
+            "rel_path": canonical.rel_path,
+            "status": "active",
+            "completed_at": None,
+            "intent_id": intent_id,
+            "target_key": canonical.target_key,
+            "fencing_token": int(fencing_token),
+            "claim_kind": "intent",
+        }
+        if len(claims) != 1 or any(
+            claims[0][key] != value for key, value in expected_claim.items()
+        ):
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_CLAIM_CHANGED",
+                "validated recovery requires the exact active claim projection",
+            )
+        if content_update_recovery:
+            assert_committed_content_update_recovery_projection(
+                stored,
+                target=canonical.path,
+                expected_current_git_head=expected_current_git_head,
+            )
+        if repair_recovered:
+            _validate_generated_index_repair_receipt(
+                conn,
+                intent=stored,
+                actor=actor,
+                raw_session_id=raw_session_id,
+                canonical=canonical,
+                generated_index_recovery=generated_index_recovery,
+            )
+            # A retry inside the one repair window is idempotent.  This marker
+            # is terminal with respect to lease publication: once it expires,
+            # no third window can be created.
+            conn.commit()
+            return _public_intent(stored)
+        if already_recovered and not expired_now:
+            if generated_index_recovery is not None:
+                raise IntentError(
+                    "EXPIRED_VALIDATED_RECOVERY_REPAIR_NOT_ALLOWED",
+                    "the first recovery window is still active",
+                )
+            # A retry inside the originally published crash window is
+            # idempotent.  Do not slide or renew that window indefinitely.
+            conn.commit()
+            return _public_intent(stored)
+        if already_recovered:
+            if published_at is None:
+                raise IntentError(
+                    "EXPIRED_VALIDATED_RECOVERY_EXPIRY_INVALID",
+                    "validated recovery marker has no publication time",
+                )
+            _validate_generated_index_repair_receipt(
+                conn,
+                intent=stored,
+                actor=actor,
+                raw_session_id=raw_session_id,
+                canonical=canonical,
+                generated_index_recovery=generated_index_recovery,
+                first_recovery_published_at=published_at,
+                first_recovery_expires_at=stored_expiry,
+            )
+            repair_expires_at = (
+                now_value
+                + dt.timedelta(
+                    seconds=EXPIRED_VALIDATED_RECOVERY_REPAIR_TTL_SECONDS
+                )
+            ).isoformat()
+            cursor = conn.execute(
+                "UPDATE memory_write_intents SET expires_at=?, reason_code=?, "
+                "updated_at=? WHERE intent_id=? AND status='validated' "
+                "AND fencing_token=? AND expires_at=? AND reason_code=?",
+                (
+                    repair_expires_at,
+                    EXPIRED_VALIDATED_RECOVERY_REPAIR_REASON,
+                    now,
+                    intent_id,
+                    int(fencing_token),
+                    expected_expires_at,
+                    EXPIRED_VALIDATED_RECOVERY_REASON,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise IntentError(
+                    "EXPIRED_VALIDATED_RECOVERY_STATE_CHANGED",
+                    "validated recovery changed during repair publication",
+                )
+            conn.commit()
+            return show_intent(intent_id)["intent"]
+        expires_at = (
+            now_value + dt.timedelta(seconds=ttl_seconds)
+        ).isoformat()
+        cursor = conn.execute(
+            "UPDATE memory_write_intents SET expires_at=?, reason_code=?, "
+            "updated_at=? WHERE intent_id=? AND status='validated' "
+            "AND fencing_token=? AND expires_at=? AND reason_code=?",
+            (
+                expires_at,
+                EXPIRED_VALIDATED_RECOVERY_REASON,
+                now,
+                intent_id,
+                int(fencing_token),
+                expected_expires_at,
+                stored_reason,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_STATE_CHANGED",
+                "validated recovery changed during lease publication",
+            )
+        conn.commit()
+    return show_intent(intent_id)["intent"]
 
 
 def _row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -556,7 +1840,10 @@ def _fetch_intent(conn: sqlite3.Connection, intent_id: str) -> dict[str, Any] | 
     if isinstance(row, sqlite3.Row):
         return _row_dict(row)
     names = [str(item[0]) for item in cursor.description or ()]
-    return dict(zip(names, row, strict=False))
+    # ``zip(strict=...)`` was added in Python 3.10.  The public runtime still
+    # supports Python 3.9, and cursor.description is guaranteed to match a
+    # successfully fetched SQLite row here.
+    return dict(zip(names, row))
 
 
 def _record_safety_assessment(
@@ -631,6 +1918,79 @@ def _git_blob(commit: str, repo_rel_path: str) -> bytes | None:
     return bytes(result.stdout)
 
 
+def git_target_digest_at_commit(
+    commit: str,
+    target: CanonicalTarget,
+) -> tuple[bool, ContentDigest]:
+    """Read the immutable Git baseline used for write-policy recovery checks.
+
+    This is deliberately separate from the mutable worktree baseline stored
+    for ADOPT.  A retry after proposal bytes were written can therefore still
+    prove whether a content_update preserved status, without adding another
+    state-schema column or trusting the already-written proposal.
+    """
+
+    normalized_commit = str(commit).strip().casefold()
+    if re.fullmatch(r"[0-9a-f]{40,64}", normalized_commit) is None:
+        raise IntentError("GIT_BASE_UNAVAILABLE", "stored Git baseline is invalid")
+    exists = _run_git("cat-file", "-e", f"{normalized_commit}^{{commit}}").returncode == 0
+    if not exists:
+        raise IntentError("GIT_BASE_UNAVAILABLE", "stored Git baseline is unavailable")
+    blob = _git_blob(normalized_commit, _repo_rel_path(target))
+    if blob is None:
+        return False, ContentDigest(
+            raw_sha256=EMPTY_RAW_SHA256,
+            canonical_sha256=EMPTY_RAW_SHA256,
+            size_bytes=0,
+            text="",
+        )
+    return True, content_hashes(blob, max_bytes=MAX_TARGET_BYTES)
+
+
+def git_target_mode_at_commit(
+    commit: str,
+    target: CanonicalTarget,
+) -> tuple[bool, str]:
+    """Return one exact Git tree mode without following worktree aliases."""
+
+    normalized_commit = str(commit).strip().casefold()
+    if re.fullmatch(r"[0-9a-f]{40,64}", normalized_commit) is None:
+        raise IntentError("GIT_BASE_UNAVAILABLE", "stored Git baseline is invalid")
+    repo_rel_path = _repo_rel_path(target)
+    result = _run_git(
+        "ls-tree",
+        "-z",
+        "--full-tree",
+        normalized_commit,
+        "--",
+        repo_rel_path,
+        binary=True,
+    )
+    if result.returncode != 0:
+        raise IntentError("GIT_HISTORY_UNAVAILABLE", "Git tree entry is unavailable")
+    records = [record for record in bytes(result.stdout).split(b"\0") if record]
+    if not records:
+        return False, ""
+    if len(records) != 1:
+        raise IntentError("GIT_HISTORY_UNAVAILABLE", "Git tree entry is ambiguous")
+    try:
+        header, raw_path = records[0].split(b"\t", 1)
+        raw_mode, object_type, raw_oid = header.split()
+        returned_path = raw_path.decode("utf-8", errors="strict")
+        mode = raw_mode.decode("ascii", errors="strict")
+        oid = raw_oid.decode("ascii", errors="strict")
+    except (UnicodeError, ValueError) as exc:
+        raise IntentError("GIT_HISTORY_UNAVAILABLE", "Git tree entry is invalid") from exc
+    if (
+        returned_path != repo_rel_path
+        or object_type != b"blob"
+        or re.fullmatch(r"[0-7]{6}", mode) is None
+        or re.fullmatch(r"[0-9a-f]{40,64}", oid) is None
+    ):
+        raise IntentError("GIT_HISTORY_UNAVAILABLE", "Git tree entry is invalid")
+    return True, mode
+
+
 def _git_path_matches_worktree(commit: str, repo_rel_path: str) -> bool:
     """Compare Git and worktree content while honoring checkout filters."""
     return _run_git("diff", "--quiet", commit, "--", repo_rel_path).returncode == 0
@@ -648,7 +2008,15 @@ def git_version_chain(base_head: str, head: str, target: CanonicalTarget) -> dic
         return {"ok": False, "reason_code": "BASE_GIT_HEAD_DIVERGED", "versions": []}
     if base_head == head:
         return {"ok": True, "reason_code": "", "versions": []}
-    result = _run_git("rev-list", "--reverse", f"{base_head}..{head}", "--", repo_rel_path)
+    result = _run_git(
+        "rev-list",
+        "--reverse",
+        "--topo-order",
+        "--full-history",
+        f"{base_head}..{head}",
+        "--",
+        repo_rel_path,
+    )
     if result.returncode != 0:
         return {"ok": False, "reason_code": "GIT_HISTORY_UNAVAILABLE", "versions": []}
     versions: list[dict[str, Any]] = []
@@ -688,6 +2056,7 @@ def _approval_binding(
         "actor": str(intent["actor"]),
         "session_hash": str(intent["session_hash"]),
         "target_key": str(intent["target_key"]),
+        "fencing_token": int(intent.get("fencing_token") or 0),
         "base_raw_sha256": str(intent["base_raw_sha256"]),
         "proposal_raw_sha256": proposal_raw_sha256,
         "proposal_canonical_sha256": proposal_canonical_sha256,
@@ -705,6 +2074,54 @@ def _stored_approval_binding(intent: dict[str, Any]) -> str:
         str(intent.get("approval_proposal_raw_sha256", "")),
         str(intent.get("approval_proposal_canonical_sha256", "")),
         str(intent.get("approval_ref_sha256", "")),
+    )
+
+
+def intent_requires_confirmation_capability(intent: dict[str, Any]) -> bool:
+    return (
+        str(intent.get("reconcile_action", "")).upper() in SENSITIVE_CONFIRMATION_ACTIONS
+        or str(intent.get("operation", "content_update")).casefold()
+        in SENSITIVE_CONFIRMATION_OPERATIONS
+    )
+
+
+def has_valid_confirmation_capability_approval(intent: dict[str, Any]) -> bool:
+    """Return true only for a complete approval minted from a consumed capability."""
+
+    return bool(
+        intent_requires_confirmation_capability(intent)
+        and str(intent.get("approved_by", "")) == HUMAN_CONFIRMATION_CAPABILITY_APPROVER
+        and str(intent.get("approved_at", ""))
+        and str(intent.get("approval_proposal_raw_sha256", ""))
+        == str(intent.get("proposal_raw_sha256", ""))
+        and str(intent.get("approval_proposal_canonical_sha256", ""))
+        == str(intent.get("proposal_canonical_sha256", ""))
+        and str(intent.get("approval_ref_sha256", ""))
+        and str(intent.get("approval_binding_sha256", "")) == _stored_approval_binding(intent)
+    )
+
+
+def has_valid_ordinary_approval(intent: dict[str, Any]) -> bool:
+    """Return true only for one complete, non-capability approval binding."""
+
+    return bool(
+        not intent_requires_confirmation_capability(intent)
+        and int(intent.get("approval_required") or 0) == 1
+        and str(intent.get("approved_by", ""))
+        and str(intent.get("approved_by", ""))
+        != HUMAN_CONFIRMATION_CAPABILITY_APPROVER
+        and str(intent.get("approved_at", ""))
+        and str(intent.get("approval_proposal_raw_sha256", ""))
+        == str(intent.get("proposal_raw_sha256", ""))
+        and str(intent.get("approval_proposal_canonical_sha256", ""))
+        == str(intent.get("proposal_canonical_sha256", ""))
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(intent.get("approval_ref_sha256", "")),
+        )
+        is not None
+        and str(intent.get("approval_binding_sha256", ""))
+        == _stored_approval_binding(intent)
     )
 
 
@@ -737,7 +2154,8 @@ def _expire_active_rows(
         conn.execute(
             """
             INSERT OR IGNORE INTO memory_write_receipts (
-              receipt_id, intent_id, actor, session_hash, target_rel_path, target_key,
+              receipt_id, intent_id, writer_protocol_version, actor, session_hash,
+              target_rel_path, target_key, fencing_token,
               outcome, reason_code, validation_mode, base_raw_sha256,
               proposal_raw_sha256, proposal_canonical_sha256, final_raw_sha256,
               final_canonical_sha256, base_git_head, validated_git_head, git_commit,
@@ -745,12 +2163,14 @@ def _expire_active_rows(
               approval_ref_sha256, source_class, knowledge_kind,
               asserted_by_sha256, safety_decision, safety_reason_code,
               safety_input_sha256, safety_input_length, evidence_ref_sha256,
+              operation, target_status, transition_reason_sha256,
               detail_code, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                receipt_id, intent["intent_id"], intent["actor"], intent["session_hash"],
-                intent["target_rel_path"], intent["target_key"], "expired", "INTENT_EXPIRED",
+                receipt_id, intent["intent_id"], intent["writer_protocol_version"],
+                intent["actor"], intent["session_hash"], intent["target_rel_path"],
+                intent["target_key"], intent["fencing_token"], "expired", "INTENT_EXPIRED",
                 intent["validation_mode"], intent["base_raw_sha256"], intent["proposal_raw_sha256"],
                 intent["proposal_canonical_sha256"], intent["final_raw_sha256"],
                 intent["final_canonical_sha256"], intent["base_git_head"],
@@ -760,7 +2180,9 @@ def _expire_active_rows(
                 sha256_bytes(str(intent["asserted_by"]).encode("utf-8")) if intent["asserted_by"] else "",
                 intent["safety_decision"], intent["safety_reason_code"],
                 intent["safety_input_sha256"], intent["safety_input_length"],
-                intent["evidence_ref_sha256"], "TTL_ELAPSED", timestamp,
+                intent["evidence_ref_sha256"], intent["operation"],
+                intent["target_status"], intent["transition_reason_sha256"],
+                "TTL_ELAPSED", timestamp,
             ),
         )
         cursor = conn.execute(
@@ -768,6 +2190,18 @@ def _expire_active_rows(
             "WHERE intent_id=? AND status IN ('pending','approved','bound','validated')",
             (timestamp, intent["intent_id"]),
         )
+        if cursor.rowcount and _table_exists(conn, "memory_session_claims"):
+            conn.execute(
+                "UPDATE memory_session_claims SET status='expired', completed_at=?, updated_at=? "
+                "WHERE status='active' AND intent_id=? AND target_key=? AND fencing_token=?",
+                (
+                    timestamp,
+                    timestamp,
+                    str(intent["intent_id"]),
+                    str(intent["target_key"]),
+                    int(intent["fencing_token"] or 0),
+                ),
+            )
         applied += int(cursor.rowcount)
     return applied
 
@@ -786,6 +2220,9 @@ def create_intent(
     asserted_by: str = "",
     evidence_ref_sha256: str = "",
     reconcile_action: str = "",
+    operation: str = "content_update",
+    target_status: str = "",
+    transition_reason_sha256: str = "",
     strict_git_base: bool = True,
     store_proposal_snapshot: bool = True,
     read_token: str = "",
@@ -799,21 +2236,23 @@ def create_intent(
     hashed_session = session_hash(raw_session_id)
     if not hashed_session:
         raise IntentError("SESSION_REQUIRED", "session id is required")
-    if actor == "yichen-content-studio":
+    if actor not in SUPPORTED_LEDGER_ACTORS:
+        raise IntentError("ACTOR_UNSUPPORTED", "actor is not supported")
+    if actor == "ailu":
         if not approval_required:
             raise IntentError(
                 "APPROVAL_REQUIRED",
-                "yichen-content-studio intents always require explicit user approval",
+                "ailu intents always require explicit user approval",
             )
         if str(asserted_by).strip().lower() not in {"user", "claude", "codex", "opencode"}:
             raise IntentError(
                 "ASSERTED_BY_UNSUPPORTED",
-                "yichen-content-studio must bind a supported factual asserter",
+                "ailu must bind a supported factual asserter",
             )
         if store_proposal_snapshot:
             raise IntentError(
-                "STUDIO_PROPOSAL_SNAPSHOT_FORBIDDEN",
-                "yichen-content-studio proposal bodies must not be stored in the state database",
+                "AILU_PROPOSAL_SNAPSHOT_FORBIDDEN",
+                "ailu proposal bodies must not be stored in the state database",
             )
         if (
             not re.fullmatch(r"[0-9a-f]{64}", read_token)
@@ -821,8 +2260,8 @@ def create_intent(
             or not scope_app_id.strip()
         ):
             raise IntentError(
-                "STUDIO_READ_TOKEN_REQUIRED",
-                "yichen-content-studio intents require a bound high-level read token",
+                "AILU_READ_TOKEN_REQUIRED",
+                "ailu intents require a bound high-level read token",
             )
     canonical = canonical_target(target)
     now_value = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
@@ -893,6 +2332,34 @@ def create_intent(
         proposal_snapshot = ""
         proposal_snapshot_truncated = bool(canonical_proposal)
     normalized_reconcile_action = _bounded_label(reconcile_action).upper()
+    normalized_operation = _bounded_label(operation, limit=64).lower() or "content_update"
+    if normalized_operation not in {
+        "content_update",
+        "status_transition",
+        "governance_migration",
+    }:
+        raise IntentError("OPERATION_INVALID", "unsupported write operation")
+    normalized_target_status = _bounded_label(target_status, limit=64).lower()
+    normalized_transition_reason = _bounded_label(transition_reason_sha256, limit=128).lower()
+    if normalized_operation == "status_transition":
+        if actor == "ailu":
+            raise IntentError("STATUS_TRANSITION_ACTOR_FORBIDDEN", "ailu cannot transition formal memory status")
+        if normalized_target_status not in {
+            "active",
+            "pending_verification",
+            "outdated",
+            "archived",
+        }:
+            raise IntentError("STATUS_TRANSITION_INVALID", "target status is not supported")
+        if re.fullmatch(r"[0-9a-f]{64}", normalized_transition_reason) is None:
+            raise IntentError("STATUS_TRANSITION_REASON_REQUIRED", "status transition reason must be hash-bound")
+    elif normalized_operation == "governance_migration":
+        if actor not in {"codex", "claude", "migration"}:
+            raise IntentError("OPERATION_FORBIDDEN", "governance migration is unavailable to this actor")
+        if normalized_target_status or normalized_transition_reason:
+            raise IntentError("OPERATION_INVALID", "governance migration has no status transition fields")
+    elif normalized_target_status or normalized_transition_reason:
+        raise IntentError("OPERATION_INVALID", "transition metadata requires status_transition")
     effective_approval_required = bool(approval_required) or normalized_reconcile_action in {
         "ASK_USER",
         "MERGE_REQUIRED",
@@ -956,6 +2423,7 @@ def create_intent(
             ).fetchone()
             if active is not None:
                 raise IntentError("ACTIVE_TARGET_CONFLICT", "another active intent already owns this target")
+            fencing_token = _allocate_fencing_token(conn, canonical.target_key)
             safety_audit_id = _record_safety_assessment(
                 conn,
                 safety,
@@ -966,7 +2434,9 @@ def create_intent(
             conn.execute(
                 """
                 INSERT INTO memory_write_intents (
-                  intent_id, actor, session_hash, target_rel_path, target_key,
+                  intent_id, schema_version, writer_protocol_version,
+                  actor, session_hash, target_rel_path, target_key,
+                  fencing_token,
                   base_exists, base_raw_sha256, base_canonical_sha256, base_git_head,
                   read_token, scope_app_id, scope_project_id,
                   proposal_raw_sha256, proposal_canonical_sha256, proposal_size_bytes,
@@ -975,16 +2445,20 @@ def create_intent(
                   source_class, knowledge_kind, asserted_by, evidence_ref_sha256,
                   safety_audit_id, safety_run_id, safety_decision,
                   safety_reason_code, safety_input_sha256, safety_input_length,
-                  reconcile_action, intent_system_enabled, effective_enforcement,
+                  reconcile_action, operation, target_status, transition_reason_sha256,
+                  intent_system_enabled, effective_enforcement,
                   approval_required, status, created_at, updated_at, expires_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     intent_id,
+                    STATE_SCHEMA_VERSION,
+                    WRITER_PROTOCOL_VERSION,
                     actor,
                     hashed_session,
                     canonical.rel_path,
                     canonical.target_key,
+                    fencing_token,
                     int(base_exists),
                     base.raw_sha256,
                     base.canonical_sha256,
@@ -1010,6 +2484,9 @@ def create_intent(
                     str(safety["input_sha256"]),
                     int(safety["input_length"]),
                     normalized_reconcile_action,
+                    normalized_operation,
+                    normalized_target_status,
+                    normalized_transition_reason,
                     int(INTENTS_ENABLED),
                     effective_enforcement,
                     int(effective_approval_required),
@@ -1026,7 +2503,7 @@ def create_intent(
 
 
 def show_intent(intent_id: str) -> dict[str, Any]:
-    with connect() as conn:
+    with connect(read_only=True) as conn:
         intent = _fetch_intent(conn, intent_id)
         receipt = _row_dict(conn.execute("SELECT * FROM memory_write_receipts WHERE intent_id=?", (intent_id,)).fetchone())
     if intent is None:
@@ -1034,16 +2511,261 @@ def show_intent(intent_id: str) -> dict[str, Any]:
     return {"intent": _public_intent(intent), "receipt": receipt}
 
 
+def inspect_intent(
+    intent_id: str,
+    *,
+    actor: str,
+    raw_session_id: str,
+) -> dict[str, Any]:
+    """Return one session-owned intent without changing SQLite sidecars."""
+
+    snapshot_before = side_effect_free_sqlite_fingerprint(STATE_DB)
+    with connect(read_only=True, side_effect_free=True) as conn:
+        intent = _fetch_intent(conn, intent_id)
+        if intent is None:
+            raise IntentError("INTENT_NOT_FOUND", f"write intent not found: {intent_id}")
+        _authorize_intent(intent, actor=actor, raw_session_id=raw_session_id)
+        receipt = _row_dict(
+            conn.execute(
+                "SELECT * FROM memory_write_receipts WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+        )
+    if side_effect_free_sqlite_fingerprint(STATE_DB) != snapshot_before:
+        raise StateSecurityError("SQLite snapshot changed during recovery query")
+    return {"intent": _public_intent(intent), "receipt": receipt}
+
+
+def _encode_recovery_cursor(updated_at: str, intent_id: str) -> str:
+    payload = json.dumps(
+        [updated_at, intent_id],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_recovery_cursor(cursor: str) -> tuple[str, str]:
+    value = str(cursor).strip()
+    if not value or len(value) > 512 or re.fullmatch(r"[A-Za-z0-9_-]+", value) is None:
+        raise IntentError("CURSOR_INVALID", "recovery cursor is invalid")
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("ascii"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise IntentError("CURSOR_INVALID", "recovery cursor is invalid") from exc
+    if (
+        not isinstance(decoded, list)
+        or len(decoded) != 2
+        or not all(isinstance(item, str) for item in decoded)
+        or parse_time(decoded[0]) is None
+        or re.fullmatch(r"[0-9a-f]{32}", decoded[1]) is None
+    ):
+        raise IntentError("CURSOR_INVALID", "recovery cursor is invalid")
+    return decoded[0], decoded[1]
+
+
+def list_session_intents(
+    *,
+    actor: str,
+    raw_session_id: str,
+    statuses: Sequence[str] = (),
+    limit: int = 50,
+    cursor: str = "",
+) -> dict[str, Any]:
+    """List bounded session-owned intents through a physical read-only open."""
+
+    hashed_session = session_hash(raw_session_id)
+    if not hashed_session:
+        raise IntentError("SESSION_REQUIRED", "session id is required")
+    if actor not in CANONICAL_WRITER_ACTORS:
+        raise IntentError("ACTOR_UNSUPPORTED", "actor is not supported")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or limit > 100:
+        raise IntentError("LIMIT_INVALID", "recovery list limit must be between 1 and 100")
+    normalized_statuses = tuple(
+        dict.fromkeys(str(item).strip().lower() for item in statuses)
+    )
+    allowed = set(ACTIVE_STATUSES) | set(TERMINAL_STATUSES)
+    if any(item not in allowed for item in normalized_statuses):
+        raise IntentError("STATUS_FILTER_INVALID", "recovery status filter is invalid")
+    params: list[Any] = [actor, hashed_session]
+    where = ["actor=?", "session_hash=?"]
+    if normalized_statuses:
+        placeholders = ",".join("?" for _ in normalized_statuses)
+        where.append(f"status IN ({placeholders})")
+        params.extend(normalized_statuses)
+    if cursor:
+        updated_at, cursor_intent_id = _decode_recovery_cursor(cursor)
+        where.append("(updated_at<? OR (updated_at=? AND intent_id<?))")
+        params.extend((updated_at, updated_at, cursor_intent_id))
+    params.append(limit + 1)
+    query = (
+        "SELECT * FROM memory_write_intents WHERE "
+        + " AND ".join(where)
+        + " ORDER BY updated_at DESC, intent_id DESC LIMIT ?"
+    )
+    snapshot_before = side_effect_free_sqlite_fingerprint(STATE_DB)
+    with connect(read_only=True, side_effect_free=True) as conn:
+        rows = [_row_dict(row) for row in conn.execute(query, params).fetchall()]
+        intents = [row for row in rows if row is not None]
+        page = intents[:limit]
+        receipts: dict[str, dict[str, Any] | None] = {}
+        for intent in page:
+            intent_id = str(intent["intent_id"])
+            receipts[intent_id] = _row_dict(
+                conn.execute(
+                    "SELECT * FROM memory_write_receipts WHERE intent_id=?",
+                    (intent_id,),
+                ).fetchone()
+            )
+    if side_effect_free_sqlite_fingerprint(STATE_DB) != snapshot_before:
+        raise StateSecurityError("SQLite snapshot changed during recovery query")
+    next_cursor = ""
+    if len(intents) > limit and page:
+        last = page[-1]
+        next_cursor = _encode_recovery_cursor(
+            str(last.get("updated_at", "")),
+            str(last.get("intent_id", "")),
+        )
+    return {
+        "items": [
+            {
+                "intent": _public_intent(intent),
+                "receipt": receipts.get(str(intent["intent_id"])),
+            }
+            for intent in page
+        ],
+        "next_cursor": next_cursor,
+    }
+
+
+def verify_terminal_receipt(
+    intent: dict[str, Any],
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify a terminal receipt against its intent, fence, hashes and Git blob."""
+
+    intent_id = str(intent.get("intent_id", ""))
+    expected_receipt_id = hashlib.sha256(
+        f"write-receipt:{intent_id}".encode("utf-8")
+    ).hexdigest()[:32]
+    string_fields = (
+        "intent_id",
+        "actor",
+        "session_hash",
+        "target_rel_path",
+        "target_key",
+        "base_raw_sha256",
+        "proposal_raw_sha256",
+        "proposal_canonical_sha256",
+        "final_raw_sha256",
+        "final_canonical_sha256",
+        "base_git_head",
+        "validated_git_head",
+        "validation_mode",
+        "proposal_commit",
+        "approval_binding_sha256",
+        "approval_ref_sha256",
+        "source_class",
+        "knowledge_kind",
+        "safety_decision",
+        "safety_reason_code",
+        "safety_input_sha256",
+        "evidence_ref_sha256",
+        "operation",
+        "target_status",
+        "transition_reason_sha256",
+    )
+    integer_fields = (
+        "writer_protocol_version",
+        "fencing_token",
+        "early_commit",
+        "safety_input_length",
+    )
+    try:
+        integer_fields_match = all(
+            int(receipt.get(field) or 0) == int(intent.get(field) or 0)
+            for field in integer_fields
+        )
+    except (TypeError, ValueError):
+        integer_fields_match = False
+    valid = (
+        re.fullmatch(r"[0-9a-f]{32}", intent_id) is not None
+        and hmac.compare_digest(str(receipt.get("receipt_id", "")), expected_receipt_id)
+        and all(
+            str(receipt.get(field, "")) == str(intent.get(field, ""))
+            for field in string_fields
+        )
+        and integer_fields_match
+        and hmac.compare_digest(
+            str(receipt.get("asserted_by_sha256", "")),
+            sha256_bytes(str(intent.get("asserted_by", "")).encode("utf-8"))
+            if intent.get("asserted_by")
+            else "",
+        )
+        and str(receipt.get("outcome", "")) == str(intent.get("status", ""))
+        and str(receipt.get("reason_code", "")) == str(intent.get("reason_code", ""))
+        and parse_time(str(receipt.get("created_at", ""))) is not None
+    )
+    if not valid or str(intent.get("status", "")) not in TERMINAL_STATUSES:
+        raise IntentError(
+            "RECEIPT_INTEGRITY_INVALID",
+            "terminal receipt does not match its intent",
+        )
+    git_commit = str(receipt.get("git_commit", ""))
+    git_blob_verified = False
+    if str(receipt.get("outcome", "")) == "completed":
+        if not git_commit or not hmac.compare_digest(_resolve_git_commit(git_commit), git_commit):
+            raise IntentError(
+                "RECEIPT_GIT_COMMIT_INVALID",
+                "completed receipt Git commit is invalid",
+            )
+        target = canonical_target(str(intent.get("target_rel_path", "")))
+        blob = _git_blob(git_commit, _repo_rel_path(target))
+        if blob is None:
+            raise IntentError(
+                "RECEIPT_GIT_BLOB_MISSING",
+                "completed receipt target blob is missing",
+            )
+        committed = content_hashes(blob, max_bytes=MAX_TARGET_BYTES)
+        if (
+            not hmac.compare_digest(
+                committed.raw_sha256,
+                str(receipt.get("final_raw_sha256", "")),
+            )
+            or not hmac.compare_digest(
+                committed.canonical_sha256,
+                str(receipt.get("final_canonical_sha256", "")),
+            )
+        ):
+            raise IntentError(
+                "RECEIPT_GIT_BLOB_MISMATCH",
+                "completed receipt Git blob does not match",
+            )
+        git_blob_verified = True
+    return {
+        "verified": True,
+        "git_blob_verified": git_blob_verified,
+        "receipt_id": str(receipt.get("receipt_id", "")),
+        "outcome": str(receipt.get("outcome", "")),
+        "reason_code": str(receipt.get("reason_code", "")),
+        "git_commit": git_commit,
+        "created_at": str(receipt.get("created_at", "")),
+    }
+
+
 def approve_intent(
     intent_id: str,
     *,
     actor: str,
     raw_session_id: str,
+    raw_task_id: str = "",
     target: str | Path,
     proposal_raw_sha256: str,
     proposal_canonical_sha256: str,
     approved_by: str,
     approval_ref: str,
+    confirmation_capability: object | None = None,
 ) -> dict[str, Any]:
     approved_by = _bounded_label(approved_by)
     if not approved_by:
@@ -1066,6 +2788,52 @@ def approve_intent(
             raise IntentError("APPROVAL_PROPOSAL_MISMATCH", "approval raw proposal hash does not match the intent")
         if proposal_canonical_sha256 != str(intent["proposal_canonical_sha256"]):
             raise IntentError("APPROVAL_PROPOSAL_MISMATCH", "approval proposal hash does not match the intent")
+        sensitive_confirmation = intent_requires_confirmation_capability(intent)
+        if sensitive_confirmation and str(intent["status"]) == "approved":
+            if not has_valid_confirmation_capability_approval(intent):
+                raise IntentError(
+                    "CONFIRMATION_CAPABILITY_INVALID",
+                    "sensitive intent has no valid capability-bound approval",
+                )
+            conn.commit()
+            payload = _public_intent(intent)
+            payload["idempotent"] = True
+            return payload
+        if sensitive_confirmation:
+            try:
+                import agent_memory_confirmation_capability as confirmation_protocol
+
+                capability_matches = confirmation_protocol.attests_to(
+                    confirmation_capability,
+                    subject_actor=actor,
+                    raw_task_id=raw_task_id,
+                    raw_session_id=raw_session_id,
+                    proposal_id=intent_id,
+                    proposal_raw_sha256=proposal_raw_sha256,
+                    proposal_canonical_sha256=proposal_canonical_sha256,
+                    target_relative_path=str(intent.get("target_rel_path", "")),
+                    target_key=str(intent.get("target_key", "")),
+                    operation=str(intent.get("operation", "content_update")),
+                    reconcile_action=str(intent.get("reconcile_action", "")),
+                    fencing_token=int(intent.get("fencing_token") or 0),
+                )
+                expected_reference = (
+                    confirmation_protocol.approval_reference(confirmation_capability)
+                    if capability_matches
+                    else ""
+                )
+            except (ImportError, RuntimeError, TypeError, ValueError):
+                capability_matches = False
+                expected_reference = ""
+            if (
+                not capability_matches
+                or approved_by != HUMAN_CONFIRMATION_CAPABILITY_APPROVER
+                or approval_ref != expected_reference
+            ):
+                raise IntentError(
+                    "CONFIRMATION_CAPABILITY_REQUIRED",
+                    "sensitive intent approval requires an exact consumed human capability",
+                )
         binding = _approval_binding(
             intent,
             approved_by,
@@ -1126,6 +2894,7 @@ def bind_claim(
     raw_session_id: str,
     claim_path: str | Path | None = None,
     claim_ref: str = "",
+    fencing_token: int | None = None,
     connection: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
     owns_connection = connection is None
@@ -1141,10 +2910,26 @@ def bind_claim(
         if snapshot is None:
             raise IntentError("INTENT_NOT_FOUND", f"write intent not found: {intent_id}")
         _authorize_intent(snapshot, actor=actor, raw_session_id=raw_session_id)
+        assert_current_lease(
+            intent_id,
+            actor=actor,
+            raw_session_id=raw_session_id,
+            fencing_token=fencing_token,
+            connection=conn,
+        )
         if str(snapshot["status"]) not in {"pending", "approved", "bound"}:
             raise IntentError("INTENT_NOT_BINDABLE", f"intent status cannot be bound: {snapshot['status']}")
         if _intent_expired(snapshot):
             terminal = ("expired", "INTENT_EXPIRED", "TTL_ELAPSED")
+        if (
+            terminal is None
+            and intent_requires_confirmation_capability(snapshot)
+            and not has_valid_confirmation_capability_approval(snapshot)
+        ):
+            raise IntentError(
+                "CONFIRMATION_CAPABILITY_REQUIRED",
+                "sensitive intent requires a capability-bound human approval before claim binding",
+            )
         if terminal is None and int(snapshot["approval_required"]):
             expected = _stored_approval_binding(snapshot)
             if not snapshot["approved_at"] or str(snapshot["approval_binding_sha256"]) != expected:
@@ -1153,11 +2938,24 @@ def bind_claim(
         if target.target_key != str(snapshot["target_key"]):
             raise IntentError("CLAIM_TARGET_MISMATCH", "claim path does not match the write intent")
         exists, current = _read_target(target)
-        stale = int(snapshot["base_exists"]) != int(exists) or current.raw_sha256 != str(snapshot["base_raw_sha256"])
+        reconcile_action = str(snapshot.get("reconcile_action", "")).upper()
+        proposal_already_written = (
+            exists
+            and current.raw_sha256 == str(snapshot["proposal_raw_sha256"])
+        )
+        stale = (
+            int(snapshot["base_exists"]) != int(exists)
+            or current.raw_sha256 != str(snapshot["base_raw_sha256"])
+        )
         current_head = current_git_head(required=True)
         history = git_version_chain(str(snapshot["base_git_head"]), current_head, target)
         if not history["ok"] or history["versions"]:
             stale = True
+        if reconcile_action == "ADOPT" and proposal_already_written and not history["versions"]:
+            # ADOPT deliberately binds an already-written external worktree
+            # version. It may bypass only the content-vs-HEAD base check; Git
+            # ancestry and every later approval/fence/hash check still apply.
+            stale = not bool(history["ok"])
         if terminal is None and stale:
             terminal = (
                 "failed",
@@ -1259,6 +3057,70 @@ def _write_validation_failure(
     )
 
 
+def _terminalize_validated_content_drift(
+    intent_id: str,
+    *,
+    actor: str,
+    raw_session_id: str,
+    target_key: str,
+    fencing_token: int,
+    require_bound: bool,
+) -> dict[str, Any]:
+    """Fail a drifted validated intent and release its exact claim atomically.
+
+    The already-validated hashes remain immutable audit evidence. In
+    particular, this helper never overwrites them with the externally changed
+    bytes. The worktree is also left untouched so a later explicit ADOPT can
+    acquire the next fencing token.
+    """
+
+    now = utc_now()
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = _fetch_intent(conn, intent_id)
+        if current is None:
+            raise IntentError("INTENT_NOT_FOUND", f"write intent not found: {intent_id}")
+        if str(current.get("status", "")) != "validated":
+            raise IntentError("INTENT_STATE_CHANGED", "validated intent changed during drift finalization")
+        if (
+            str(current.get("target_key", "")) != target_key
+            or int(current.get("fencing_token") or 0) != int(fencing_token)
+        ):
+            raise IntentError("LEASE_FENCED", "validated intent no longer owns the expected path fence")
+        assert_current_lease(
+            intent_id,
+            actor=actor,
+            raw_session_id=raw_session_id,
+            fencing_token=fencing_token,
+            target=str(current["target_rel_path"]),
+            require_unexpired=True,
+            connection=conn,
+        )
+        receipt = finalize_receipt(
+            intent_id,
+            actor=actor,
+            raw_session_id=raw_session_id,
+            outcome="failed",
+            reason_code="VALIDATED_CONTENT_CHANGED",
+            detail_code="RAW_BYTES_DRIFTED_AFTER_VALIDATION",
+            fencing_token=fencing_token,
+            connection=conn,
+            commit=False,
+        )
+        cursor = conn.execute(
+            "UPDATE memory_session_claims SET status='expired', completed_at=?, updated_at=? "
+            "WHERE status='active' AND intent_id=? AND target_key=? AND fencing_token=?",
+            (now, now, intent_id, target_key, fencing_token),
+        )
+        if require_bound and cursor.rowcount != 1:
+            raise IntentError(
+                "CLAIM_PROJECTION_MISMATCH",
+                "validated path lease has no exact active claim projection",
+            )
+        conn.commit()
+    return receipt
+
+
 def validate_closeout(
     intent_id: str,
     *,
@@ -1277,6 +3139,18 @@ def validate_closeout(
     if snapshot is None:
         raise IntentError("INTENT_NOT_FOUND", f"write intent not found: {intent_id}")
     _authorize_intent(snapshot, actor=actor, raw_session_id=raw_session_id)
+    if str(snapshot["status"]) in ACTIVE_STATUSES:
+        try:
+            assert_current_lease(
+                intent_id,
+                actor=actor,
+                raw_session_id=raw_session_id,
+                fencing_token=int(snapshot.get("fencing_token") or 0),
+                target=target or str(snapshot["target_rel_path"]),
+                require_unexpired=False,
+            )
+        except IntentError as exc:
+            return {"ok": False, "reason_code": exc.reason_code, "receipt": None, "mutated": False}
     canonical = canonical_target(target or str(snapshot["target_rel_path"]))
     if canonical.target_key != str(snapshot["target_key"]):
         return {"ok": False, "reason_code": "INTENT_TARGET_MISMATCH", "receipt": None, "mutated": False}
@@ -1286,7 +3160,7 @@ def validate_closeout(
             exists
             and completed_receipt is not None
             and str(completed_receipt["outcome"]) == "completed"
-            and final.canonical_sha256 == str(snapshot["final_canonical_sha256"])
+            and final.raw_sha256 == str(snapshot["final_raw_sha256"])
         ):
             return {
                 "ok": True,
@@ -1304,7 +3178,7 @@ def validate_closeout(
         raise IntentError("COMPLETED_CONTENT_CHANGED", "target no longer matches the completed write receipt")
     if str(snapshot["status"]) == "validated":
         exists, final = _read_target(canonical)
-        if final.canonical_sha256 == str(snapshot["final_canonical_sha256"]):
+        if exists and final.raw_sha256 == str(snapshot["final_raw_sha256"]):
             early_commit = bool(snapshot["early_commit"])
             proposal_commit = str(snapshot["proposal_commit"])
             version_chain: list[dict[str, Any]] = []
@@ -1344,7 +3218,25 @@ def validate_closeout(
                 "mutated": bool(mutate and version_chain),
                 "version_chain": version_chain,
             }
-        raise IntentError("VALIDATED_CONTENT_CHANGED", "target changed after closeout validation")
+        receipt = None
+        if mutate:
+            # Preserve the externally changed bytes. Terminalize only the lease
+            # and its exact claim projection so a subsequent explicit ADOPT may
+            # acquire a newer fence instead of being stranded behind validated.
+            receipt = _terminalize_validated_content_drift(
+                intent_id,
+                actor=actor,
+                raw_session_id=raw_session_id,
+                target_key=str(snapshot["target_key"]),
+                fencing_token=int(snapshot.get("fencing_token") or 0),
+                require_bound=require_bound,
+            )
+        return {
+            "ok": False,
+            "reason_code": "VALIDATED_CONTENT_CHANGED",
+            "receipt": receipt,
+            "mutated": mutate,
+        }
     if str(snapshot["status"]) not in {"pending", "approved", "bound"}:
         raise IntentError("INTENT_NOT_VALIDATABLE", f"intent status cannot be validated: {snapshot['status']}")
     if _intent_expired(snapshot):
@@ -1360,6 +3252,16 @@ def validate_closeout(
         return {"ok": False, "reason_code": "INTENT_EXPIRED", "receipt": receipt, "mutated": mutate}
     if require_bound and str(snapshot["status"]) != "bound":
         return {"ok": False, "reason_code": "CLAIM_NOT_BOUND", "receipt": None, "mutated": False}
+    if (
+        intent_requires_confirmation_capability(snapshot)
+        and not has_valid_confirmation_capability_approval(snapshot)
+    ):
+        return {
+            "ok": False,
+            "reason_code": "CONFIRMATION_CAPABILITY_INVALID",
+            "receipt": None,
+            "mutated": False,
+        }
     if int(snapshot["approval_required"]):
         expected_binding = _stored_approval_binding(snapshot)
         if not snapshot["approved_at"] or str(snapshot["approval_binding_sha256"]) != expected_binding:
@@ -1540,12 +3442,28 @@ def finalize_receipt(
     reason_code: str = "",
     git_commit: str = "",
     detail_code: str = "",
+    fencing_token: int | None = None,
+    connection: sqlite3.Connection | None = None,
+    commit: bool = True,
 ) -> dict[str, Any]:
+    """Finalize one intent, optionally as part of a caller-owned transaction.
+
+    When ``connection`` is supplied with ``commit=False``, this function never
+    commits or rolls back. That lets closeout atomically persist the receipt,
+    latest file observation, and claim projection in one ``BEGIN IMMEDIATE``.
+    """
+
     outcome = outcome.strip().lower()
     if outcome not in {"completed", "failed", "cancelled", "expired"}:
         raise IntentError("OUTCOME_INVALID", f"unsupported receipt outcome: {outcome}")
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+    owns_connection = connection is None
+    conn = connect() if owns_connection else connection
+    if conn is None:
+        raise IntentError("STATE_DB_UNAVAILABLE", "intent state connection is unavailable")
+    result: dict[str, Any] | None = None
+    try:
+        if owns_connection:
+            conn.execute("BEGIN IMMEDIATE")
         intent = _row_dict(
             conn.execute("SELECT * FROM memory_write_intents WHERE intent_id=?", (intent_id,)).fetchone()
         )
@@ -1561,10 +3479,28 @@ def finalize_receipt(
                     "RECEIPT_OUTCOME_CONFLICT",
                     "an existing terminal receipt has a different outcome",
                 )
-            conn.commit()
+            if fencing_token is not None and int(existing.get("fencing_token") or 0) != int(fencing_token):
+                raise IntentError("LEASE_FENCED", "terminal receipt belongs to a different path fence")
+            if owns_connection or commit:
+                conn.commit()
             existing["idempotent"] = True
             existing["requested_outcome_mismatch"] = False
             return existing
+        if str(intent["status"]) in ACTIVE_STATUSES:
+            assert_current_lease(
+                intent_id,
+                actor=actor,
+                raw_session_id=raw_session_id,
+                fencing_token=(
+                    int(fencing_token)
+                    if fencing_token is not None
+                    else int(intent.get("fencing_token") or 0)
+                ),
+                require_unexpired=outcome != "expired",
+                connection=conn,
+            )
+        elif fencing_token is not None and int(intent.get("fencing_token") or 0) != int(fencing_token):
+            raise IntentError("LEASE_FENCED", "terminal intent belongs to a different path fence")
         if outcome == "completed" and str(intent["status"]) != "validated":
             raise IntentError("INTENT_NOT_VALIDATED", "a successful receipt requires a validated intent")
         resolved_commit = ""
@@ -1580,7 +3516,8 @@ def finalize_receipt(
             committed_digest = content_hashes(blob, max_bytes=MAX_TARGET_BYTES) if blob is not None else None
             if (
                 committed_digest is None
-                or committed_digest.canonical_sha256 != str(intent["final_canonical_sha256"])
+                or committed_digest.canonical_sha256
+                != str(intent["final_canonical_sha256"])
             ):
                 raise IntentError(
                     "COMMIT_BLOB_MISMATCH",
@@ -1592,11 +3529,34 @@ def finalize_receipt(
             reason_code,
             default="WRITE_COMPLETED" if outcome == "completed" else outcome.upper(),
         )
+        recovery_pending = (
+            str(intent.get("reason_code", ""))
+            in {
+                EXPIRED_VALIDATED_RECOVERY_REASON,
+                EXPIRED_VALIDATED_RECOVERY_REPAIR_REASON,
+            }
+        )
+        if outcome == "completed" and recovery_pending:
+            if effective_reason not in {
+                "WRITE_COMPLETED",
+                EXPIRED_VALIDATED_RECOVERY_COMPLETED_REASON,
+            }:
+                raise IntentError(
+                    "EXPIRED_VALIDATED_RECOVERY_COMPLETION_INVALID",
+                    "expired validated recovery must retain its terminal audit marker",
+                )
+            effective_reason = EXPIRED_VALIDATED_RECOVERY_COMPLETED_REASON
+        elif effective_reason == EXPIRED_VALIDATED_RECOVERY_COMPLETED_REASON:
+            raise IntentError(
+                "EXPIRED_VALIDATED_RECOVERY_COMPLETION_INVALID",
+                "the expired validated recovery terminal marker is reserved",
+            )
         effective_detail = _safe_code(detail_code)
         conn.execute(
             """
             INSERT INTO memory_write_receipts (
-              receipt_id, intent_id, actor, session_hash, target_rel_path, target_key,
+              receipt_id, intent_id, writer_protocol_version, actor, session_hash,
+              target_rel_path, target_key, fencing_token,
               outcome, reason_code, validation_mode, base_raw_sha256,
               proposal_raw_sha256, proposal_canonical_sha256, final_raw_sha256,
               final_canonical_sha256, base_git_head, validated_git_head, git_commit,
@@ -1604,16 +3564,19 @@ def finalize_receipt(
               approval_ref_sha256, source_class, knowledge_kind,
               asserted_by_sha256, safety_decision, safety_reason_code,
               safety_input_sha256, safety_input_length, evidence_ref_sha256,
+              operation, target_status, transition_reason_sha256,
               detail_code, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 receipt_id,
                 intent_id,
+                intent["writer_protocol_version"],
                 intent["actor"],
                 intent["session_hash"],
                 intent["target_rel_path"],
                 intent["target_key"],
+                intent["fencing_token"],
                 outcome,
                 effective_reason,
                 intent["validation_mode"],
@@ -1637,6 +3600,9 @@ def finalize_receipt(
                 intent["safety_input_sha256"],
                 intent["safety_input_length"],
                 intent["evidence_ref_sha256"],
+                intent["operation"],
+                intent["target_status"],
+                intent["transition_reason_sha256"],
                 effective_detail,
                 now,
             ),
@@ -1645,14 +3611,33 @@ def finalize_receipt(
             "UPDATE memory_write_intents SET status=?, reason_code=?, updated_at=? WHERE intent_id=?",
             (outcome, effective_reason, now, intent_id),
         )
-        conn.commit()
-    result = show_intent(intent_id)["receipt"] or {}
+        result = _row_dict(
+            conn.execute("SELECT * FROM memory_write_receipts WHERE intent_id=?", (intent_id,)).fetchone()
+        )
+        if owns_connection or commit:
+            conn.commit()
+    except Exception:
+        if (owns_connection or commit) and conn.in_transaction:
+            conn.rollback()
+        raise
+    finally:
+        if owns_connection:
+            conn.close()
+    if result is None:
+        raise IntentError("RECEIPT_WRITE_FAILED", "terminal receipt was not persisted")
     result["idempotent"] = False
     result["requested_outcome_mismatch"] = False
     return result
 
 
-def cancel_intent(intent_id: str, *, actor: str, raw_session_id: str, reason_code: str = "CANCELLED_BY_ACTOR") -> dict[str, Any]:
+def cancel_intent(
+    intent_id: str,
+    *,
+    actor: str,
+    raw_session_id: str,
+    reason_code: str = "CANCELLED_BY_ACTOR",
+    fencing_token: int | None = None,
+) -> dict[str, Any]:
     intent = show_intent(intent_id)["intent"]
     _authorize_intent(intent, actor=actor, raw_session_id=raw_session_id)
     if str(intent["status"]) not in ACTIVE_STATUSES:
@@ -1663,12 +3648,13 @@ def cancel_intent(intent_id: str, *, actor: str, raw_session_id: str, reason_cod
         raw_session_id=raw_session_id,
         outcome="cancelled",
         reason_code=_bounded_label(reason_code),
+        fencing_token=fencing_token,
     )
 
 
 def expire_intents(*, now: dt.datetime | None = None, apply: bool = False) -> dict[str, Any]:
     current = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
-    with connect() as conn:
+    with connect(read_only=not apply) as conn:
         rows = conn.execute(
             "SELECT intent_id, actor, session_hash, target_rel_path, expires_at FROM memory_write_intents "
             "WHERE status IN ('pending','approved','bound','validated') ORDER BY expires_at"
@@ -1702,7 +3688,8 @@ def expire_intents(*, now: dt.datetime | None = None, apply: bool = False) -> di
                 conn.execute(
                     """
                     INSERT INTO memory_write_receipts (
-                      receipt_id, intent_id, actor, session_hash, target_rel_path, target_key,
+                      receipt_id, intent_id, writer_protocol_version, actor, session_hash,
+                      target_rel_path, target_key, fencing_token,
                       outcome, reason_code, validation_mode, base_raw_sha256,
                       proposal_raw_sha256, proposal_canonical_sha256, final_raw_sha256,
                       final_canonical_sha256, base_git_head, validated_git_head, git_commit,
@@ -1710,12 +3697,14 @@ def expire_intents(*, now: dt.datetime | None = None, apply: bool = False) -> di
                       approval_ref_sha256, source_class, knowledge_kind,
                       asserted_by_sha256, safety_decision, safety_reason_code,
                       safety_input_sha256, safety_input_length, evidence_ref_sha256,
+                      operation, target_status, transition_reason_sha256,
                       detail_code, created_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
-                        receipt_id, intent["intent_id"], intent["actor"], intent["session_hash"],
-                        intent["target_rel_path"], intent["target_key"], "expired", "INTENT_EXPIRED",
+                        receipt_id, intent["intent_id"], intent["writer_protocol_version"],
+                        intent["actor"], intent["session_hash"], intent["target_rel_path"],
+                        intent["target_key"], intent["fencing_token"], "expired", "INTENT_EXPIRED",
                         intent["validation_mode"], intent["base_raw_sha256"], intent["proposal_raw_sha256"],
                         intent["proposal_canonical_sha256"], intent["final_raw_sha256"],
                         intent["final_canonical_sha256"], intent["base_git_head"],
@@ -1726,7 +3715,9 @@ def expire_intents(*, now: dt.datetime | None = None, apply: bool = False) -> di
                         sha256_bytes(str(intent["asserted_by"]).encode("utf-8")) if intent["asserted_by"] else "",
                         intent["safety_decision"], intent["safety_reason_code"],
                         intent["safety_input_sha256"], intent["safety_input_length"],
-                        intent["evidence_ref_sha256"], "TTL_ELAPSED", timestamp,
+                        intent["evidence_ref_sha256"], intent["operation"],
+                        intent["target_status"], intent["transition_reason_sha256"],
+                        "TTL_ELAPSED", timestamp,
                     ),
                 )
                 conn.execute(
@@ -1734,6 +3725,18 @@ def expire_intents(*, now: dt.datetime | None = None, apply: bool = False) -> di
                     "WHERE intent_id=?",
                     (timestamp, intent["intent_id"]),
                 )
+                if _table_exists(conn, "memory_session_claims"):
+                    conn.execute(
+                        "UPDATE memory_session_claims SET status='expired', completed_at=?, updated_at=? "
+                        "WHERE status='active' AND intent_id=? AND target_key=? AND fencing_token=?",
+                        (
+                            timestamp,
+                            timestamp,
+                            str(intent["intent_id"]),
+                            str(intent["target_key"]),
+                            int(intent["fencing_token"] or 0),
+                        ),
+                    )
                 conn.commit()
                 applied += 1
     return {"expired": expired, "count": len(expired), "applied": applied}
@@ -1752,6 +3755,8 @@ def _normalized_patterns(patterns: Sequence[str] | None = None) -> tuple[str, ..
 
 def is_protected_target(target: str | Path, *, protected_paths: Sequence[str] | None = None) -> bool:
     canonical = canonical_target(target)
+    if protected_paths is None and FULL_VAULT_GATEWAY:
+        return True
     for pattern in _normalized_patterns(protected_paths):
         if pattern.endswith("/") and canonical.target_key.startswith(pattern):
             return True
@@ -1876,7 +3881,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create and verify Agent Memory write intents and receipts.")
     parser.add_argument(
         "--actor",
-        choices=("codex", "claude", "human", "migration", "test", "yichen-content-studio"),
+        choices=("codex", "claude", "human", "migration", "test", "ailu"),
         default="codex",
     )
     parser.add_argument("--session-id", default="")
@@ -1910,6 +3915,11 @@ def parse_args() -> argparse.Namespace:
     bind.add_argument("--target")
     bind.add_argument("--claim-ref", default="")
 
+    renew = subparsers.add_parser("renew")
+    renew.add_argument("--intent-id", required=True)
+    renew.add_argument("--fencing-token", type=int, required=True)
+    renew.add_argument("--ttl-hours", type=float, default=None)
+
     validate = subparsers.add_parser("validate")
     validate.add_argument("--intent-id", required=True)
     validate.add_argument("--target")
@@ -1920,15 +3930,19 @@ def parse_args() -> argparse.Namespace:
         help="Show a bounded, secret-redacted mismatch diff. Default output contains hashes and counts only.",
     )
 
-    finalize = subparsers.add_parser("finalize")
+    finalize = subparsers.add_parser(
+        "finalize",
+        help="Record a non-success terminal outcome; completed is internal to atomic closeout.",
+    )
     finalize.add_argument("--intent-id", required=True)
-    finalize.add_argument("--outcome", choices=("completed", "failed", "cancelled", "expired"), default="completed")
+    finalize.add_argument("--outcome", choices=("failed", "cancelled", "expired"), required=True)
     finalize.add_argument("--reason-code", default="")
     finalize.add_argument("--git-commit", default="")
     finalize.add_argument("--detail-code", default="")
 
     cancel = subparsers.add_parser("cancel")
     cancel.add_argument("--intent-id", required=True)
+    cancel.add_argument("--fencing-token", type=int, required=True)
     cancel.add_argument("--reason-code", default="CANCELLED_BY_ACTOR")
 
     expire = subparsers.add_parser("expire")
@@ -1936,26 +3950,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def enforce_low_level_cli_policy(actor: str, action: str) -> None:
+    if actor in CANONICAL_WRITER_ACTORS and action != "show":
+        raise IntentError(
+            "LOW_LEVEL_GATEWAY_MUTATION_FORBIDDEN",
+            f"{actor} must mutate memory through write read-target/prepare/apply/cancel",
+        )
+
+
 def main() -> int:
     args = parse_args()
     raw_session_id = _session_value(args.session_id, args.actor)
     try:
-        if args.actor == "yichen-content-studio" and args.action == "create":
-            raise IntentError(
-                "STUDIO_LOW_LEVEL_API_FORBIDDEN",
-                "yichen-content-studio must use the high-level write prepare/apply protocol",
-            )
+        assert_runtime_ready("intent")
+        enforce_low_level_cli_policy(args.actor, args.action)
         if args.action == "create":
-            if args.actor == "yichen-content-studio" and args.asserted_by not in {
-                "user",
-                "claude",
-                "codex",
-                "opencode",
-            }:
-                raise IntentError(
-                    "ASSERTED_BY_UNSUPPORTED",
-                    "yichen-content-studio must identify the factual asserter as user, claude, codex, or opencode",
-                )
             payload: Any = create_intent(
                 actor=args.actor,
                 raw_session_id=raw_session_id,
@@ -1990,6 +3999,14 @@ def main() -> int:
                 claim_path=args.target,
                 claim_ref=args.claim_ref,
             )
+        elif args.action == "renew":
+            payload = renew_lease(
+                args.intent_id,
+                actor=args.actor,
+                raw_session_id=raw_session_id,
+                fencing_token=args.fencing_token,
+                ttl_hours=args.ttl_hours,
+            )
         elif args.action == "validate":
             payload = validate_closeout(
                 args.intent_id,
@@ -2000,6 +4017,11 @@ def main() -> int:
                 include_private_diff=args.show_private_diff,
             )
         elif args.action == "finalize":
+            if args.outcome == "completed":
+                raise IntentError(
+                    "COMPLETED_FINALIZE_INTERNAL_ONLY",
+                    "completed receipts are emitted only by atomic closeout batch finalization",
+                )
             payload = finalize_receipt(
                 args.intent_id,
                 actor=args.actor,
@@ -2015,11 +4037,18 @@ def main() -> int:
                 actor=args.actor,
                 raw_session_id=raw_session_id,
                 reason_code=args.reason_code,
+                fencing_token=args.fencing_token,
             )
         else:
             payload = expire_intents(apply=args.apply)
-    except (IntentError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
-        error = {"ok": False, "reason_code": getattr(exc, "reason_code", "INTENT_ERROR"), "error": str(exc)}
+    except (IntentError, OSError, sqlite3.Error, subprocess.SubprocessError, RuntimeError) as exc:
+        reason_code = getattr(exc, "reason_code", "INTENT_ERROR")
+        error = {
+            "ok": False,
+            "reason_code": reason_code,
+            "error": str(exc),
+            "degraded": reason_code == STATE_SCHEMA_REASON_CODE,
+        }
         if args.json:
             print(json.dumps(error, ensure_ascii=False, indent=2))
         else:

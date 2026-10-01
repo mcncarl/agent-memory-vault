@@ -53,7 +53,8 @@ class AgentMemoryEnvironmentTests(unittest.TestCase):
                 config = Path(raw_root) / "agent-memory.toml"
                 config.write_text(
                     'memory_root = "/configured/vault"\n'
-                    '[semantic_retrieval]\npython = "/configured/vector/python"\n',
+                    '[semantic_retrieval]\npython = "/configured/vector/python"\n'
+                    '[observability]\nenabled = true\n',
                     encoding="utf-8",
                 )
                 with mock.patch.dict(
@@ -64,6 +65,7 @@ class AgentMemoryEnvironmentTests(unittest.TestCase):
                     reset_config_cache()
                     self.assertEqual(env_value("ROOT", "/default"), "/configured/vault")
                     self.assertEqual(env_value("ZVEC_PYTHON", "python3"), "/configured/vector/python")
+                    self.assertEqual(env_value("OBSERVABILITY_ENABLED", "false"), "True")
         reset_config_cache()
 
     def test_python_without_tomllib_parses_multiline_protected_paths(self) -> None:

@@ -5,28 +5,37 @@ project_id: agent-memory-vault-closeout
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
+agent_scope: shared
 session_id: ""
 status: active
+risk_class: ordinary
 sensitivity: normal
-verified_at: 2026-06-20
+temporal_policy: reviewable
+review_after_days: 180
 keywords:
   - closeout
   - memory
+  - 对话结束
+  - 自动归档
+  - 记忆收尾
+  - 对话结束归档
 ---
 
 # Agent 记忆收尾决策规则
 
 ## 当前有效摘要
 
-普通记忆不设候选池。每次重要任务结束时，由 Agent 判断是否有稳定事实需要直接写入正式目录；写入前先对账，写入后用 closeout 自动整理。
+普通记忆不设候选池。“对话结束”“自动归档”“记忆收尾”和“对话结束归档”都指向同一套 closeout 流程。每次重要任务结束时，由 Agent 判断是否有稳定事实需要直接写入正式目录；写入前先对账，写入后用 closeout 自动整理。
+
+- 真实用户表达别名：对话结束、自动归档、记忆收尾、对话结束归档、Codex 每次对话结束怎么自动归档。
 
 ## 写入前对账
 
 写入前先运行：
 
 ```bash
-python3 scripts/agent_memory_closeout.py \
-  --prewrite "准备写入的记忆摘要" \
+<runtime>/.venv/bin/python -I -S <runtime>/scripts/memoryctl \
+  --actor codex prewrite "准备写入的记忆摘要" \
   --source-class user_direct \
   --knowledge-kind fact \
   --asserted-by human \
@@ -82,8 +91,8 @@ python3 scripts/agent_memory_closeout.py \
 写完记忆后优先运行统一 closeout：
 
 ```bash
-python3 scripts/agent_memory_closeout.py --dry-run
-python3 scripts/agent_memory_closeout.py --commit
+<runtime>/.venv/bin/python -I -S <runtime>/scripts/memoryctl --actor codex closeout --dry-run
+<runtime>/.venv/bin/python -I -S <runtime>/scripts/memoryctl --actor codex closeout
 ```
 
 它会自动完成：
@@ -94,7 +103,7 @@ python3 scripts/agent_memory_closeout.py --commit
 - 刷新 SQLite 索引。
 - 可选刷新 Zvec 语义索引。
 - 必要时刷新 Agent evolution。
-- audit 超过间隔时自动捎带运行。
+- 不运行或重排周审计；周审计始终由周日 10:30 的唯一调度器负责。
 - 写入 closeout 日志。
 - 只提交本轮处理过的记忆文件。
 
@@ -105,7 +114,7 @@ python3 scripts/agent_memory_closeout.py --commit
 audit 负责发现需要复核、合并或忽略的记忆，不直接修改 Markdown。
 
 ```bash
-python3 scripts/agent_memory_audit.py
-python3 scripts/agent_memory_audit.py --ignore FINDING_ID --note "保留原因"
-python3 scripts/agent_memory_audit_autorun.py --reason closeout --min-interval-days 7
+<runtime>/.venv/bin/python -I -S <runtime>/scripts/memoryctl --actor human audit --json
+<runtime>/.venv/bin/python -I -S <runtime>/scripts/memoryctl --actor human audit --ignore FINDING_ID --note "保留原因" --json
+<runtime>/.venv/bin/python -I -S <runtime>/scripts/memoryctl --actor human audit-autorun --reason manual --json
 ```

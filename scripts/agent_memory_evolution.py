@@ -10,7 +10,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_memory_env import env_value, expand_path
+from agent_memory_env import RuntimeTransitionError, assert_runtime_ready, env_value, expand_path
 from agent_memory_state import absolute_path, secure_sqlite_connect
 
 
@@ -153,6 +153,7 @@ def iter_agent_memories() -> list[AgentMemory]:
 
 
 def connect() -> sqlite3.Connection:
+    assert_runtime_ready("evolution")
     return secure_sqlite_connect(
         STATE_DB,
         pragmas=("PRAGMA journal_mode=WAL", "PRAGMA foreign_keys=ON"),
@@ -209,6 +210,42 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("agent_evolution_schema_version", "1"))
+
+
+def assert_schema_ready(conn: sqlite3.Connection) -> None:
+    """Verify installer-owned evolution schema without performing DDL."""
+
+    required = {
+        "memory_files": {
+            "path", "sha256", "memory_type", "status", "case_key", "task_type",
+            "promotion_state", "reuse_count", "evidence_count", "risk_flags",
+            "last_seen", "title", "scanned_at",
+        },
+        "agent_case_state": {
+            "case_key", "task_type", "candidate_count", "active_count",
+            "skill_candidate_count", "total_reuse_count", "total_evidence_count",
+            "risk_flags", "last_seen", "recommendation", "updated_at",
+        },
+        "reminders": {"id", "case_key", "kind", "message", "status", "created_at", "resolved_at"},
+    }
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    version = (
+        conn.execute("SELECT value FROM meta WHERE key='agent_evolution_schema_version'").fetchone()
+        if "meta" in tables
+        else None
+    )
+    columns_ready = all(
+        table in tables
+        and columns.issubset(
+            {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        )
+        for table, columns in required.items()
+    )
+    if version is None or str(version[0]) != "1" or not columns_ready:
+        raise sqlite3.OperationalError("STATE_SCHEMA_MIGRATION_REQUIRED")
 
 
 def upsert_file(conn: sqlite3.Connection, memory: AgentMemory, scanned_at: str) -> None:
@@ -365,14 +402,30 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    try:
+        transition = assert_runtime_ready("evolution")
+    except RuntimeTransitionError as exc:
+        print(str(exc))
+        return 2
     if not (args.init or args.scan or args.report):
         args.init = True
         args.scan = True
         args.report = True
 
     with connect() as conn:
-        if args.init or args.scan:
-            init_db(conn)
+        try:
+            if args.init:
+                if transition.get("maintenance_capability"):
+                    init_db(conn)
+                else:
+                    assert_schema_ready(conn)
+            if args.scan:
+                assert_schema_ready(conn)
+        except sqlite3.OperationalError as exc:
+            if str(exc) == "STATE_SCHEMA_MIGRATION_REQUIRED":
+                print("STATE_SCHEMA_MIGRATION_REQUIRED")
+                return 2
+            raise
         if args.scan:
             scanned_at = utc_now()
             memories = iter_agent_memories()

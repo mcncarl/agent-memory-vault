@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agent_memory_state import secure_sqlite_connect
+from agent_memory_state import STATE_SCHEMA_VERSION, secure_sqlite_connect
 
 
 SOURCE_CLASSES = {
@@ -146,28 +146,52 @@ def record_assessment(
     trigger: str,
 ) -> int:
     """Persist a content-free audit row. Candidate text and evidence never enter SQLite."""
-    with secure_sqlite_connect(state_db, timeout=10) as conn:
+    if not state_db.exists():
+        raise sqlite3.OperationalError("STATE_SCHEMA_MIGRATION_REQUIRED")
+    with secure_sqlite_connect(state_db, timeout=10, create=False) as conn:
         conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS memory_safety_log (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              run_id TEXT NOT NULL UNIQUE,
-              actor TEXT NOT NULL,
-              session_hash TEXT NOT NULL DEFAULT '',
-              trigger TEXT NOT NULL,
-              decision TEXT NOT NULL,
-              reason_code TEXT NOT NULL,
-              source_class TEXT NOT NULL,
-              knowledge_kind TEXT NOT NULL,
-              asserted_by TEXT NOT NULL DEFAULT '',
-              input_sha256 TEXT NOT NULL,
-              input_length INTEGER NOT NULL,
-              evidence_ref_sha256 TEXT NOT NULL DEFAULT '',
-              created_at TEXT NOT NULL
-            )
-            """
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        required_columns = {
+            "id",
+            "run_id",
+            "actor",
+            "session_hash",
+            "trigger",
+            "decision",
+            "reason_code",
+            "source_class",
+            "knowledge_kind",
+            "asserted_by",
+            "input_sha256",
+            "input_length",
+            "evidence_ref_sha256",
+            "created_at",
+        }
+        actual_columns = (
+            {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(memory_safety_log)")
+            }
+            if "memory_safety_log" in tables
+            else set()
         )
+        state_version = (
+            conn.execute(
+                "SELECT value FROM meta WHERE key='agent_memory_state_schema_version'"
+            ).fetchone()
+            if "meta" in tables
+            else None
+        )
+        if (
+            "memory_safety_log" not in tables
+            or not required_columns.issubset(actual_columns)
+            or state_version is None
+            or str(state_version[0]) != str(STATE_SCHEMA_VERSION)
+        ):
+            raise sqlite3.OperationalError("STATE_SCHEMA_MIGRATION_REQUIRED")
         cursor = conn.execute(
             """
             INSERT INTO memory_safety_log (

@@ -2,34 +2,110 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import datetime as dt
 import hashlib
+import json
 import os
 import re
 import sqlite3
+import stat
+import subprocess
+import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from agent_memory_env import env_value, expand_path
+from agent_memory_env import RuntimeTransitionError, assert_runtime_ready, env_value, expand_path
+from agent_memory_generated_index_capability import (
+    GeneratedIndexCapabilityError,
+    bind_expected_generated_index_sha256,
+    bind_generated_index_recovery_evidence,
+    consume_generated_index_capability_from_environment,
+    generated_index_backup_directory,
+)
 import agent_memory_intent
+import agent_memory_observability
 from agent_memory_state import absolute_path, secure_sqlite_connect
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_VAULT_ROOT = REPO_ROOT / "templates" / "vault"
 VAULT_ROOT = expand_path(env_value("ROOT", str(DEFAULT_VAULT_ROOT))).resolve()
+CONFIG_ROOT = expand_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory")).resolve()
+GIT_ROOT = expand_path(env_value("GIT_ROOT", str(VAULT_ROOT))).resolve()
 STATE_DB = absolute_path(expand_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite")))
 DEFAULT_USER_ID = env_value("USER_ID", "demo-user")
 DEFAULT_AGENT_ID = env_value("AGENT_ID", "shared")
 DEFAULT_APP_ID = env_value("APP_ID", "agent-memory")
 DEFAULT_LIMIT = 5
+INDEX_SCHEMA_VERSION = "13"
+GENERATED_INDEX_MARKER = "<!-- agent-memory-generated-index:v1 -->"
+GENERATED_INDEX_ENTRY_RE = re.compile(r"^- `(?P<rel_path>[^`\r\n]+\.md)`:")
+TEMPORAL_POLICIES = {"structural", "snapshot", "stable", "reviewable", "expiring"}
+FORMAL_BODY_TOP_LEVELS = {"用户记忆", "项目", "工作流", "决策", "agent"}
+GOVERNANCE_MIGRATION_STATUSES = {
+    "active",
+    "pending_verification",
+    "outdated",
+    "archived",
+    "candidate",
+}
+FACT_LINEAGE_SOURCE_STATUSES = frozenset({
+    "active",
+    "pending_verification",
+    "outdated",
+    "archived",
+})
+PROTECTED_FRONTMATTER_KEYS = frozenset({
+    "memory_id",
+    "memory_type",
+    "track",
+    "app_id",
+    "project_id",
+    "user_id",
+    "agent_id",
+    "agent_scope",
+    "session_id",
+    "status",
+    "sensitivity",
+    "risk_class",
+    "temporal_policy",
+    "verified_at",
+    "fact_key",
+    "valid_from",
+    "valid_until",
+    "review_after_days",
+    "supersedes",
+    "verification_mode",
+    "requires_live_verification",
+})
+
+
+def is_formal_body_document(relative: Path) -> bool:
+    """Return whether a relative Markdown path is part of the governed body.
+
+    Doctor and Write Gateway must share this exact boundary.  Navigation
+    README files are governed bodies, while archive and template material are
+    deliberately excluded from automatic governance migration.
+    """
+
+    return bool(
+        relative.parts
+        and relative.parts[0] in FORMAL_BODY_TOP_LEVELS
+        and "archive" not in {part.casefold() for part in relative.parts}
+        and not relative.name.startswith("_模板")
+    )
 
 
 @dataclass
 class MemoryDoc:
     path: Path
     rel_path: str
+    memory_id: str
+    memory_id_source: str
     sha256: str
     title: str
     memory_type: str
@@ -42,10 +118,19 @@ class MemoryDoc:
     session_id: str
     status: str
     sensitivity: str
+    risk_class: str
+    risk_class_source: str
     verified_at: str
     verified_at_source: str
+    document_date: str
+    temporal_policy: str
+    temporal_policy_source: str
+    fact_key: str
+    valid_from: str
     valid_until: str
     review_after_days: int
+    review_after_source: str
+    supersedes: str
     mtime: float
     size_bytes: int
     line_count: int
@@ -68,6 +153,195 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _canonical_projection_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def full_vault_input_projection_sha256() -> str:
+    projection: list[tuple[str, str]] = []
+    index_path = (VAULT_ROOT / "INDEX.md").resolve()
+    for path in sorted(VAULT_ROOT.rglob("*.md"), key=lambda item: item.as_posix()):
+        if path.is_symlink() or not path.is_file():
+            raise GeneratedIndexCapabilityError("GENERATED_INDEX_INPUT_UNSAFE")
+        resolved = path.resolve()
+        if resolved == index_path:
+            continue
+        projection.append(
+            (
+                resolved.relative_to(VAULT_ROOT).as_posix(),
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+        )
+    return _canonical_projection_sha256(projection)
+
+
+def verify_generated_index_transaction_snapshot(
+    authorization: dict[str, Any],
+    *,
+    expected_index_sha256: str | None = None,
+) -> None:
+    binding = authorization.get("transaction_binding")
+    if not isinstance(binding, dict):
+        raise GeneratedIndexCapabilityError("GENERATED_INDEX_TRANSACTION_INVALID")
+    target = VAULT_ROOT / "INDEX.md"
+    vault_root_sha256 = hashlib.sha256(str(VAULT_ROOT.resolve()).encode("utf-8")).hexdigest()
+    current_index_sha256 = (
+        hashlib.sha256(target.read_bytes()).hexdigest()
+        if target.is_file() and not target.is_symlink()
+        else ""
+    )
+    try:
+        git_head = subprocess.run(
+            ["git", "-C", str(GIT_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.strip().lower()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GeneratedIndexCapabilityError("GENERATED_INDEX_TRANSACTION_INVALID") from exc
+    if (
+        str(binding.get("vault_root_sha256", "")) != vault_root_sha256
+        or str(expected_index_sha256 or binding.get("index_base_sha256", ""))
+        != current_index_sha256
+        or str(binding.get("git_head", "")) != git_head
+        or str(binding.get("full_vault_inputs_sha256", ""))
+        != full_vault_input_projection_sha256()
+    ):
+        raise GeneratedIndexCapabilityError("GENERATED_INDEX_TRANSACTION_CHANGED")
+
+
+def _atomic_exchange_paths(first: Path, second: Path) -> None:
+    """Atomically exchange two existing same-filesystem paths or fail closed."""
+
+    if os.name == "nt":  # Windows uses ReplaceFile in the conditional wrapper.
+        raise OSError("ATOMIC_EXCHANGE_UNAVAILABLE")
+    libc = ctypes.CDLL(None, use_errno=True)
+    first_raw = os.fsencode(first)
+    second_raw = os.fsencode(second)
+    if sys.platform == "darwin":
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            raise OSError("ATOMIC_EXCHANGE_UNAVAILABLE")
+        renamex_np.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(first_raw, second_raw, 0x00000002)
+    else:
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError("ATOMIC_EXCHANGE_UNAVAILABLE")
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        result = renameat2(-100, first_raw, -100, second_raw, 0x00000002)
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _fsync_parent_directories(*paths: Path) -> None:
+    if os.name == "nt":
+        return
+    for parent in {path.parent.resolve() for path in paths}:
+        descriptor = os.open(
+            parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def conditional_atomic_replace(
+    target: Path,
+    replacement: Path,
+    *,
+    expected_current_sha256: str,
+    evidence_path: Path | None = None,
+) -> Path:
+    """Replace target atomically while preserving and verifying prior bytes."""
+
+    if target.is_symlink() or replacement.is_symlink() or not target.is_file() or not replacement.is_file():
+        raise OSError("GENERATED_INDEX_TARGET_UNSAFE")
+    if os.name == "nt":
+        evidence = (
+            evidence_path
+            if evidence_path is not None
+            else replacement.parent / f"previous-{os.getpid()}-{time.time_ns()}.md"
+        )
+        if (
+            evidence.parent.resolve() != replacement.parent.resolve()
+            or evidence.exists()
+            or evidence.is_symlink()
+        ):
+            raise OSError("GENERATED_INDEX_RECOVERY_EVIDENCE_INVALID")
+        replace_file = ctypes.windll.kernel32.ReplaceFileW
+        replace_file.argtypes = (
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        )
+        replace_file.restype = ctypes.c_int
+        if not replace_file(str(target), str(replacement), str(evidence), 0x00000001, None, None):
+            raise OSError(ctypes.get_last_error(), "ReplaceFileW failed")
+        evidence_metadata = evidence.lstat()
+        observed = (
+            hashlib.sha256(evidence.read_bytes()).hexdigest()
+            if stat.S_ISREG(evidence_metadata.st_mode) and not evidence.is_symlink()
+            else ""
+        )
+        if observed != expected_current_sha256:
+            generated_evidence = evidence.parent / f"generated-race-{os.getpid()}-{time.time_ns()}.md"
+            if not replace_file(str(target), str(evidence), str(generated_evidence), 0x00000001, None, None):
+                raise OSError("GENERATED_INDEX_CAS_RESTORE_FAILED")
+            raise OSError("GENERATED_INDEX_BASE_CHANGED")
+        return evidence
+    if evidence_path is not None and evidence_path.resolve() != replacement.resolve():
+        raise OSError("GENERATED_INDEX_RECOVERY_EVIDENCE_INVALID")
+    _atomic_exchange_paths(replacement, target)
+    displaced_metadata = replacement.lstat()
+    observed = (
+        hashlib.sha256(replacement.read_bytes()).hexdigest()
+        if stat.S_ISREG(displaced_metadata.st_mode) and not replacement.is_symlink()
+        else ""
+    )
+    if observed != expected_current_sha256:
+        _atomic_exchange_paths(replacement, target)
+        _fsync_parent_directories(replacement, target)
+        raise OSError("GENERATED_INDEX_BASE_CHANGED")
+    _fsync_parent_directories(replacement, target)
+    return replacement
+
+
+def memory_identity(rel_path: str, meta: dict[str, object]) -> tuple[str, str]:
+    explicit = as_text(meta.get("memory_id")).casefold()
+    if re.fullmatch(r"[0-9a-f]{64}", explicit):
+        return explicit, "frontmatter"
+    normalized = unicodedata.normalize("NFC", rel_path.replace("\\", "/").strip())
+    fallback = hashlib.sha256(f"agent-memory-v1\0{normalized}".encode("utf-8")).hexdigest()
+    return fallback, "legacy_path_hash_invalid" if explicit else "legacy_path_hash"
+
+
+def stable_memory_id(rel_path: str, meta: dict[str, object]) -> str:
+    return memory_identity(rel_path, meta)[0]
+
+
 def parse_frontmatter(text: str) -> dict[str, object]:
     if not text.startswith("---\n"):
         return {}
@@ -75,6 +349,7 @@ def parse_frontmatter(text: str) -> dict[str, object]:
     if end == -1:
         return {}
     data: dict[str, object] = {}
+    protected_seen: set[str] = set()
     current_key = ""
     for line in text[4:end].splitlines():
         if not line.strip():
@@ -89,6 +364,10 @@ def parse_frontmatter(text: str) -> dict[str, object]:
             continue
         key, value = line.split(":", 1)
         current_key = key.strip()
+        if current_key in PROTECTED_FRONTMATTER_KEYS:
+            if current_key in protected_seen:
+                raise ValueError("FRONTMATTER_DUPLICATE_KEY")
+            protected_seen.add(current_key)
         value = value.strip()
         data[current_key] = value if value else []
     return data
@@ -102,6 +381,142 @@ def as_text(value: object, default: str = "") -> str:
         return default
     text = str(value).strip().strip('"').strip("'")
     return text if text else default
+
+
+def as_list(value: object) -> list[str]:
+    """Return a bounded, stable list from the deliberately small YAML subset.
+
+    The vault parser is intentionally dependency-free.  It supports normal
+    block lists and a conservative inline ``[a, b]`` form so temporal relation
+    metadata remains human-editable without making SQLite a second source of
+    truth.
+    """
+
+    values: list[object]
+    if isinstance(value, list):
+        values = value
+    elif value in (None, ""):
+        values = []
+    else:
+        raw = str(value).strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            raw = raw[1:-1]
+        values = raw.split(",")
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        normalized = unicodedata.normalize("NFKC", str(item).strip().strip("'\"`"))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def normalized_relation_ref(value: str) -> tuple[str, str]:
+    """Normalize a Markdown-relative supersession reference.
+
+    Relations are declarations in Markdown.  They may never be absolute,
+    escape the vault, or silently target a non-Markdown object.  Invalid
+    declarations remain auditable in ``memory_supersessions`` but never affect
+    current-fact retrieval.
+    """
+
+    raw = unicodedata.normalize("NFKC", value.strip()).replace("\\", "/")
+    if not raw:
+        return "", "REFERENCE_EMPTY"
+    candidate = Path(raw)
+    if candidate.is_absolute() or raw.startswith("/"):
+        return raw, "REFERENCE_ABSOLUTE"
+    if any(part in {"", ".", ".."} for part in candidate.parts):
+        return raw, "REFERENCE_TRAVERSAL"
+    normalized = candidate.as_posix()
+    if not normalized.endswith(".md"):
+        return normalized, "REFERENCE_NOT_MARKDOWN"
+    return normalized, ""
+
+
+def normalized_fact_key(value: object) -> tuple[str, str]:
+    """Return a stable fact identity or a bounded validation error.
+
+    Fact keys are deliberately explicit.  Free text, titles, and embeddings
+    are never allowed to decide that two facts replace one another.
+    """
+
+    normalized = unicodedata.normalize("NFKC", str(value or "").strip()).casefold()
+    if not normalized:
+        return "", "FACT_KEY_REQUIRED"
+    if len(normalized) > 160 or normalized in {"null", "none", "~"}:
+        return normalized[:160], "FACT_KEY_INVALID"
+    if any(character.isspace() or ord(character) < 32 for character in normalized):
+        return normalized, "FACT_KEY_INVALID"
+    if any(character in normalized for character in (",", "|", "[", "]", "{", "}", "\\")):
+        return normalized, "FACT_KEY_INVALID"
+    if normalized.startswith(('.', '/')) or normalized.endswith(('.', '/')) or ".." in normalized:
+        return normalized, "FACT_KEY_INVALID"
+    return normalized, ""
+
+
+def temporal_date(value: object) -> tuple[str, str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return "", "DATE_REQUIRED"
+    try:
+        parsed = dt.date.fromisoformat(raw)
+    except ValueError:
+        return raw, "DATE_INVALID"
+    if parsed.isoformat() != raw:
+        return raw, "DATE_INVALID"
+    return raw, ""
+
+
+def fact_metadata(meta: dict[str, object]) -> dict[str, object]:
+    """Validate the opt-in, one-fact-per-file temporal contract.
+
+    ``valid_from`` by itself remains ordinary document metadata for backward
+    compatibility.  A document enters fact-record mode only when ``fact_key``
+    or ``supersedes`` is declared.
+    """
+
+    raw_fact_key = meta.get("fact_key")
+    declared_supersedes = as_list(meta.get("supersedes"))
+    enabled = bool(str(raw_fact_key or "").strip() or declared_supersedes)
+    if not enabled:
+        return {
+            "enabled": False,
+            "fact_key": "",
+            "valid_from": as_text(meta.get("valid_from")),
+            "valid_until": as_text(meta.get("valid_until")),
+            "supersedes": [],
+            "errors": [],
+        }
+
+    fact_key, fact_key_error = normalized_fact_key(raw_fact_key)
+    valid_from, valid_from_error = temporal_date(meta.get("valid_from"))
+    valid_until = as_text(meta.get("valid_until"))
+    errors = [code for code in (fact_key_error, valid_from_error) if code]
+    if valid_until:
+        normalized_until, until_error = temporal_date(valid_until)
+        valid_until = normalized_until
+        if until_error:
+            errors.append("VALID_UNTIL_INVALID")
+        elif valid_from and valid_until < valid_from:
+            errors.append("VALIDITY_RANGE_INVALID")
+    normalized_supersedes: list[str] = []
+    for declared in declared_supersedes:
+        target, reason = normalized_relation_ref(declared)
+        if reason:
+            errors.append(reason)
+        elif target not in normalized_supersedes:
+            normalized_supersedes.append(target)
+    return {
+        "enabled": True,
+        "fact_key": fact_key,
+        "valid_from": valid_from,
+        "valid_until": valid_until,
+        "supersedes": normalized_supersedes,
+        "errors": list(dict.fromkeys(errors)),
+    }
 
 
 def title_from_markdown(text: str, path: Path) -> str:
@@ -174,14 +589,78 @@ def extract_verified_at(
     match = re.search(r"最近验证[:：]\s*(\d{4}-\d{2}-\d{2})", text)
     if match:
         return match.group(1), "summary"
-    summary_dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", extract_summary(text))
-    if summary_dates:
-        return max(summary_dates), "document_date"
+    if extract_document_date(text):
+        # A date merely appearing in a summary is provenance, never proof that
+        # the fact was checked on that date.
+        return "", "document_date_unverified"
     if status in {"archived", "outdated", "deprecated", "stale"}:
         return "", "snapshot"
     if memory_type in {"routing", "directory_index", "template"}:
         return "", "structural"
     return "", "needs_review"
+
+
+def extract_document_date(text: str) -> str:
+    summary_dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", extract_summary(text))
+    return max(summary_dates) if summary_dates else ""
+
+
+def temporal_policy_for(
+    meta: dict[str, object],
+    *,
+    memory_type: str,
+    status: str,
+    fact: dict[str, object],
+) -> tuple[str, str]:
+    explicit = as_text(meta.get("temporal_policy")).casefold()
+    if explicit in TEMPORAL_POLICIES:
+        return explicit, "frontmatter"
+    if status in {"archived", "outdated", "deprecated", "stale", "superseded"}:
+        return "snapshot", "inferred"
+    if memory_type in {"routing", "directory_index", "template", "governance"}:
+        return "structural", "inferred"
+    if bool(fact.get("enabled")) and str(fact.get("valid_until") or ""):
+        return "expiring", "inferred"
+    if bool(fact.get("enabled")):
+        return "reviewable", "inferred"
+    if memory_type in {"user_profile", "decision"}:
+        return "stable", "inferred"
+    return "reviewable", "inferred"
+
+
+def is_explicitly_action_sensitive(
+    *,
+    status: object,
+    memory_type: object,
+    temporal_policy: object,
+    fact_key: object,
+    valid_from: object,
+    valid_until: object,
+    rel_path: object,
+) -> bool:
+    """Classify only explicit action-sensitive fact records.
+
+    Project, workflow, and decision documents are not facts merely because of
+    their container type. Audit and Doctor share this predicate so ordinary
+    reviewable guidance does not create false atomic-fact coverage debt.
+    """
+
+    normalized_status = str(status or "").casefold()
+    normalized_type = str(memory_type or "").casefold()
+    normalized_policy = str(temporal_policy or "").casefold()
+    return bool(
+        normalized_status == "active"
+        and normalized_type not in {"routing", "directory_index", "template", "governance"}
+        and normalized_policy != "structural"
+        and (
+            normalized_type in {"fact", "atomic_fact", "current_fact"}
+            or normalized_policy == "expiring"
+            or str(valid_from or "").strip()
+            or str(valid_until or "").strip()
+            or str(fact_key or "").strip()
+            or "事实-" in Path(str(rel_path or "")).stem
+        )
+    )
 
 
 def infer_review_after_days(path: Path, title: str, memory_type: str, status: str, meta: dict[str, object]) -> int:
@@ -205,6 +684,19 @@ def infer_review_after_days(path: Path, title: str, memory_type: str, status: st
         "directory_index": 365,
         "template": 365,
     }.get(memory_type, 180)
+
+
+def review_after_policy(
+    path: Path,
+    title: str,
+    memory_type: str,
+    status: str,
+    meta: dict[str, object],
+) -> tuple[int, str]:
+    explicit = as_text(meta.get("review_after_days"))
+    return infer_review_after_days(path, title, memory_type, status, meta), (
+        "frontmatter" if explicit and explicit.isdigit() else "inferred"
+    )
 
 
 def infer_from_path(path: Path, meta: dict[str, object]) -> tuple[str, str, str, str]:
@@ -284,10 +776,27 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
     headings = headings_from_markdown(text)
     keywords = as_text(meta.get("keywords"))
     open_loops = extract_open_loops(path, title, rel_path, text, indexed_at)
+    temporal = fact_metadata(meta)
+    temporal_policy, temporal_policy_source = temporal_policy_for(
+        meta,
+        memory_type=memory_type,
+        status=status,
+        fact=temporal,
+    )
+    review_after_days, review_after_source = review_after_policy(
+        path,
+        title,
+        memory_type,
+        status,
+        meta,
+    )
+    memory_id, memory_id_source = memory_identity(rel_path, meta)
     return (
         MemoryDoc(
             path=path,
             rel_path=rel_path,
+            memory_id=memory_id,
+            memory_id_source=memory_id_source,
             sha256=sha256_text(text),
             title=title,
             memory_type=memory_type,
@@ -302,10 +811,19 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
             session_id=as_text(meta.get("session_id")),
             status=status,
             sensitivity=as_text(meta.get("sensitivity"), "private" if track == "user" else "normal"),
+            risk_class=as_text(meta.get("risk_class")).strip().casefold(),
+            risk_class_source="frontmatter" if "risk_class" in meta else "",
             verified_at=verified_at,
             verified_at_source=verified_at_source,
-            valid_until=as_text(meta.get("valid_until")),
-            review_after_days=infer_review_after_days(path, title, memory_type, status, meta),
+            document_date=extract_document_date(text),
+            temporal_policy=temporal_policy,
+            temporal_policy_source=temporal_policy_source,
+            fact_key=str(temporal["fact_key"]),
+            valid_from=str(temporal["valid_from"]),
+            valid_until=str(temporal["valid_until"]),
+            review_after_days=review_after_days,
+            review_after_source=review_after_source,
+            supersedes=", ".join(str(item) for item in temporal["supersedes"]),
             mtime=stat.st_mtime,
             size_bytes=stat.st_size,
             line_count=text.count("\n") + 1,
@@ -324,8 +842,10 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
 
 
 def connect() -> sqlite3.Connection:
+    assert_runtime_ready("index")
     return secure_sqlite_connect(
         STATE_DB,
+        create=False,
         pragmas=(
             "PRAGMA journal_mode=WAL",
             "PRAGMA foreign_keys=ON",
@@ -351,6 +871,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS memory_docs (
           path TEXT PRIMARY KEY,
           rel_path TEXT NOT NULL,
+          memory_id TEXT NOT NULL DEFAULT '',
+          memory_id_source TEXT NOT NULL DEFAULT 'legacy_path_hash',
           sha256 TEXT NOT NULL,
           title TEXT NOT NULL,
           memory_type TEXT NOT NULL,
@@ -363,10 +885,19 @@ def init_db(conn: sqlite3.Connection) -> None:
           session_id TEXT DEFAULT '',
           status TEXT DEFAULT 'active',
           sensitivity TEXT DEFAULT 'normal',
+          risk_class TEXT DEFAULT '',
+          risk_class_source TEXT DEFAULT '',
           verified_at TEXT,
           verified_at_source TEXT DEFAULT 'mtime_fallback',
+          document_date TEXT DEFAULT '',
+          temporal_policy TEXT DEFAULT '',
+          temporal_policy_source TEXT DEFAULT 'inferred',
+          fact_key TEXT DEFAULT '',
+          valid_from TEXT DEFAULT '',
           valid_until TEXT DEFAULT '',
           review_after_days INTEGER DEFAULT 180,
+          review_after_source TEXT DEFAULT 'inferred',
+          supersedes TEXT DEFAULT '',
           mtime REAL NOT NULL,
           size_bytes INTEGER NOT NULL,
           line_count INTEGER NOT NULL,
@@ -389,6 +920,28 @@ def init_db(conn: sqlite3.Connection) -> None:
           tokenize = 'unicode61'
         );
 
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts_unicode USING fts5(
+          path UNINDEXED,
+          title,
+          rel_path,
+          summary,
+          keywords,
+          headings,
+          search_text,
+          tokenize = 'unicode61'
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts_trigram USING fts5(
+          path UNINDEXED,
+          title,
+          rel_path,
+          summary,
+          keywords,
+          headings,
+          search_text,
+          tokenize = 'trigram'
+        );
+
         CREATE TABLE IF NOT EXISTS memory_open_loops (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           path TEXT NOT NULL,
@@ -397,6 +950,33 @@ def init_db(conn: sqlite3.Connection) -> None:
           kind TEXT NOT NULL,
           item TEXT NOT NULL,
           status TEXT DEFAULT 'open',
+          indexed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_supersessions (
+          source_rel_path TEXT NOT NULL,
+          target_rel_path TEXT NOT NULL,
+          source_fact_key TEXT NOT NULL DEFAULT '',
+          target_fact_key TEXT NOT NULL DEFAULT '',
+          source_valid_from TEXT NOT NULL DEFAULT '',
+          target_valid_from TEXT NOT NULL DEFAULT '',
+          effective_from TEXT NOT NULL DEFAULT '',
+          source_status TEXT NOT NULL,
+          target_status TEXT NOT NULL DEFAULT '',
+          relation_status TEXT NOT NULL,
+          reason_code TEXT NOT NULL DEFAULT '',
+          indexed_at TEXT NOT NULL,
+          PRIMARY KEY (source_rel_path, target_rel_path)
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_fact_states (
+          rel_path TEXT PRIMARY KEY,
+          fact_key TEXT NOT NULL,
+          fact_status TEXT NOT NULL,
+          current_rel_path TEXT NOT NULL DEFAULT '',
+          superseded_by TEXT NOT NULL DEFAULT '',
+          effective_from TEXT NOT NULL DEFAULT '',
+          reason_code TEXT NOT NULL DEFAULT '',
           indexed_at TEXT NOT NULL
         );
 
@@ -458,16 +1038,43 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     ensure_column(conn, "memory_docs", "verified_at_source", "TEXT DEFAULT 'mtime_fallback'")
+    ensure_column(conn, "memory_docs", "memory_id", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "memory_docs", "memory_id_source", "TEXT NOT NULL DEFAULT 'legacy_path_hash'")
+    # init_db is a migration/fixture primitive. The managed index command
+    # reaches it only with an explicit maintenance capability; ordinary
+    # index/search/retrieve/benchmark paths call assert_schema_ready instead
+    # and therefore cannot silently ALTER a live database.
+    ensure_column(conn, "memory_docs", "risk_class", "TEXT DEFAULT ''")
+    ensure_column(conn, "memory_docs", "risk_class_source", "TEXT DEFAULT ''")
+    ensure_column(conn, "memory_docs", "document_date", "TEXT DEFAULT ''")
+    ensure_column(conn, "memory_docs", "temporal_policy", "TEXT DEFAULT ''")
+    ensure_column(conn, "memory_docs", "temporal_policy_source", "TEXT DEFAULT 'inferred'")
+    ensure_column(conn, "memory_docs", "fact_key", "TEXT DEFAULT ''")
+    ensure_column(conn, "memory_docs", "valid_from", "TEXT DEFAULT ''")
     ensure_column(conn, "memory_docs", "valid_until", "TEXT DEFAULT ''")
     ensure_column(conn, "memory_docs", "review_after_days", "INTEGER DEFAULT 180")
+    ensure_column(conn, "memory_docs", "review_after_source", "TEXT DEFAULT 'inferred'")
+    ensure_column(conn, "memory_docs", "supersedes", "TEXT DEFAULT ''")
+    for column, ddl in (
+        ("source_fact_key", "TEXT NOT NULL DEFAULT ''"),
+        ("target_fact_key", "TEXT NOT NULL DEFAULT ''"),
+        ("source_valid_from", "TEXT NOT NULL DEFAULT ''"),
+        ("target_valid_from", "TEXT NOT NULL DEFAULT ''"),
+        ("effective_from", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        ensure_column(conn, "memory_supersessions", column, ddl)
     ensure_column(conn, "memory_docs", "agent_scope", "TEXT DEFAULT 'shared'")
     ensure_column(conn, "memory_docs", "session_id", "TEXT DEFAULT ''")
     ensure_column(conn, "memory_search_log", "query_sha256", "TEXT")
     ensure_column(conn, "memory_search_log", "query_length", "INTEGER")
     ensure_column(conn, "memory_search_log", "sources", "TEXT")
     ensure_column(conn, "memory_search_log", "duration_ms", "INTEGER")
+    ensure_column(conn, "memory_search_log", "metadata_gate_mode", "TEXT NOT NULL DEFAULT 'shadow'")
+    ensure_column(conn, "memory_search_log", "metadata_would_block_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "memory_search_log", "metadata_reason_fingerprint", "TEXT NOT NULL DEFAULT ''")
     ensure_column(conn, "memory_session_claims", "intent_id", "TEXT NOT NULL DEFAULT ''")
     agent_memory_intent.ensure_schema(conn)
+    agent_memory_observability.ensure_schema(conn)
     # Older databases do not have these columns until the migration above runs.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_docs_agent_scope ON memory_docs(agent_scope)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_docs_session ON memory_docs(session_id)")
@@ -479,8 +1086,80 @@ def init_db(conn: sqlite3.Connection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_session_claims_active_intent "
         "ON memory_session_claims(intent_id) WHERE intent_id<>'' AND status='active'"
     )
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "7"))
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_docs_fact_key ON memory_docs(fact_key)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_docs_memory_id ON memory_docs(memory_id) WHERE memory_id<>''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_fact_states_status ON memory_fact_states(fact_status)")
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", INDEX_SCHEMA_VERSION))
     conn.commit()
+
+
+def assert_schema_ready(conn: sqlite3.Connection) -> None:
+    """Verify the derived index without creating or altering SQLite objects."""
+
+    tables = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")
+    }
+    required_tables = {
+        "meta",
+        "memory_docs",
+        "memory_fts",
+        "memory_fts_unicode",
+        "memory_fts_trigram",
+        "memory_open_loops",
+        "memory_supersessions",
+        "memory_fact_states",
+        "memory_search_log",
+    }
+    required_columns = {
+        "memory_docs": {
+            "path", "rel_path", "memory_id", "memory_id_source", "sha256", "title",
+            "memory_type", "track", "project_id", "app_id", "user_id", "agent_id",
+            "agent_scope", "session_id", "status", "sensitivity", "verified_at",
+            "risk_class", "risk_class_source",
+            "verified_at_source", "document_date", "temporal_policy",
+            "temporal_policy_source", "fact_key", "valid_from", "valid_until",
+            "review_after_days", "review_after_source", "supersedes", "mtime",
+            "size_bytes", "line_count", "summary", "next_hint", "stale_info",
+            "has_open_loop", "open_loop_count", "indexed_at",
+        },
+        "memory_fts": {"path", "title", "rel_path", "summary", "keywords", "headings", "search_text"},
+        "memory_fts_unicode": {"path", "title", "rel_path", "summary", "keywords", "headings", "search_text"},
+        "memory_fts_trigram": {"path", "title", "rel_path", "summary", "keywords", "headings", "search_text"},
+        "memory_open_loops": {"path", "rel_path", "title", "kind", "item", "status", "indexed_at"},
+        "memory_supersessions": {
+            "source_rel_path", "target_rel_path", "source_fact_key", "target_fact_key",
+            "source_valid_from", "target_valid_from", "effective_from", "source_status",
+            "target_status", "relation_status", "reason_code", "indexed_at",
+        },
+        "memory_fact_states": {
+            "rel_path", "fact_key", "fact_status", "current_rel_path", "superseded_by",
+            "effective_from", "reason_code", "indexed_at",
+        },
+        "memory_search_log": {
+            "metadata_gate_mode", "metadata_would_block_count",
+            "metadata_reason_fingerprint",
+        },
+    }
+    columns_ready = all(
+        required.issubset(
+            {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        )
+        for table, required in required_columns.items()
+        if table in tables
+    )
+    version = None
+    if "meta" in tables:
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key='memory_index_schema_version'"
+        ).fetchone()
+    if (
+        not required_tables.issubset(tables)
+        or not columns_ready
+        or version is None
+        or str(version[0]) != str(INDEX_SCHEMA_VERSION)
+    ):
+        raise sqlite3.OperationalError("STATE_SCHEMA_MIGRATION_REQUIRED")
 
 
 def iter_markdown_files() -> list[Path]:
@@ -493,14 +1172,19 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
     conn.execute(
         """
         INSERT INTO memory_docs (
-          path, rel_path, sha256, title, memory_type, track, project_id, app_id,
-          user_id, agent_id, agent_scope, session_id, status, sensitivity, verified_at, verified_at_source,
-          valid_until, review_after_days, mtime, size_bytes, line_count, summary, next_hint, stale_info, has_open_loop,
-          open_loop_count, indexed_at
+          path, rel_path, memory_id, memory_id_source, sha256, title, memory_type, track, project_id, app_id,
+          user_id, agent_id, agent_scope, session_id, status, sensitivity, risk_class, risk_class_source,
+          verified_at, verified_at_source,
+          document_date, temporal_policy, temporal_policy_source,
+          fact_key, valid_from, valid_until, review_after_days, review_after_source,
+          supersedes, mtime, size_bytes, line_count, summary, next_hint,
+          stale_info, has_open_loop, open_loop_count, indexed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
           rel_path=excluded.rel_path,
+          memory_id=excluded.memory_id,
+          memory_id_source=excluded.memory_id_source,
           sha256=excluded.sha256,
           title=excluded.title,
           memory_type=excluded.memory_type,
@@ -513,10 +1197,19 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
           session_id=excluded.session_id,
           status=excluded.status,
           sensitivity=excluded.sensitivity,
+          risk_class=excluded.risk_class,
+          risk_class_source=excluded.risk_class_source,
           verified_at=excluded.verified_at,
           verified_at_source=excluded.verified_at_source,
+          document_date=excluded.document_date,
+          temporal_policy=excluded.temporal_policy,
+          temporal_policy_source=excluded.temporal_policy_source,
+          fact_key=excluded.fact_key,
+          valid_from=excluded.valid_from,
           valid_until=excluded.valid_until,
           review_after_days=excluded.review_after_days,
+          review_after_source=excluded.review_after_source,
+          supersedes=excluded.supersedes,
           mtime=excluded.mtime,
           size_bytes=excluded.size_bytes,
           line_count=excluded.line_count,
@@ -530,6 +1223,8 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
         (
             str(doc.path),
             doc.rel_path,
+            doc.memory_id,
+            doc.memory_id_source,
             doc.sha256,
             doc.title,
             doc.memory_type,
@@ -542,10 +1237,19 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
             doc.session_id,
             doc.status,
             doc.sensitivity,
+            doc.risk_class,
+            doc.risk_class_source,
             doc.verified_at,
             doc.verified_at_source,
+            doc.document_date,
+            doc.temporal_policy,
+            doc.temporal_policy_source,
+            doc.fact_key,
+            doc.valid_from,
             doc.valid_until,
             doc.review_after_days,
+            doc.review_after_source,
+            doc.supersedes,
             doc.mtime,
             doc.size_bytes,
             doc.line_count,
@@ -560,21 +1264,300 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
 
 
 def insert_fts(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
-    conn.execute(
+    values = (
+        str(doc.path),
+        doc.title,
+        doc.rel_path,
+        doc.summary,
+        doc.keywords,
+        doc.headings,
+        doc.search_text,
+    )
+    for table in ("memory_fts", "memory_fts_unicode", "memory_fts_trigram"):
+        conn.execute(
+            f"""
+            INSERT INTO {table}(path, title, rel_path, summary, keywords, headings, search_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+
+
+def _normalized_scope_value(value: object) -> str:
+    return unicodedata.normalize("NFKC", str(value or "").strip()).casefold()
+
+
+def _fact_scope(row: object) -> tuple[str, str, str, str]:
+    return (
+        _normalized_scope_value(row["app_id"]),
+        _normalized_scope_value(row["project_id"]),
+        _normalized_scope_value(row["user_id"]),
+        _normalized_scope_value(row["agent_scope"] or "shared"),
+    )
+
+
+def _edge_in_cycle(edge: tuple[str, str], adjacency: dict[str, set[str]]) -> bool:
+    source, target = edge
+    pending = [target]
+    visited: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current == source:
+            return True
+        if current in visited:
+            continue
+        visited.add(current)
+        pending.extend(adjacency.get(current, set()) - visited)
+    return False
+
+
+def build_temporal_projection(
+    rows: list[object],
+    indexed_at: str,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Build deterministic supersession edges and one current-fact state.
+
+    The input may come from SQLite or from the Write Gateway's live Markdown
+    scan.  Only explicit, same-scope, same-key, forward-dated edges can hide an
+    older fact.  Ambiguity is retained as a conflict and never resolved by
+    semantic similarity or timestamps alone.
+    """
+
+    by_path = {
+        str(row["rel_path"]): row
+        for row in rows
+        if str(row.get("memory_type", "") if isinstance(row, dict) else row["memory_type"] or "").casefold()
+        not in {"template", "directory_index", "routing"}
+    }
+    record_errors: dict[str, list[str]] = {}
+    for rel_path, row in by_path.items():
+        errors: list[str] = []
+        raw_key = str(row["fact_key"] or "")
+        raw_supersedes = as_list(str(row["supersedes"] or ""))
+        if not raw_key and not raw_supersedes:
+            continue
+        _key, key_error = normalized_fact_key(raw_key)
+        _start, start_error = temporal_date(row["valid_from"])
+        if key_error:
+            errors.append(key_error)
+        if start_error:
+            errors.append("VALID_FROM_INVALID")
+        valid_until = str(row["valid_until"] or "").strip()
+        if valid_until:
+            _until, until_error = temporal_date(valid_until)
+            if until_error:
+                errors.append("VALID_UNTIL_INVALID")
+            elif not start_error and valid_until < str(row["valid_from"]):
+                errors.append("VALIDITY_RANGE_INVALID")
+        record_errors[rel_path] = list(dict.fromkeys(errors))
+
+    relations: list[dict[str, str]] = []
+    preliminary: list[int] = []
+    for source, row in by_path.items():
+        for declared in as_list(str(row["supersedes"] or "")):
+            target, reason = normalized_relation_ref(declared)
+            target_row = by_path.get(target)
+            source_key, source_key_error = normalized_fact_key(row["fact_key"])
+            source_from, source_from_error = temporal_date(row["valid_from"])
+            target_key = ""
+            target_from = ""
+            target_status = ""
+            if target_row is not None:
+                target_key, target_key_error = normalized_fact_key(target_row["fact_key"])
+                target_from, target_from_error = temporal_date(target_row["valid_from"])
+                target_status = str(target_row["status"] or "").casefold()
+            else:
+                target_key_error = "FACT_KEY_REQUIRED"
+                target_from_error = "DATE_REQUIRED"
+            if not reason and target == source:
+                reason = "REFERENCE_SELF"
+            elif not reason and target_row is None:
+                reason = "TARGET_MISSING"
+            elif (
+                not reason
+                and str(row["status"] or "").casefold()
+                not in FACT_LINEAGE_SOURCE_STATUSES
+            ):
+                reason = "SOURCE_NOT_CURRENT"
+            elif not reason and source_key_error:
+                reason = source_key_error
+            elif not reason and target_key_error:
+                reason = "TARGET_FACT_KEY_INVALID"
+            elif not reason and source_key != target_key:
+                reason = "FACT_KEY_MISMATCH"
+            elif not reason and _fact_scope(row) != _fact_scope(target_row):
+                reason = "FACT_SCOPE_MISMATCH"
+            elif not reason and source_from_error:
+                reason = "SOURCE_VALID_FROM_INVALID"
+            elif not reason and target_from_error:
+                reason = "TARGET_VALID_FROM_INVALID"
+            elif not reason and source_from <= target_from:
+                reason = "VALID_FROM_NOT_FORWARD"
+            relation = {
+                "source_rel_path": source,
+                "target_rel_path": target,
+                "source_fact_key": source_key,
+                "target_fact_key": target_key,
+                "source_valid_from": source_from,
+                "target_valid_from": target_from,
+                "effective_from": source_from if not source_from_error else "",
+                "source_status": str(row["status"] or "").casefold(),
+                "target_status": target_status,
+                "relation_status": "invalid" if reason else "effective",
+                "reason_code": reason,
+                "indexed_at": indexed_at,
+            }
+            relations.append(relation)
+            if not reason:
+                preliminary.append(len(relations) - 1)
+
+    incoming: dict[str, list[int]] = {}
+    adjacency: dict[str, set[str]] = {}
+    for index in preliminary:
+        relation = relations[index]
+        incoming.setdefault(relation["target_rel_path"], []).append(index)
+        adjacency.setdefault(relation["source_rel_path"], set()).add(relation["target_rel_path"])
+    for indexes in incoming.values():
+        if len(indexes) > 1:
+            for index in indexes:
+                relations[index]["relation_status"] = "invalid"
+                relations[index]["reason_code"] = "MULTIPLE_SUCCESSORS"
+    for index in preliminary:
+        relation = relations[index]
+        if relation["relation_status"] == "effective" and _edge_in_cycle(
+            (relation["source_rel_path"], relation["target_rel_path"]), adjacency
+        ):
+            relation["relation_status"] = "invalid"
+            relation["reason_code"] = "SUPERSESSION_CYCLE"
+
+    effective_incoming = {
+        relation["target_rel_path"]: relation
+        for relation in relations
+        if relation["relation_status"] == "effective"
+    }
+    invalid_by_path: dict[str, set[str]] = {}
+    for relation in relations:
+        if relation["relation_status"] == "effective":
+            continue
+        reason = relation["reason_code"] or "RELATION_INVALID"
+        invalid_by_path.setdefault(relation["source_rel_path"], set()).add(reason)
+        if relation["target_rel_path"] in by_path:
+            invalid_by_path.setdefault(relation["target_rel_path"], set()).add(reason)
+
+    groups: dict[tuple[tuple[str, str, str, str], str], list[str]] = {}
+    for rel_path, row in by_path.items():
+        key = str(row["fact_key"] or "")
+        if key:
+            groups.setdefault((_fact_scope(row), key), []).append(rel_path)
+
+    states_by_path: dict[str, dict[str, str]] = {}
+    for (_scope, fact_key), paths in groups.items():
+        active = [
+            path
+            for path in paths
+            if str(by_path[path]["status"] or "").casefold() == "active"
+            and not record_errors.get(path)
+        ]
+        heads = [path for path in active if path not in effective_incoming]
+        if len(heads) > 1:
+            for path in paths:
+                states_by_path[path] = {
+                    "rel_path": path,
+                    "fact_key": fact_key,
+                    "fact_status": "conflict",
+                    "current_rel_path": "",
+                    "superseded_by": "",
+                    "effective_from": "",
+                    "reason_code": "MULTIPLE_CURRENT_FACTS",
+                    "indexed_at": indexed_at,
+                }
+            continue
+        current_path = heads[0] if heads else ""
+        for path in paths:
+            row = by_path[path]
+            incoming_relation = effective_incoming.get(path)
+            if record_errors.get(path):
+                fact_status = "invalid_metadata"
+                reason = ",".join(record_errors[path])
+            elif path in invalid_by_path:
+                fact_status = "invalid_relation"
+                reason = ",".join(sorted(invalid_by_path[path]))
+            elif incoming_relation is not None:
+                fact_status = "superseded"
+                reason = "SUPERSEDED_BY_EXPLICIT_EDGE"
+            elif str(row["status"] or "").casefold() != "active":
+                fact_status = "historical"
+                reason = "DOCUMENT_NOT_ACTIVE"
+            elif current_path == path:
+                fact_status = "current"
+                reason = ""
+            else:
+                fact_status = "no_current"
+                reason = "NO_ACTIVE_CURRENT_FACT"
+            states_by_path[path] = {
+                "rel_path": path,
+                "fact_key": fact_key,
+                "fact_status": fact_status,
+                "current_rel_path": current_path,
+                "superseded_by": incoming_relation["source_rel_path"] if incoming_relation else "",
+                "effective_from": incoming_relation["effective_from"] if incoming_relation else "",
+                "reason_code": reason,
+                "indexed_at": indexed_at,
+            }
+    return relations, [states_by_path[path] for path in sorted(states_by_path)]
+
+
+def _rebuild_supersessions(conn: sqlite3.Connection, indexed_at: str) -> None:
+    cursor = conn.execute(
         """
-        INSERT INTO memory_fts(path, title, rel_path, summary, keywords, headings, search_text)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        SELECT rel_path, sha256, memory_type, status, fact_key, valid_from, valid_until,
+               supersedes, app_id, project_id, user_id, agent_scope
+        FROM memory_docs
+        ORDER BY rel_path
+        """
+    )
+    columns = [str(item[0]) for item in cursor.description or ()]
+    rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    relations, states = build_temporal_projection(rows, indexed_at)
+    conn.executemany(
+        """
+        INSERT INTO memory_supersessions(
+          source_rel_path, target_rel_path, source_fact_key, target_fact_key,
+          source_valid_from, target_valid_from, effective_from, source_status,
+          target_status, relation_status, reason_code, indexed_at
+        ) VALUES (
+          :source_rel_path, :target_rel_path, :source_fact_key, :target_fact_key,
+          :source_valid_from, :target_valid_from, :effective_from, :source_status,
+          :target_status, :relation_status, :reason_code, :indexed_at
+        )
         """,
-        (str(doc.path), doc.title, doc.rel_path, doc.summary, doc.keywords, doc.headings, doc.search_text),
+        relations,
+    )
+    conn.executemany(
+        """
+        INSERT INTO memory_fact_states(
+          rel_path, fact_key, fact_status, current_rel_path, superseded_by,
+          effective_from, reason_code, indexed_at
+        ) VALUES (
+          :rel_path, :fact_key, :fact_status, :current_rel_path, :superseded_by,
+          :effective_from, :reason_code, :indexed_at
+        )
+        """,
+        states,
     )
 
 
 def scan(conn: sqlite3.Connection) -> None:
-    init_db(conn)
+    # The index is derived state, but its schema is installer-owned. Ordinary
+    # scans may refresh rows only; they must never repair tables or columns.
+    assert_schema_ready(conn)
     indexed_at = utc_now()
     conn.execute("DELETE FROM memory_docs")
-    conn.execute("DELETE FROM memory_fts")
+    for table in ("memory_fts", "memory_fts_unicode", "memory_fts_trigram"):
+        conn.execute(f"DELETE FROM {table}")
     conn.execute("DELETE FROM memory_open_loops")
+    conn.execute("DELETE FROM memory_supersessions")
+    conn.execute("DELETE FROM memory_fact_states")
     files = iter_markdown_files()
     for path in files:
         doc, open_loops = load_doc(path, indexed_at)
@@ -587,6 +1570,7 @@ def scan(conn: sqlite3.Connection) -> None:
             """,
             open_loops,
         )
+    _rebuild_supersessions(conn, indexed_at)
     conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_last_scan_at", indexed_at))
     conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_doc_count", str(len(files))))
 
@@ -715,7 +1699,7 @@ def search(
     has_open_loop: bool = False,
 ) -> list[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
-    init_db(conn)
+    assert_schema_ready(conn)
     rows: list[sqlite3.Row] = []
     try:
         rows = list(
@@ -846,35 +1830,45 @@ def print_search(
             ).fetchall()
             for kind, item in loops:
                 print(f"   open_loop[{kind}]: {item[:180]}")
-    digest = sha256_text(query)
-    conn.execute(
-        """
-        INSERT INTO memory_search_log(
-          query, result_count, used_paths, query_sha256, query_length, sources, duration_ms, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            f"[redacted:{digest[:12]}]",
-            len(rows),
-            ",".join(row["rel_path"] for row in rows),
-            digest,
-            len(query),
-            "sqlite",
-            round((time.monotonic() - started) * 1000),
-            utc_now(),
-        ),
+    agent_memory_observability.record_search(
+        conn,
+        query=query,
+        rel_paths=[str(row["rel_path"]) for row in rows],
+        sources=["sqlite"],
+        duration_ms=round((time.monotonic() - started) * 1000),
+        search_status="success",
     )
 
 
 def print_report(conn: sqlite3.Connection) -> None:
-    init_db(conn)
+    assert_schema_ready(conn)
     doc_count = conn.execute("SELECT COUNT(*) FROM memory_docs").fetchone()[0]
+    unicode_fts_count = conn.execute("SELECT COUNT(DISTINCT path) FROM memory_fts_unicode").fetchone()[0]
+    trigram_fts_count = conn.execute("SELECT COUNT(DISTINCT path) FROM memory_fts_trigram").fetchone()[0]
     loop_count = conn.execute("SELECT COUNT(*) FROM memory_open_loops WHERE status='open'").fetchone()[0]
+    relation_count = conn.execute("SELECT COUNT(*) FROM memory_supersessions").fetchone()[0]
+    invalid_relation_count = conn.execute(
+        "SELECT COUNT(*) FROM memory_supersessions WHERE relation_status<>'effective'"
+    ).fetchone()[0]
+    fact_state_counts = {
+        str(row[0]): int(row[1])
+        for row in conn.execute(
+            "SELECT fact_status, COUNT(*) AS item_count FROM memory_fact_states GROUP BY fact_status"
+        )
+    }
     last_scan = conn.execute("SELECT value FROM meta WHERE key='memory_index_last_scan_at'").fetchone()
     print(f"vault_root={VAULT_ROOT}")
     print(f"state_db={STATE_DB}")
     print(f"memory_docs={doc_count}")
+    print(f"memory_fts_unicode={unicode_fts_count}")
+    print(f"memory_fts_trigram={trigram_fts_count}")
     print(f"memory_open_loops={loop_count}")
+    print(f"memory_supersessions={relation_count}")
+    print(f"memory_supersessions_invalid={invalid_relation_count}")
+    print(
+        "memory_fact_states="
+        + ",".join(f"{key}:{fact_state_counts[key]}" for key in sorted(fact_state_counts))
+    )
     print(f"last_scan_at={last_scan[0] if last_scan else ''}")
     for track, count in conn.execute(
         "SELECT track, COUNT(*) AS item_count FROM memory_docs GROUP BY track ORDER BY item_count DESC, track"
@@ -886,52 +1880,249 @@ def print_report(conn: sqlite3.Connection) -> None:
         print(f"type[{memory_type}]={count}")
 
 
-def generated_index_candidate(conn: sqlite3.Connection) -> str:
-    """Generate a deterministic navigation view from indexed Markdown metadata."""
-    init_db(conn)
+def generated_index_markdown(conn: sqlite3.Connection) -> str:
+    """Generate the canonical, deterministic INDEX.md from Markdown metadata."""
+    assert_schema_ready(conn)
     rows = conn.execute(
         """
         SELECT rel_path, title, memory_type, track, project_id, status, summary
         FROM memory_docs
+        WHERE rel_path<>'INDEX.md'
         ORDER BY
-          CASE track
-            WHEN 'user' THEN 1
-            WHEN 'project' THEN 2
-            WHEN 'workflow' THEN 3
-            WHEN 'decision' THEN 4
-            WHEN 'agent' THEN 5
-            WHEN 'routing' THEN 6
+          CASE status
+            WHEN 'active' THEN 1
+            WHEN 'pending_verification' THEN 2
+            WHEN 'candidate' THEN 3
+            WHEN 'outdated' THEN 4
+            WHEN 'archived' THEN 5
             ELSE 9
           END,
+          memory_type,
           rel_path
         """
     ).fetchall()
     lines = [
-        "# Agent Memory INDEX candidate",
+        GENERATED_INDEX_MARKER,
+        "# Claude Code、Codex 与 Ailu 共享记忆索引",
         "",
-        f"Generated at: {utc_now()}",
-        "",
-        "This navigation candidate is derived from Markdown/frontmatter through SQLite. Review the diff before replacing a curated INDEX.md.",
+        "本文件由 Agent Memory Runtime 根据 Markdown/frontmatter 自动生成。请修改对应记忆文件，不要直接编辑本文件。",
     ]
-    current_track = ""
+    current_group = ""
     for row in rows:
         rel_path, title, memory_type, track, project_id, status, summary = row
-        normalized_track = track or "uncategorized"
-        if normalized_track != current_track:
-            current_track = normalized_track
-            lines.extend(["", f"## {current_track}", ""])
+        normalized_status = status or "active"
+        normalized_type = memory_type or track or "uncategorized"
+        group = f"{normalized_status} / {normalized_type}"
+        if group != current_group:
+            current_group = group
+            lines.extend(["", f"## {current_group}", ""])
         compact_summary = (summary or "").replace("\n", " ").strip()
         if len(compact_summary) > 120:
             compact_summary = compact_summary[:117] + "..."
-        metadata = str(memory_type)
+        metadata = str(track or "")
         if project_id:
             metadata += f"; {project_id}"
-        if status and status != "active":
-            metadata += f"; status={status}"
         suffix = f"; {compact_summary}" if compact_summary else ""
         lines.append(f"- `{rel_path}`: {title} ({metadata}){suffix}")
     lines.append("")
     return "\n".join(lines)
+
+
+def generated_index_navigation_references(text: str) -> list[str]:
+    """Return only canonical navigation rows from a generated ``INDEX.md``.
+
+    Generated summaries are free to mention Markdown paths in inline code.  A
+    navigation reference therefore exists only when a list row starts with the
+    generator's canonical ``- `<relative>.md`:`` prefix.  Reject non-canonical
+    spellings here as well; exact-byte verification catches generated-file
+    tampering, while this parser keeps parity counts content-independent.
+    """
+
+    references: list[str] = []
+    for line in text.splitlines():
+        match = GENERATED_INDEX_ENTRY_RE.match(line)
+        if match is None:
+            continue
+        rel_path = match.group("rel_path")
+        parts = rel_path.split("/")
+        if (
+            rel_path.startswith("/")
+            or "\\" in rel_path
+            or any(part in {"", ".", ".."} for part in parts)
+            or "/".join(parts) != rel_path
+        ):
+            continue
+        references.append(rel_path)
+    return references
+
+
+def generated_index_candidate(conn: sqlite3.Connection) -> str:
+    """Compatibility alias for callers that previously requested a candidate."""
+
+    return generated_index_markdown(conn)
+
+
+def write_generated_index_candidate(raw_output: str, candidate: str) -> Path:
+    """Create a review candidate outside the Vault without overwriting bytes."""
+
+    output_path = Path(raw_output).expanduser().resolve(strict=False)
+    vault_root = VAULT_ROOT.resolve()
+    try:
+        output_path.relative_to(vault_root)
+    except ValueError:
+        pass
+    else:
+        # Neither INDEX.md nor a differently named formal-memory file may be
+        # used as a side door around the generated-file/write-gateway rules.
+        raise GeneratedIndexCapabilityError("GENERATED_FILE_READ_ONLY")
+    if output_path.exists() or output_path.is_symlink():
+        raise RuntimeError("INDEX_CANDIDATE_OUTPUT_EXISTS")
+    if not output_path.parent.is_dir() or output_path.parent.is_symlink():
+        raise RuntimeError("INDEX_CANDIDATE_OUTPUT_PARENT_UNSAFE")
+    payload = candidate.encode("utf-8")
+    descriptor = os.open(
+        output_path,
+        os.O_CREAT
+        | os.O_EXCL
+        | os.O_WRONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        # Preserve a partial candidate for inspection; automatic code never
+        # deletes or replaces user-visible evidence.
+        raise
+    return output_path
+
+
+def sync_generated_index(
+    conn: sqlite3.Connection,
+    *,
+    consumed_capability: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    """Atomically publish the generated INDEX.md and report whether bytes changed."""
+
+    authorization = consumed_capability
+    if authorization is None:
+        authorization = consume_generated_index_capability_from_environment(
+            CONFIG_ROOT,
+            state_db=STATE_DB,
+        )
+    if authorization.get("ok") is not True:
+        raise GeneratedIndexCapabilityError("GENERATED_FILE_READ_ONLY")
+    target = VAULT_ROOT / "INDEX.md"
+    verify_generated_index_transaction_snapshot(authorization)
+    if target.is_symlink():
+        raise RuntimeError("GENERATED_INDEX_TARGET_UNSAFE")
+    payload = generated_index_markdown(conn).encode("utf-8")
+    current = target.read_bytes() if target.is_file() else b""
+    digest = hashlib.sha256(payload).hexdigest()
+    bind_expected_generated_index_sha256(
+        STATE_DB,
+        authorization,
+        generated_sha256=digest,
+    )
+    if current == payload:
+        verify_generated_index_transaction_snapshot(
+            authorization,
+            expected_index_sha256=digest,
+        )
+        return {"changed": False, "path": str(target), "sha256": digest}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    transaction_id = str(authorization["transaction_binding"]["transaction_id"])
+    evidence_root = generated_index_backup_directory(CONFIG_ROOT, transaction_id)
+    temporary = evidence_root / f"generated-{os.getpid()}-{time.time_ns()}-{digest[:12]}.md"
+    descriptor = os.open(
+        temporary,
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    evidence_path: Path | None = None
+    published = False
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if target.exists() and not target.is_symlink():
+            os.chmod(temporary, target.stat().st_mode & 0o777)
+        planned_evidence = (
+            evidence_root / f"previous-{os.getpid()}-{time.time_ns()}-{digest[:12]}.md"
+            if os.name == "nt"
+            else temporary
+        )
+        bind_generated_index_recovery_evidence(
+            STATE_DB,
+            authorization,
+            config_root=CONFIG_ROOT,
+            evidence_path=planned_evidence,
+        )
+        evidence_path = conditional_atomic_replace(
+            target,
+            temporary,
+            expected_current_sha256=str(
+                authorization["transaction_binding"]["index_base_sha256"]
+            ),
+            evidence_path=planned_evidence,
+        )
+        published = True
+        verify_generated_index_transaction_snapshot(
+            authorization,
+            expected_index_sha256=digest,
+        )
+        # The INDEX document itself is part of SQLite parity.  Do the second
+        # scan before the durable transaction can become consumed.
+        scan(conn)
+        rescanned_payload = generated_index_markdown(conn).encode("utf-8")
+        rescanned_digest = hashlib.sha256(rescanned_payload).hexdigest()
+        verify_generated_index_transaction_snapshot(
+            authorization,
+            expected_index_sha256=digest,
+        )
+        target_payload = (
+            target.read_bytes()
+            if target.is_file() and not target.is_symlink()
+            else b""
+        )
+        target_digest = hashlib.sha256(target_payload).hexdigest()
+        if (
+            rescanned_payload != payload
+            or rescanned_digest != digest
+            or target_payload != payload
+            or target_digest != digest
+        ):
+            raise GeneratedIndexCapabilityError("GENERATED_INDEX_POST_SCAN_DRIFT")
+    except Exception as exc:
+        # If publication happened but a later verification/scan failed, restore
+        # only while the target still contains our generated bytes.  A user or
+        # concurrent process edit wins and is preserved as an incident.
+        if published and evidence_path is not None:
+            try:
+                conditional_atomic_replace(
+                    target,
+                    evidence_path,
+                    expected_current_sha256=digest,
+                )
+                scan(conn)
+            except Exception as rollback_exc:
+                raise GeneratedIndexCapabilityError(
+                    "GENERATED_INDEX_ROLLBACK_CONFLICT"
+                ) from rollback_exc
+        if isinstance(exc, GeneratedIndexCapabilityError):
+            raise
+        raise GeneratedIndexCapabilityError("GENERATED_INDEX_ATOMIC_CAS_FAILED") from exc
+    return {
+        "changed": True,
+        "path": str(target),
+        "sha256": digest,
+        "previous_bytes_evidence": str(evidence_path),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -952,21 +2143,67 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--status", default="", help="Filter by status.")
     parser.add_argument("--has-open-loop", action="store_true", help="Only return docs with open loops.")
     parser.add_argument("--gen-index-candidate", action="store_true", help="Generate an INDEX.md candidate from SQLite.")
+    parser.add_argument("--sync-generated-index", action="store_true", help="Atomically synchronize the generated INDEX.md.")
     parser.add_argument("--output", default="", help="Optional output path for --gen-index-candidate.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if not (args.init or args.scan or args.report or args.search or args.gen_index_candidate):
+    try:
+        transition = assert_runtime_ready("index")
+    except RuntimeTransitionError as exc:
+        print(str(exc))
+        return 2
+    if not (args.init or args.scan or args.report or args.search or args.gen_index_candidate or args.sync_generated_index):
         args.init = True
         args.scan = True
         args.report = True
+    generated_index_capability: dict[str, Any] | None = None
+    if args.sync_generated_index:
+        # Consume the short-lived one-shot capability before a potentially
+        # expensive full-vault scan.  The authorization remains process-local
+        # and cannot expire midway through the already-authorized operation.
+        try:
+            generated_index_capability = consume_generated_index_capability_from_environment(
+                CONFIG_ROOT,
+                state_db=STATE_DB,
+            )
+            verify_generated_index_transaction_snapshot(generated_index_capability)
+        except GeneratedIndexCapabilityError as exc:
+            print(str(exc))
+            return 2
     with connect() as conn:
-        if args.init:
-            init_db(conn)
-        if args.scan:
-            scan(conn)
+        try:
+            if args.init:
+                if transition.get("maintenance_capability"):
+                    init_db(conn)
+                else:
+                    assert_schema_ready(conn)
+            if args.scan:
+                scan(conn)
+                if args.sync_generated_index:
+                    # The capability ledger shares the state database.  Release
+                    # the derived-index write transaction before the separate
+                    # one-shot ledger connection binds generated bytes.
+                    conn.commit()
+        except sqlite3.OperationalError as exc:
+            if str(exc) == "STATE_SCHEMA_MIGRATION_REQUIRED":
+                print("STATE_SCHEMA_MIGRATION_REQUIRED")
+                return 2
+            raise
+        if args.sync_generated_index:
+            try:
+                result = sync_generated_index(
+                    conn,
+                    consumed_capability=generated_index_capability,
+                )
+            except (GeneratedIndexCapabilityError, OSError, RuntimeError, sqlite3.Error) as exc:
+                print(str(exc))
+                return 2
+            print(f"generated_index_changed={int(bool(result['changed']))}")
+            print(f"generated_index_path={result['path']}")
+            print(f"generated_index_sha256={result['sha256']}")
         if args.search:
             print_search(
                 conn,
@@ -988,8 +2225,11 @@ def main() -> int:
         if args.gen_index_candidate:
             candidate = generated_index_candidate(conn)
             if args.output:
-                output_path = Path(args.output).expanduser().resolve()
-                output_path.write_text(candidate, encoding="utf-8")
+                try:
+                    output_path = write_generated_index_candidate(args.output, candidate)
+                except (GeneratedIndexCapabilityError, RuntimeError, OSError) as exc:
+                    print(str(exc))
+                    return 2
                 print(f"index_candidate={output_path}")
             else:
                 print(candidate)

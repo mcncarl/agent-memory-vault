@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from agent_memory_env import env_value, expand_path
+from agent_memory_env import RuntimeTransitionError, assert_runtime_ready, env_value, expand_path
 from agent_memory_safety import SECRET_PATTERNS, normalize_for_detection
 from agent_memory_state import secure_sqlite_connect
 
@@ -64,9 +64,13 @@ REQUIRED_LOCAL_FILES = [
     SCRIPT_ROOT / "bootstrap.py",
     SCRIPT_ROOT / "agent_memory_check.py",
     SCRIPT_ROOT / "agent_memory_evolution.py",
+    SCRIPT_ROOT / "agent_memory_explain.py",
     SCRIPT_ROOT / "agent_memory_index.py",
+    SCRIPT_ROOT / "agent_memory_host_automation.py",
     SCRIPT_ROOT / "agent_memory_intent.py",
+    SCRIPT_ROOT / "agent_memory_observability.py",
     SCRIPT_ROOT / "agent_memory_search.py",
+    SCRIPT_ROOT / "agent_memory_shadow.py",
     SCRIPT_ROOT / "agent_memory_safety.py",
     SCRIPT_ROOT / "agent_memory_closeout.py",
     SCRIPT_ROOT / "agent_memory_audit.py",
@@ -78,13 +82,18 @@ REQUIRED_LOCAL_FILES = [
     SCRIPT_ROOT / "agent_memory_write.py",
     SCRIPT_ROOT / "agent_memory_doctor.py",
     SCRIPT_ROOT / "agent_memory_decision_outcomes.py",
+    SCRIPT_ROOT / "agent_memory_embedding_worker.py",
     SCRIPT_ROOT / "agent_memory_session_hook.py",
     SCRIPT_ROOT / "agent_memory_state.py",
     SCRIPT_ROOT / "agent_memory_stop_hook.py",
     SCRIPT_ROOT / "agent_memory_env.py",
     SCRIPT_ROOT / "install_runtime.py",
+    SCRIPT_ROOT / "install_audit_launchagent.py",
+    SCRIPT_ROOT / "install_host_hooks.py",
     SCRIPT_ROOT / "memoryctl",
 ]
+
+PUBLIC_REQUIRED_LOCAL_FILES = [SCRIPT_ROOT / "run_tests_isolated.py"]
 
 REQUIRED_STATE_TABLES = {
     "meta",
@@ -98,6 +107,7 @@ REQUIRED_STATE_TABLES = {
     "memory_write_intents",
     "memory_write_receipts",
     "memory_session_claims",
+    "memory_use_events",
     "memory_file_observations",
 }
 
@@ -109,6 +119,19 @@ OPTIONAL_STATE_TABLES = {
 COMPACTION_DIR_NAMES = {"用户记忆", "项目", "工作流", "决策", "agent"}
 DEFAULT_COMPACTION_LINE_LIMIT = 140
 DEFAULT_COMPACTION_BYTE_LIMIT = 14 * 1024
+FORBIDDEN_HOST_AUTOMATION_TARGETS = (
+    "agent_memory_stop_hook.py",
+    "agent_memory_session_hook.py",
+    "agent_memory_audit_autorun.py",
+)
+HOST_AUTOMATION_ADAPTERS = (
+    Path("scripts/audit-task.ps1"),
+    Path("scripts/stop-hook.ps1"),
+    Path("scripts/install-codex-hook.ps1"),
+    Path("scripts/agent_memory_session_hook.py"),
+    Path("scripts/agent_memory_stop_hook.py"),
+    Path("scripts/agent_memory_closeout.py"),
+)
 
 
 PRIVATE_PATH_PATTERN = re.compile(r"/Users/[A-Za-z0-9._-]+/")
@@ -310,6 +333,102 @@ def check_public_repo_files() -> list[str]:
     return failures
 
 
+def _markdown_fenced_blocks(text: str) -> list[str]:
+    blocks: list[str] = []
+    current: list[str] = []
+    fence = ""
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        marker = "```" if stripped.startswith("```") else ("~~~" if stripped.startswith("~~~") else "")
+        if marker and not fence:
+            fence = marker
+            current = []
+            continue
+        if marker == fence:
+            blocks.append("\n".join(current))
+            current = []
+            fence = ""
+            continue
+        if fence:
+            current.append(line)
+    if fence and current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def check_host_automation_examples(repo_root: Path = REPO_ROOT) -> list[str]:
+    """Reject production examples/adapters that bypass managed memoryctl.
+
+    Runtime implementation and classifier code may name legacy scripts to
+    preserve or diagnose them.  The stricter boundary applies to copyable
+    documentation blocks and the actual Host Automation adapters.
+    """
+
+    failures: list[str] = []
+    markdown_paths: list[Path] = [
+        path
+        for path in (repo_root / "README.md", repo_root / "README.zh-CN.md")
+        if path.is_file()
+    ]
+    for root in (repo_root / "docs", repo_root / "templates"):
+        if root.is_dir():
+            markdown_paths.extend(root.rglob("*.md"))
+    inline_command = re.compile(
+        r"(?:python(?:3)?|exec|command\s*[:=]|<string>|-Argument)[^\n]{0,500}"
+        r"agent_memory_(?:stop_hook|session_hook|audit_autorun)\.py",
+        re.IGNORECASE,
+    )
+    automation_direct = re.compile(
+        r"(?:python(?:3)?|command\s*[:=]|<runtime>/.+python)[^\n]{0,500}"
+        r"(?:agent_memory_[a-z0-9_]+|install_(?:host_hooks|audit_launchagent))\.py",
+        re.IGNORECASE,
+    )
+    obsolete_claim_guidance = re.compile(
+        r"(?:--actor(?:=|\s+)(?:codex|claude)\s+claim\b|\bclaim\s+--file(?:=|\s))",
+        re.IGNORECASE,
+    )
+    for path in sorted(set(markdown_paths)):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for target in FORBIDDEN_HOST_AUTOMATION_TARGETS:
+            if any(
+                target in block and inline_command.search(block)
+                for block in _markdown_fenced_blocks(text)
+            ):
+                failures.append(
+                    f"HOST_AUTOMATION_BYPASS example={path.relative_to(repo_root)} target={target}"
+                )
+        for line_number, line in enumerate(text.splitlines(), 1):
+            if inline_command.search(line) or (
+                path == repo_root / "docs" / "automation.md"
+                and automation_direct.search(line)
+            ):
+                failures.append(
+                    "HOST_AUTOMATION_BYPASS "
+                    f"example={path.relative_to(repo_root)}:{line_number}"
+                )
+            if obsolete_claim_guidance.search(line):
+                failures.append(
+                    "OBSOLETE_CLAIM_GUIDANCE "
+                    f"example={path.relative_to(repo_root)}:{line_number}"
+                )
+
+    for relative in HOST_AUTOMATION_ADAPTERS:
+        path = repo_root / relative
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for target in FORBIDDEN_HOST_AUTOMATION_TARGETS:
+            if target in text:
+                failures.append(f"HOST_AUTOMATION_BYPASS adapter={relative} target={target}")
+    return sorted(set(failures))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check the local Agent Memory system.")
     parser.add_argument(
@@ -341,6 +460,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    try:
+        assert_runtime_ready("check")
+    except RuntimeTransitionError as exc:
+        payload = {
+            "ok": False,
+            "failures": ["RUNTIME_TRANSITION_INCOMPLETE"],
+            "advisories": [],
+            "checks": [],
+            "status": "error",
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(str(exc), file=sys.stderr)
+        return 2
     failures: list[str] = []
     warnings: list[str] = []
     mode = "public_template" if PUBLIC_TEMPLATE_MODE else "private_runtime"
@@ -361,7 +495,10 @@ def main() -> int:
         else:
             failures.append(f"MISSING file {path}")
 
-    for path in REQUIRED_LOCAL_FILES:
+    required_local_files = REQUIRED_LOCAL_FILES + (
+        PUBLIC_REQUIRED_LOCAL_FILES if PUBLIC_TEMPLATE_MODE else []
+    )
+    for path in required_local_files:
         if path.is_file():
             checks.append(f"OK local_file {path}")
         else:
@@ -405,6 +542,10 @@ def main() -> int:
 
     if PUBLIC_TEMPLATE_MODE:
         failures.extend(check_public_repo_files())
+        automation_failures = check_host_automation_examples()
+        failures.extend(automation_failures)
+        if not automation_failures:
+            checks.append("OK host_automation_examples_use_managed_memoryctl")
 
     if not args.skip_state_db:
         state_ok, state_detail = check_state_db()

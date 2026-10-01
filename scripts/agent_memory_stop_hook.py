@@ -13,8 +13,18 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agent_memory_env import env_value, expand_path
-from agent_memory_claim import active_claim_rows, all_active_claim_rows
+from agent_memory_env import (
+    RuntimeTransitionError,
+    assert_runtime_ready,
+    env_value,
+    expand_path,
+)
+from agent_memory_claim import (
+    active_claim_lease_rows,
+    all_active_claim_lease_rows,
+)
+import agent_memory_observability as observability
+import agent_memory_shadow as shadow_gate
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +33,6 @@ CONFIG_ROOT = expand_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory")
 STATE_DB = expand_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite"))).resolve()
 LOG_PATH = expand_path(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl"))).resolve()
 CLOSEOUT_SCRIPT = REPO_ROOT / "scripts" / "agent_memory_closeout.py"
-AUDIT_AUTORUN = REPO_ROOT / "scripts" / "agent_memory_audit_autorun.py"
 STAMP_ROOT = CONFIG_ROOT / "hooks"
 
 
@@ -207,6 +216,51 @@ def pending_paths() -> list[Path]:
     return unobserved_paths(candidates)
 
 
+def unresolved_closeout_incidents(
+    connection: sqlite3.Connection | None = None,
+) -> list[dict[str, str]]:
+    """Read unresolved post-finalize drift without creating or migrating state."""
+
+    if connection is None and (not STATE_DB.is_file() or STATE_DB.is_symlink()):
+        return []
+    owns_connection = connection is None
+    try:
+        if connection is None:
+            connection = sqlite3.connect(
+                f"{STATE_DB.as_uri()}?mode=ro",
+                uri=True,
+                timeout=5,
+            )
+            connection.execute("PRAGMA query_only=ON")
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_closeout_incidents'"
+        ).fetchone()
+        if table is None:
+            return []
+        rows = connection.execute(
+            "SELECT incident_id, rel_path, reason_code FROM memory_closeout_incidents "
+            "WHERE resolved_at IS NULL ORDER BY detected_at LIMIT 100"
+        ).fetchall()
+        return [
+            {
+                "incident_id": str(row[0]),
+                "rel_path": str(row[1]),
+                "reason_code": str(row[2]),
+            }
+            for row in rows
+        ]
+    except (OSError, sqlite3.Error):
+        # An unreadable v2 incident ledger cannot be treated as healthy.
+        return [{
+            "incident_id": "unreadable",
+            "rel_path": "",
+            "reason_code": "INCIDENT_LEDGER_UNREADABLE",
+        }]
+    finally:
+        if owns_connection and connection is not None:
+            connection.close()
+
+
 def notify(message: str) -> None:
     if sys.platform != "darwin":
         return
@@ -309,33 +363,211 @@ def handle_failure(
     )
 
 
-def run_due_audit() -> None:
-    if not AUDIT_AUTORUN.exists():
-        return
+def finish_success(
+    *,
+    actor: str,
+    raw_session_id: str,
+    protocol: str,
+    payload: dict[str, object],
+    event: str,
+    non_blocking: bool,
+) -> int:
+    """Apply the task-local stale-adoption gate, then close observability."""
+
+    configured_enforcement = env_value("STALE_ADOPTION_ENFORCEMENT", "shadow").strip().lower()
+    enforcement = (
+        "enforce"
+        if configured_enforcement == "enforce" and shadow_gate.cutover_active()
+        else "shadow"
+    )
     try:
-        subprocess.run(
-            [sys.executable, str(AUDIT_AUTORUN), "--reason", "hook", "--min-interval-days", "7", "--notify", "--json"],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            timeout=180,
-            env=clean_env(),
-            check=False,
+        stale_count = observability.adopted_stale_without_verification(
+            actor,
+            raw_session_id,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return
+    except (
+        OSError,
+        sqlite3.Error,
+        ValueError,
+        RuntimeTransitionError,
+        observability.ObservabilityLedgerUnavailable,
+    ):
+        # A broken ledger is not evidence that no stale memory was adopted.
+        # Shadow mode stays non-blocking but exposes a stable degraded signal;
+        # enforce mode fails closed and never records a successful task.
+        observability.record_task_completed(raw_session_id, actor, value="failure")
+        result = {
+            "status": "degraded" if enforcement == "shadow" else "error",
+            "reason_code": "OBSERVABILITY_LEDGER_UNAVAILABLE",
+            "ownership_error": "OBSERVABILITY_LEDGER_UNAVAILABLE",
+        }
+        if enforcement == "enforce":
+            return handle_failure(
+                protocol,
+                result,
+                payload=payload,
+                event=event,
+                non_blocking=non_blocking,
+            )
+        notify("OBSERVABILITY_LEDGER_UNAVAILABLE")
+        print(
+            "Agent Memory observability degraded: OBSERVABILITY_LEDGER_UNAVAILABLE",
+            file=sys.stderr,
+        )
+        return 0
+    if enforcement == "enforce" and stale_count:
+        return handle_failure(
+            protocol,
+            {
+                "status": "error",
+                "reason_code": "ADOPTED_MEMORY_REQUIRES_LIVE_VERIFICATION",
+                "ownership_error": (
+                    f"{stale_count} adopted stale or conflicting memory version(s) "
+                    "lack task-local live verification"
+                ),
+            },
+            payload=payload,
+            event=event,
+            non_blocking=non_blocking,
+        )
+    observability.record_task_completed(raw_session_id, actor, value="success")
+    return 0
+
+
+def run_due_audit() -> None:
+    """Compatibility no-op: the canonical Sunday LaunchAgent owns audits."""
+
+    return
+
+
+def claim_path(row: dict[str, Any]) -> Path:
+    return Path(str(row.get("path", ""))).expanduser().resolve()
+
+
+def invalid_lease_result(rows: list[dict[str, Any]], *, context: str) -> dict[str, Any]:
+    states = sorted({str(row.get("lease_state", "unknown")) for row in rows})
+    paths = sorted({str(row.get("rel_path") or claim_path(row)) for row in rows})
+    return {
+        "status": "error",
+        "ownership_error": (
+            f"{context}: active memory claim(s) do not hold a live intent lease; "
+            f"states={','.join(states)}"
+        ),
+        "lease_states": states,
+        "affected_files": paths,
+    }
 
 
 def main() -> int:
     args = parse_args()
     payload = read_payload()
-    paths = pending_paths()
+    try:
+        assert_runtime_ready("stop-hook")
+    except RuntimeTransitionError:
+        return handle_failure(
+            args.protocol,
+            {
+                "status": "error",
+                "reason_code": "RUNTIME_TRANSITION_INCOMPLETE",
+                "ownership_error": "Agent Memory runtime migration is incomplete",
+            },
+            payload=payload,
+            event=args.event,
+            non_blocking=args.non_blocking,
+        )
+    incidents = unresolved_closeout_incidents()
+    if incidents:
+        return handle_failure(
+            args.protocol,
+            {
+                "status": "error",
+                "reason_code": "POST_FINALIZE_CONTENT_DRIFT",
+                "ownership_error": (
+                    "Agent Memory has unresolved post-finalize content drift; "
+                    "run Doctor and resolve the recorded incident before continuing"
+                ),
+                "incident_count": len(incidents),
+                "affected_files": sorted({
+                    item["rel_path"] for item in incidents if item.get("rel_path")
+                }),
+            },
+            payload=payload,
+            event=args.event,
+            non_blocking=args.non_blocking,
+        )
     raw_session_id = session_key(payload, args.actor)
-    current_claims = active_claim_rows(raw_session_id, args.actor, max_age_hours=24)
-    if args.auto_closeout and current_claims:
+    # This is intentionally best effort and runs before every early-return
+    # branch so a missing search can be distinguished from a missing task
+    # denominator. The helper never raises into the host lifecycle hook.
+    observability.record_task_seen(raw_session_id, args.actor)
+    paths = pending_paths()
+    pending_set = {path.resolve() for path in paths}
+    try:
+        current_claims = (
+            active_claim_lease_rows(raw_session_id, args.actor)
+            if raw_session_id
+            else []
+        )
+        all_claims = all_active_claim_lease_rows() if args.auto_closeout and paths else []
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        if not args.auto_closeout:
+            current_claims, all_claims = [], []
+        else:
+            return handle_failure(
+                args.protocol,
+                {
+                    "status": "error",
+                    "ownership_error": "cannot verify current memory intent leases",
+                    "error": type(exc).__name__,
+                },
+                payload=payload,
+                event=args.event,
+                non_blocking=args.non_blocking,
+            )
+    current_live_claims = [
+        row for row in current_claims if str(row.get("lease_state", "")) == "live"
+    ]
+    current_terminal_claims = [
+        row for row in current_claims if str(row.get("lease_state", "")) == "intent_terminal"
+    ]
+    dirty_claims = [row for row in all_claims if claim_path(row) in pending_set]
+    invalid_dirty_claims = [
+        row for row in dirty_claims if str(row.get("lease_state", "")) != "live"
+    ]
+    if args.auto_closeout and current_terminal_claims:
+        return handle_failure(
+            args.protocol,
+            invalid_lease_result(
+                current_terminal_claims,
+                context="terminal intent still has an active claim",
+            ),
+            payload=payload,
+            event=args.event,
+            non_blocking=args.non_blocking,
+        )
+    if args.auto_closeout and invalid_dirty_claims:
+        return handle_failure(
+            args.protocol,
+            invalid_lease_result(
+                invalid_dirty_claims,
+                context="dirty memory is covered by an invalid or expired lease",
+            ),
+            payload=payload,
+            event=args.event,
+            non_blocking=args.non_blocking,
+        )
+    if args.auto_closeout and current_live_claims:
         result = run_closeout(payload, args.actor, args.timeout, args.event)
-        return 0 if result.get("status") == "ok" else handle_failure(
+        if result.get("status") == "ok":
+            return finish_success(
+                actor=args.actor,
+                raw_session_id=raw_session_id,
+                protocol=args.protocol,
+                payload=payload,
+                event=args.event,
+                non_blocking=args.non_blocking,
+            )
+        return handle_failure(
             args.protocol,
             result,
             payload=payload,
@@ -343,15 +575,21 @@ def main() -> int:
             non_blocking=args.non_blocking,
         )
     if args.auto_closeout and paths:
-        all_claimed_paths = {
-            Path(row["path"]).resolve()
-            for row in all_active_claim_rows(max_age_hours=24)
+        live_claimed_paths = {
+            claim_path(row)
+            for row in dirty_claims
+            if str(row.get("lease_state", "")) == "live"
         }
-        unclaimed = [path for path in paths if path.resolve() not in all_claimed_paths]
+        unclaimed = [path for path in paths if path.resolve() not in live_claimed_paths]
         if not unclaimed:
-            if args.event != "session-end":
-                run_due_audit()
-            return 0
+            return finish_success(
+                actor=args.actor,
+                raw_session_id=raw_session_id,
+                protocol=args.protocol,
+                payload=payload,
+                event=args.event,
+                non_blocking=args.non_blocking,
+            )
         if not raw_session_id:
             result = {
                 "status": "error",
@@ -370,8 +608,9 @@ def main() -> int:
             result = {
                 "status": "error",
                 "ownership_error": (
-                    f"{len(unclaimed)} changed memory file(s) are not claimed by any session; "
-                    f"run memoryctl --actor {args.actor} claim --file <path> for files owned by this session"
+                    f"{len(unclaimed)} changed memory file(s) have no live intent-backed claim; "
+                    f"re-read and prepare through memoryctl --actor {args.actor} write, "
+                    "or explicitly ADOPT an authorized external edit"
                 ),
                 "unclaimed_files": [str(path) for path in unclaimed],
             }
@@ -397,9 +636,14 @@ def main() -> int:
             if not stamp.exists():
                 stamp.write_text(str(int(time.time())), encoding="utf-8")
                 notify(f"{len(paths)} memory files still need closeout.")
-    if args.event != "session-end":
-        run_due_audit()
-    return 0
+    return finish_success(
+        actor=args.actor,
+        raw_session_id=raw_session_id,
+        protocol=args.protocol,
+        payload=payload,
+        event=args.event,
+        non_blocking=args.non_blocking,
+    )
 
 
 if __name__ == "__main__":

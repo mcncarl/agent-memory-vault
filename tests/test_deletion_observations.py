@@ -21,6 +21,7 @@ if str(SCRIPTS) not in sys.path:
 
 import agent_memory_claim as claim
 from agent_memory_claim import parse_deleted_observation
+from state_fixture import initialize_full_state
 
 
 def git(root: Path, *args: str) -> str:
@@ -87,6 +88,11 @@ class DeletionObservationCommandTests(unittest.TestCase):
         self.env["AGENT_MEMORY_CONFIG_FILE"] = str(config_path)
         self.env["HOME"] = str(self.root)
         self.env["USERPROFILE"] = str(self.root)
+        initialize_full_state(self.state_db)
+        self.state_before = self.state_db.read_bytes()
+
+    def assert_state_unchanged(self) -> None:
+        self.assertEqual(self.state_db.read_bytes(), self.state_before)
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
@@ -100,7 +106,6 @@ class DeletionObservationCommandTests(unittest.TestCase):
         apply: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         command = [
-            sys.executable,
             str(SCRIPTS / "memoryctl"),
             "--actor",
             "human",
@@ -129,12 +134,17 @@ class DeletionObservationCommandTests(unittest.TestCase):
         )
 
     def test_preview_then_apply_records_audited_tombstone_without_restoring_file(self) -> None:
+        state_before = self.state_db.read_bytes()
         preview = self.observe()
         self.assertEqual(preview.returncode, 0, preview.stderr + preview.stdout)
         preview_payload = json.loads(preview.stdout)
         self.assertTrue(preview_payload["preview"])
         self.assertEqual(preview_payload["applied"], 0)
-        self.assertFalse(self.state_db.exists(), "preview must not create or modify the state database")
+        self.assertEqual(
+            self.state_db.read_bytes(),
+            state_before,
+            "preview must not modify the disposable state database",
+        )
 
         applied = self.observe(apply=True)
         self.assertEqual(applied.returncode, 0, applied.stderr + applied.stdout)
@@ -181,14 +191,14 @@ class DeletionObservationCommandTests(unittest.TestCase):
         completed = self.observe(authorized=False, apply=True)
         self.assertEqual(completed.returncode, 2, completed.stderr + completed.stdout)
         self.assertIn("explicit user authorization", json.loads(completed.stdout)["error"])
-        self.assertFalse(self.state_db.exists())
+        self.assert_state_unchanged()
 
     def test_trash_hash_mismatch_is_rejected_without_writes(self) -> None:
         self.trash_file.write_text("different content\n", encoding="utf-8")
         completed = self.observe(apply=True)
         self.assertEqual(completed.returncode, 2, completed.stderr + completed.stdout)
         self.assertIn("does not match", json.loads(completed.stdout)["error"])
-        self.assertFalse(self.state_db.exists())
+        self.assert_state_unchanged()
 
     def test_trash_symlink_is_rejected_without_writes(self) -> None:
         trash_link = self.trash_dir / "deleted-note-link.md"
@@ -196,7 +206,7 @@ class DeletionObservationCommandTests(unittest.TestCase):
         completed = self.observe(trash_file=trash_link, apply=True)
         self.assertEqual(completed.returncode, 2, completed.stderr + completed.stdout)
         self.assertIn("regular file", json.loads(completed.stdout)["error"])
-        self.assertFalse(self.state_db.exists())
+        self.assert_state_unchanged()
 
     def test_lookalike_trash_component_is_rejected_without_writes(self) -> None:
         lookalike = self.root / "ordinary" / ".Trash"
@@ -206,7 +216,7 @@ class DeletionObservationCommandTests(unittest.TestCase):
         completed = self.observe(trash_file=fake_trash, apply=True)
         self.assertEqual(completed.returncode, 2, completed.stderr + completed.stdout)
         self.assertIn("recognized Trash", json.loads(completed.stdout)["error"])
-        self.assertFalse(self.state_db.exists())
+        self.assert_state_unchanged()
 
     def test_staged_readd_with_missing_worktree_file_is_rejected(self) -> None:
         self.target.write_bytes(self.content)
@@ -215,7 +225,7 @@ class DeletionObservationCommandTests(unittest.TestCase):
         completed = self.observe(apply=True)
         self.assertEqual(completed.returncode, 2, completed.stderr + completed.stdout)
         self.assertIn("uncommitted Git index or worktree", json.loads(completed.stdout)["error"])
-        self.assertFalse(self.state_db.exists())
+        self.assert_state_unchanged()
 
     def test_apply_revalidates_trash_after_preview(self) -> None:
         patches = (
@@ -253,7 +263,7 @@ class DeletionObservationCommandTests(unittest.TestCase):
                     evidence_ref="current-user-turn-explicit-delete",
                     user_authorized=True,
                 )
-        self.assertFalse(self.state_db.exists())
+        self.assert_state_unchanged()
 
     def test_non_ancestor_deletion_commit_is_rejected(self) -> None:
         side_trash = self.trash_dir / "side-deleted-note.md"
@@ -268,14 +278,14 @@ class DeletionObservationCommandTests(unittest.TestCase):
         completed = self.observe(commit=side_commit, trash_file=side_trash, apply=True)
         self.assertEqual(completed.returncode, 2, completed.stderr + completed.stdout)
         self.assertIn("not an ancestor", json.loads(completed.stdout)["error"])
-        self.assertFalse(self.state_db.exists())
+        self.assert_state_unchanged()
 
     def test_ancestor_commit_that_did_not_delete_target_is_rejected(self) -> None:
         completed = self.observe(commit=self.non_deletion_commit, apply=True)
         self.assertEqual(completed.returncode, 2, completed.stderr + completed.stdout)
         error = json.loads(completed.stdout)["error"]
         self.assertTrue("still contains" in error or "did not delete" in error)
-        self.assertFalse(self.state_db.exists())
+        self.assert_state_unchanged()
 
 
 if __name__ == "__main__":

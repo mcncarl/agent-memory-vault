@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import gc
 import hashlib
 import importlib.util
 import json
@@ -11,13 +12,14 @@ import math
 import os
 import re
 import sqlite3
+import stat
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_memory_env import env_value, expand_path
+from agent_memory_env import RuntimeTransitionError, assert_runtime_ready, env_value, expand_path
 from agent_memory_lock import try_lock, unlock
 from agent_memory_state import absolute_path, secure_sqlite_connect
 
@@ -42,11 +44,26 @@ DEFAULT_REQUIRE_LOCAL_MODEL = env_value("REQUIRE_LOCAL_MODEL", "false").strip().
     "yes",
     "on",
 }
+DEFAULT_MODEL_REVISION = env_value("MODEL_REVISION", "")
+DEFAULT_MODEL_MANIFEST = expand_path(
+    env_value(
+        "MODEL_MANIFEST",
+        str(REPO_ROOT / ".agent-memory" / "models" / "embeddinggemma-300m" / "model-manifest.json"),
+    )
+).resolve()
+DEFAULT_LOCK_TIMEOUT = float(env_value("ZVEC_LOCK_TIMEOUT_SECONDS", "2"))
+DEFAULT_WORKER_COLD_TIMEOUT = float(env_value("EMBEDDING_WORKER_COLD_TIMEOUT_SECONDS", "12"))
+DEFAULT_WORKER_WARM_TIMEOUT = float(env_value("EMBEDDING_WORKER_WARM_TIMEOUT_SECONDS", "2"))
+DEFAULT_WORKER_IDLE_SECONDS = int(env_value("EMBEDDING_WORKER_IDLE_SECONDS", "600"))
+DEFAULT_CANDIDATE_POOL_MIN = int(env_value("CANDIDATE_POOL_MIN", "64"))
+DEFAULT_CANDIDATE_POOL_FACTOR = int(env_value("CANDIDATE_POOL_FACTOR", "16"))
+DEFAULT_CANDIDATE_POOL_MAX = int(env_value("CANDIDATE_POOL_MAX", "512"))
 DEFAULT_LIMIT = 5
 CHUNK_MAX_CHARS = 1400
 CHUNK_OVERLAP_CHARS = 160
-CHUNK_POLICY_VERSION = "2"
-HISTORY_SECTION_PATTERNS = ("已过时", "历史信息", "旧方案", "废弃", "不再使用")
+CHUNK_POLICY_VERSION = "4"
+VECTOR_SCHEMA_VERSION = "3"
+HISTORY_SECTION_PATTERNS = ("已过时", "历史信息", "事实历史", "旧方案", "废弃", "不再使用")
 EXCLUDED_MEMORY_TYPES = {"directory_index", "routing", "template", "agent_case_candidate", "skill_candidate"}
 EXCLUDED_STATUS = {"archived", "deleted", "draft", "obsolete", "outdated", "deprecated", "stale"}
 
@@ -65,6 +82,7 @@ class IndexedDoc:
     status: str
     sensitivity: str
     verified_at: str
+    memory_id: str
 
 
 @dataclass
@@ -83,6 +101,7 @@ class Chunk:
     agent_id: str
     app_id: str
     verified_at: str
+    memory_id: str
 
 
 class EmbedderError(RuntimeError):
@@ -105,9 +124,29 @@ def utc_now() -> str:
 
 
 @contextlib.contextmanager
-def zvec_lock(exclusive: bool, timeout: float):
-    DEFAULT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with DEFAULT_LOCK_PATH.open("a+", encoding="utf-8") as handle:
+def zvec_lock(exclusive: bool, timeout: float, *, allow_create: bool = False):
+    """Use the native collection lock without read-path filesystem writes."""
+
+    if allow_create:
+        DEFAULT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            DEFAULT_LOCK_PATH.parent.chmod(0o700)
+        except OSError:
+            pass
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(DEFAULT_LOCK_PATH, flags, 0o600)
+    else:
+        try:
+            metadata = DEFAULT_LOCK_PATH.lstat()
+        except FileNotFoundError as exc:
+            raise RuntimeError("ZVEC_LOCK_MISSING") from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("ZVEC_LOCK_UNSAFE")
+        descriptor = os.open(
+            DEFAULT_LOCK_PATH,
+            os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    with os.fdopen(descriptor, "r+", encoding="utf-8") as handle:
         deadline = time.monotonic() + max(timeout, 0.0)
         while True:
             try:
@@ -217,8 +256,8 @@ def chunk_body(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap: int = CHUNK
     return chunks
 
 
-def stable_chunk_id(rel_path: str, doc_sha: str, chunk_index: int, chunk_sha: str) -> str:
-    return sha256_text(f"{rel_path}\n{doc_sha}\n{chunk_index}\n{chunk_sha}")
+def stable_chunk_id(memory_id: str, doc_sha: str, chunk_index: int, chunk_sha: str) -> str:
+    return sha256_text(f"{memory_id}\n{doc_sha}\n{chunk_index}\n{chunk_sha}")
 
 
 def build_chunks(sqlite_index: Any, doc: IndexedDoc) -> list[Chunk]:
@@ -252,7 +291,7 @@ def build_chunks(sqlite_index: Any, doc: IndexedDoc) -> list[Chunk]:
         chunk_sha = sha256_text(clean_text)
         chunks.append(
             Chunk(
-                chunk_id=stable_chunk_id(doc.rel_path, doc.sha256, index, chunk_sha),
+                chunk_id=stable_chunk_id(doc.memory_id, doc.sha256, index, chunk_sha),
                 path=doc.path,
                 rel_path=doc.rel_path,
                 doc_sha256=doc.sha256,
@@ -266,20 +305,29 @@ def build_chunks(sqlite_index: Any, doc: IndexedDoc) -> list[Chunk]:
                 agent_id=doc.agent_id,
                 app_id=doc.app_id,
                 verified_at=doc.verified_at,
+                memory_id=doc.memory_id,
             )
         )
     return chunks
 
 
-def connect(state_db: Path = STATE_DB) -> sqlite3.Connection:
-    return secure_sqlite_connect(
-        state_db,
-        row_factory=sqlite3.Row,
-        pragmas=(
+def connect(state_db: Path = STATE_DB, *, read_only: bool = False) -> sqlite3.Connection:
+    assert_runtime_ready("zvec")
+    pragmas = (
+        ("PRAGMA busy_timeout=10000",)
+        if read_only
+        else (
             "PRAGMA journal_mode=WAL",
             "PRAGMA foreign_keys=ON",
             "PRAGMA busy_timeout=10000",
-        ),
+        )
+    )
+    return secure_sqlite_connect(
+        state_db,
+        create=False,
+        read_only=read_only,
+        row_factory=sqlite3.Row,
+        pragmas=pragmas,
     )
 
 
@@ -299,6 +347,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS memory_vector_chunks (
           chunk_id TEXT PRIMARY KEY,
+          memory_id TEXT NOT NULL,
           path TEXT NOT NULL,
           rel_path TEXT NOT NULL,
           doc_sha256 TEXT NOT NULL,
@@ -325,6 +374,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS memory_vector_index_state (
           path TEXT PRIMARY KEY,
+          memory_id TEXT NOT NULL,
           rel_path TEXT,
           doc_sha256 TEXT,
           status TEXT NOT NULL,
@@ -337,12 +387,65 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    ensure_column(conn, "memory_vector_chunks", "memory_id", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "memory_vector_index_state", "memory_id", "TEXT NOT NULL DEFAULT ''")
     ensure_column(conn, "memory_vector_index_state", "chunk_policy_version", "TEXT DEFAULT '1'")
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_vector_schema_version", "2"))
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memory_vector_chunks_memory_id "
+        "ON memory_vector_chunks(memory_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memory_vector_index_state_memory_id "
+        "ON memory_vector_index_state(memory_id)"
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+        ("memory_vector_schema_version", VECTOR_SCHEMA_VERSION),
+    )
     conn.commit()
 
 
+def assert_schema_ready(conn: sqlite3.Connection) -> None:
+    tables = {
+        str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    required = {"meta", "memory_vector_chunks", "memory_vector_index_state"}
+    version = None
+    if "meta" in tables:
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key='memory_vector_schema_version'"
+        ).fetchone()
+    state_columns = (
+        {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(memory_vector_index_state)")
+        }
+        if "memory_vector_index_state" in tables
+        else set()
+    )
+    chunk_columns = (
+        {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(memory_vector_chunks)")
+        }
+        if "memory_vector_chunks" in tables
+        else set()
+    )
+    if (
+        not required.issubset(tables)
+        or "memory_id" not in chunk_columns
+        or "memory_id" not in state_columns
+        or "chunk_policy_version" not in state_columns
+        or version is None
+        or str(version[0]) != VECTOR_SCHEMA_VERSION
+    ):
+        raise sqlite3.OperationalError("STATE_SCHEMA_MIGRATION_REQUIRED")
+
+
 def doc_from_row(row: sqlite3.Row) -> IndexedDoc:
+    memory_id = str(row["memory_id"] or "").casefold()
+    if not re.fullmatch(r"[0-9a-f]{64}", memory_id):
+        raise sqlite3.IntegrityError("MEMORY_ID_INVALID")
     return IndexedDoc(
         path=Path(row["path"]),
         rel_path=str(row["rel_path"]),
@@ -356,7 +459,16 @@ def doc_from_row(row: sqlite3.Row) -> IndexedDoc:
         status=str(row["status"] or "active"),
         sensitivity=str(row["sensitivity"] or "normal"),
         verified_at=str(row["verified_at"] or ""),
+        memory_id=memory_id,
     )
+
+
+def assert_unique_doc_memory_ids(docs: list[IndexedDoc]) -> None:
+    seen: set[str] = set()
+    for doc in docs:
+        if doc.memory_id in seen:
+            raise sqlite3.IntegrityError("DUPLICATE_MEMORY_ID")
+        seen.add(doc.memory_id)
 
 
 def is_eligible_doc(doc: IndexedDoc, vault_root: Path) -> bool:
@@ -380,13 +492,21 @@ def is_eligible_doc(doc: IndexedDoc, vault_root: Path) -> bool:
 def load_index_docs(conn: sqlite3.Connection, vault_root: Path) -> list[IndexedDoc]:
     rows = conn.execute(
         """
-        SELECT path, rel_path, sha256, title, memory_type, track, project_id,
-               app_id, agent_id, status, sensitivity, verified_at
-        FROM memory_docs
-        ORDER BY rel_path
+        SELECT d.path, d.rel_path, d.memory_id, d.sha256, d.title, d.memory_type, d.track, d.project_id,
+               d.app_id, d.agent_id, d.status, d.sensitivity, d.verified_at
+        FROM memory_docs d
+        LEFT JOIN memory_fact_states f ON f.rel_path=d.rel_path
+        WHERE f.rel_path IS NULL OR f.fact_status='current'
+        ORDER BY d.rel_path
         """
     ).fetchall()
-    return [doc for doc in (doc_from_row(row) for row in rows) if is_eligible_doc(doc, vault_root)]
+    docs = [
+        doc
+        for doc in (doc_from_row(row) for row in rows)
+        if is_eligible_doc(doc, vault_root)
+    ]
+    assert_unique_doc_memory_ids(docs)
+    return docs
 
 
 def load_changed_docs(conn: sqlite3.Connection, raw_paths: list[str], vault_root: Path) -> tuple[list[IndexedDoc], list[str]]:
@@ -399,15 +519,25 @@ def load_changed_docs(conn: sqlite3.Connection, raw_paths: list[str], vault_root
         path = path.resolve()
         row = conn.execute(
             """
-            SELECT path, rel_path, sha256, title, memory_type, track, project_id,
-                   app_id, agent_id, status, sensitivity, verified_at
-            FROM memory_docs
-            WHERE path=?
+            SELECT d.path, d.rel_path, d.memory_id, d.sha256, d.title, d.memory_type, d.track, d.project_id,
+                   d.app_id, d.agent_id, d.status, d.sensitivity, d.verified_at,
+                   f.rel_path AS fact_state_rel_path, f.fact_status
+            FROM memory_docs d
+            LEFT JOIN memory_fact_states f ON f.rel_path=d.rel_path
+            WHERE d.path=?
             """,
             (str(path),),
         ).fetchone()
         if not row:
             errors.append(f"not_in_sqlite_index {path}")
+            continue
+        # A changed Markdown file can be present in the canonical SQLite index
+        # while the temporal projection deliberately excludes it from current
+        # retrieval (for example, superseded or conflict facts).  This is not
+        # an indexing failure and must not create a skipped/error vector state.
+        # When --prune is requested, prune_ineligible() removes any vectors
+        # left from the document's formerly-current version.
+        if row["fact_state_rel_path"] is not None and row["fact_status"] != "current":
             continue
         doc = doc_from_row(row)
         if not is_eligible_doc(doc, vault_root):
@@ -425,12 +555,14 @@ class EmbeddingGemmaEmbedder:
         device: str = "cpu",
         cache_folder: str = "",
         require_local_model: bool = False,
+        model_revision: str = "",
     ) -> None:
         self.model_name = model_name
         self.embedding_dim = embedding_dim
         self.device = device
         self.cache_folder = cache_folder
         self.require_local_model = require_local_model
+        self.model_revision = model_revision
         self._model: Any | None = None
 
     def _load_model(self) -> Any:
@@ -448,6 +580,8 @@ class EmbeddingGemmaEmbedder:
             kwargs["device"] = self.device
         if self.cache_folder:
             kwargs["cache_folder"] = self.cache_folder
+        if self.model_revision:
+            kwargs["revision"] = self.model_revision
         if self.require_local_model:
             model_path = Path(self.model_name).expanduser().resolve()
             if not model_path.is_dir():
@@ -483,7 +617,11 @@ class EmbeddingGemmaEmbedder:
         normalized: list[list[float]] = []
         for row in array:
             vector = [float(item) for item in row.tolist()]
+            if any(not math.isfinite(item) for item in vector):
+                raise EmbedderError("embedding_vector_nonfinite")
             norm = math.sqrt(sum(item * item for item in vector))
+            if not math.isfinite(norm):
+                raise EmbedderError("embedding_vector_norm_nonfinite")
             if norm > 0:
                 vector = [item / norm for item in vector]
             normalized.append(vector)
@@ -567,9 +705,20 @@ class ZvecStore:
         else:
             self._collection = zvec.create_and_open(path=str(self.collection_path), schema=self._schema())
 
+    def open_existing(self) -> None:
+        """Open the collection for query without creating directories or data."""
+
+        if self._collection is not None:
+            return
+        if not self.collection_path.exists() or self.collection_path.is_symlink():
+            raise RuntimeError("ZVEC_INDEX_MIGRATION_REQUIRED")
+        self._collection = self._load_zvec().open(path=str(self.collection_path))
+
     @property
     def collection(self) -> Any:
-        self.init()
+        # Ordinary maintenance/query paths must never create a collection.
+        # The installer-only preflight path calls ``init`` explicitly first.
+        self.open_existing()
         return self._collection
 
     def replace_chunks(self, chunks: list[Chunk], embeddings: list[list[float]], old_chunk_ids: list[str]) -> None:
@@ -605,6 +754,23 @@ class ZvecStore:
         results = self.collection.query(queries=zvec.Query(field_name="embedding", vector=embedding), topk=max(limit, 1))
         return [(str(item.id), float(item.score)) for item in results]
 
+    def close(self) -> None:
+        """Release the native collection before another process opens it.
+
+        The Python zvec binding does not expose a public ``close`` method. Its
+        native collection lock is released by the wrapper destructor, so drop
+        the last owned reference and collect it deterministically. This is
+        especially important for the retrieval benchmark: the direct-vector
+        baseline and the production Hybrid subprocess must not overlap their
+        collection lifetimes.
+        """
+
+        collection = self._collection
+        self._collection = None
+        if collection is not None:
+            del collection
+            gc.collect()
+
 
 def old_chunk_ids(conn: sqlite3.Connection, path: Path) -> list[str]:
     return [
@@ -614,6 +780,46 @@ def old_chunk_ids(conn: sqlite3.Connection, path: Path) -> list[str]:
             (str(path),),
         ).fetchall()
     ]
+
+
+def stale_identity_chunk_ids(
+    conn: sqlite3.Connection, memory_id: str, current_path: Path
+) -> list[str]:
+    return [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT chunk_id FROM memory_vector_chunks "
+            "WHERE memory_id=? AND path<>? ORDER BY chunk_id",
+            (memory_id, str(current_path)),
+        ).fetchall()
+    ]
+
+
+def prune_stale_identity(
+    conn: sqlite3.Connection, store: ZvecStore, doc: IndexedDoc
+) -> int:
+    """Remove old-path vectors for the same stable identity after a rename."""
+
+    stale_ids = stale_identity_chunk_ids(conn, doc.memory_id, doc.path)
+    stale_paths = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT path FROM memory_vector_index_state "
+            "WHERE memory_id=? AND path<>? ORDER BY path",
+            (doc.memory_id, str(doc.path)),
+        ).fetchall()
+    ]
+    if stale_ids:
+        store.replace_chunks([], [], stale_ids)
+    conn.execute(
+        "DELETE FROM memory_vector_chunks WHERE memory_id=? AND path<>?",
+        (doc.memory_id, str(doc.path)),
+    )
+    conn.execute(
+        "DELETE FROM memory_vector_index_state WHERE memory_id=? AND path<>?",
+        (doc.memory_id, str(doc.path)),
+    )
+    return len(stale_paths)
 
 
 def mark_state(
@@ -628,11 +834,12 @@ def mark_state(
     conn.execute(
         """
         INSERT INTO memory_vector_index_state (
-          path, rel_path, doc_sha256, status, chunk_count, last_error,
+          path, memory_id, rel_path, doc_sha256, status, chunk_count, last_error,
           embedding_model, embedding_dim, chunk_policy_version, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
+          memory_id=excluded.memory_id,
           rel_path=excluded.rel_path,
           doc_sha256=excluded.doc_sha256,
           status=excluded.status,
@@ -643,7 +850,10 @@ def mark_state(
           chunk_policy_version=excluded.chunk_policy_version,
           updated_at=excluded.updated_at
         """,
-        (str(doc.path), doc.rel_path, doc.sha256, status, chunk_count, error[:800], model, dim, CHUNK_POLICY_VERSION, utc_now()),
+        (
+            str(doc.path), doc.memory_id, doc.rel_path, doc.sha256, status,
+            chunk_count, error[:800], model, dim, CHUNK_POLICY_VERSION, utc_now(),
+        ),
     )
 
 
@@ -652,15 +862,16 @@ def upsert_chunks(conn: sqlite3.Connection, chunks: list[Chunk], model: str, dim
     conn.executemany(
         """
         INSERT INTO memory_vector_chunks (
-          chunk_id, path, rel_path, doc_sha256, chunk_sha256, chunk_index,
+          chunk_id, memory_id, path, rel_path, doc_sha256, chunk_sha256, chunk_index,
           title, chunk_text, memory_type, track, project_id, agent_id, app_id,
           verified_at, embedding_model, embedding_dim, indexed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
                 chunk.chunk_id,
+                chunk.memory_id,
                 str(chunk.path),
                 chunk.rel_path,
                 chunk.doc_sha256,
@@ -693,13 +904,20 @@ def refresh_doc(
     dim: int,
     force: bool = False,
 ) -> tuple[str, int, str]:
+    try:
+        prune_stale_identity(conn, store, doc)
+    except Exception as exc:
+        mark_state(conn, doc, "error", 0, str(exc), model, dim)
+        return ("error", 0, str(exc))
     current = conn.execute(
-        "SELECT doc_sha256, status, embedding_model, embedding_dim, chunk_policy_version FROM memory_vector_index_state WHERE path=?",
+        "SELECT memory_id, doc_sha256, status, embedding_model, embedding_dim, "
+        "chunk_policy_version FROM memory_vector_index_state WHERE path=?",
         (str(doc.path),),
     ).fetchone()
     if (
         current
         and not force
+        and str(current["memory_id"] or "") == doc.memory_id
         and current["doc_sha256"] == doc.sha256
         and current["status"] == "indexed"
         and current["embedding_model"] == model
@@ -733,54 +951,40 @@ def refresh_doc(
         return ("error", 0, str(exc))
 
 
-def lexical_terms(query: str) -> set[str]:
-    terms = {item.lower() for item in re.split(r"\s+", query.strip()) if len(item.strip()) >= 2}
-    terms.update(item.lower() for item in re.findall(r"[A-Za-z0-9_./+-]{2,}", query))
-    for cjk in re.findall(r"[\u4e00-\u9fff]{2,}", query):
-        if len(cjk) <= 6:
-            terms.add(cjk)
-        for size in (2, 3):
-            for index in range(0, max(len(cjk) - size + 1, 0)):
-                terms.add(cjk[index : index + size])
-    return terms
-
-
-def rank_adjustment(row: sqlite3.Row, query_terms: set[str]) -> float:
-    if not query_terms:
-        return 0.0
-    text = f"{row['title'] or ''}\n{row['rel_path'] or ''}\n{row['chunk_text'] or ''}".lower()
-    matches = [term for term in query_terms if term in text]
-    adjustment = min(len(matches) * 0.03, 0.18)
-    if any(term in str(row["title"] or "").lower() or term in str(row["rel_path"] or "").lower() for term in query_terms):
-        adjustment += 0.05
-    return adjustment
-
-
-def vector_rows(conn: sqlite3.Connection, scored_ids: list[tuple[str, float]], query: str = "") -> list[dict[str, object]]:
+def vector_rows(
+    conn: sqlite3.Connection,
+    scored_ids: list[tuple[str, float]],
+    query: str = "",
+    *,
+    expected_embedding_binding: str = "",
+) -> list[dict[str, object]]:
     if not scored_ids:
         return []
     by_id = {chunk_id: score for chunk_id, score in scored_ids}
     placeholders = ",".join("?" for _ in by_id)
+    binding_clause = " AND embedding_model=?" if expected_embedding_binding else ""
     rows = conn.execute(
         f"""
-        SELECT chunk_id, path, rel_path, title, chunk_index, chunk_text,
+        SELECT chunk_id, memory_id, path, rel_path, title, chunk_index, chunk_text,
                memory_type, track, project_id, agent_id, app_id, verified_at,
                embedding_model, embedding_dim, indexed_at
         FROM memory_vector_chunks
-        WHERE chunk_id IN ({placeholders})
+        WHERE chunk_id IN ({placeholders}) AND memory_id<>''{binding_clause}
         """,
-        tuple(by_id),
+        (*tuple(by_id), *((expected_embedding_binding,) if expected_embedding_binding else ())),
     ).fetchall()
-    query_terms = lexical_terms(query)
     mapped: list[dict[str, object]] = []
     for row in rows:
         vector_score = by_id[row["chunk_id"]]
-        rank_score = vector_score - rank_adjustment(row, query_terms)
         mapped.append(
             {
                 "chunk_id": row["chunk_id"],
-                "score": rank_score,
-                "rank_distance": rank_score,
+                "memory_id": row["memory_id"],
+                # Vector output is deliberately pure.  Lexical evidence is
+                # fused by agent_memory_search using RRF and must never alter
+                # the semantic distance consumed by reconcile/policy code.
+                "score": vector_score,
+                "rank_distance": vector_score,
                 "vector_score": vector_score,
                 "raw_distance": vector_score,
                 "path": row["path"],
@@ -799,25 +1003,50 @@ def vector_rows(conn: sqlite3.Connection, scored_ids: list[tuple[str, float]], q
                 "indexed_at": row["indexed_at"],
             }
         )
-    best_by_path: dict[str, dict[str, object]] = {}
+    best_by_identity: dict[str, dict[str, object]] = {}
     for item in mapped:
-        path = str(item["path"])
-        previous = best_by_path.get(path)
-        if previous is None or float(item["score"]) < float(previous["score"]):
-            best_by_path[path] = item
-    deduped = list(best_by_path.values())
-    deduped.sort(key=lambda item: float(item["score"]))
+        memory_id = str(item["memory_id"] or "").casefold()
+        if not re.fullmatch(r"[0-9a-f]{64}", memory_id):
+            continue
+        previous = best_by_identity.get(memory_id)
+        if previous is None or float(item["raw_distance"]) < float(previous["raw_distance"]):
+            item["memory_id"] = memory_id
+            best_by_identity[memory_id] = item
+    deduped = list(best_by_identity.values())
+    deduped.sort(
+        key=lambda item: (float(item["raw_distance"]), str(item["memory_id"]))
+    )
     return deduped
 
 
 def parity_report(conn: sqlite3.Connection, vault_root: Path) -> dict[str, object]:
     eligible_docs = load_index_docs(conn, vault_root)
-    eligible = {str(doc.path): doc.rel_path for doc in eligible_docs}
-    rows = conn.execute("SELECT path, rel_path, status, chunk_count, last_error FROM memory_vector_index_state").fetchall()
-    indexed = {str(row["path"]): row for row in rows if row["status"] == "indexed" and str(row["path"]) in eligible}
+    eligible = {str(doc.path): doc for doc in eligible_docs}
+    rows = conn.execute(
+        "SELECT path, memory_id, rel_path, doc_sha256, status, chunk_count, "
+        "last_error FROM memory_vector_index_state"
+    ).fetchall()
+    indexed = {
+        str(row["path"]): row
+        for row in rows
+        if row["status"] == "indexed"
+        and str(row["path"]) in eligible
+        and str(row["memory_id"] or "") == eligible[str(row["path"])].memory_id
+        and str(row["doc_sha256"] or "") == eligible[str(row["path"])].sha256
+    }
     all_state_paths = {str(row["path"]) for row in rows}
-    missing = sorted(eligible[path] for path in eligible.keys() - indexed.keys())
+    missing = sorted(
+        eligible[path].rel_path for path in eligible.keys() - indexed.keys()
+    )
     stale = sorted(all_state_paths - eligible.keys())
+    identity_counts: dict[str, int] = {}
+    for row in rows:
+        memory_id = str(row["memory_id"] or "")
+        if memory_id:
+            identity_counts[memory_id] = identity_counts.get(memory_id, 0) + 1
+    duplicate_memory_ids = sorted(
+        memory_id for memory_id, count in identity_counts.items() if count > 1
+    )
     errors = [
         {"rel_path": str(row["rel_path"] or row["path"]), "error": str(row["last_error"] or "")[:300]}
         for row in rows if row["status"] == "error"
@@ -825,8 +1054,9 @@ def parity_report(conn: sqlite3.Connection, vault_root: Path) -> dict[str, objec
     chunk_count = int(conn.execute("SELECT COUNT(*) FROM memory_vector_chunks").fetchone()[0])
     return {
         "eligible_docs": len(eligible), "indexed_docs": len(indexed), "chunk_count": chunk_count,
-        "missing_docs": missing, "stale_paths": stale, "errors": errors,
-        "parity_ok": not missing and not stale and not errors,
+        "missing_docs": missing, "stale_paths": stale,
+        "duplicate_memory_ids": duplicate_memory_ids, "errors": errors,
+        "parity_ok": not missing and not stale and not duplicate_memory_ids and not errors,
     }
 
 
@@ -883,9 +1113,12 @@ def print_search_result(query: str, rows: list[dict[str, object]], as_json: bool
 
 
 def run_indexing(args: argparse.Namespace, sqlite_index: Any, conn: sqlite3.Connection, store: ZvecStore) -> int:
-    init_db(conn)
-    store.init()
-    sqlite_index.init_db(conn)
+    # Ordinary maintenance consumes installer-owned derived state.  It may
+    # update rows/vectors but must never initialize, ALTER, or create either
+    # schema or collection.
+    assert_schema_ready(conn)
+    sqlite_index.assert_schema_ready(conn)
+    store.open_existing()
     vault_root = Path(sqlite_index.VAULT_ROOT)
     docs: list[IndexedDoc] = []
     errors: list[str] = []
@@ -897,12 +1130,17 @@ def run_indexing(args: argparse.Namespace, sqlite_index: Any, conn: sqlite3.Conn
         errors.extend(changed_errors)
 
     deduped: dict[str, IndexedDoc] = {str(doc.path): doc for doc in docs}
+    assert_unique_doc_memory_ids(list(deduped.values()))
+    binding = getattr(args, "_embedding_binding", {})
+    if not isinstance(binding, dict) or not binding.get("binding_id"):
+        binding = resolve_embedding_binding(args)
     embedder = EmbeddingGemmaEmbedder(
         args.model,
         args.embedding_dim,
         args.device,
         args.cache_folder,
         args.require_local_model,
+        args.model_revision,
     )
     stats = {
         "status": "ok",
@@ -932,7 +1170,16 @@ def run_indexing(args: argparse.Namespace, sqlite_index: Any, conn: sqlite3.Conn
             print_scan_result(stats, args.json)
             return 2
     for doc in deduped.values():
-        status, count, detail = refresh_doc(sqlite_index, conn, store, embedder, doc, args.model, args.embedding_dim, args.force)
+        status, count, detail = refresh_doc(
+            sqlite_index,
+            conn,
+            store,
+            embedder,
+            doc,
+            str(binding["binding_id"]),
+            args.embedding_dim,
+            args.force,
+        )
         if status == "indexed":
             stats["docs_indexed"] = int(stats["docs_indexed"]) + 1
             stats["chunks_indexed"] = int(stats["chunks_indexed"]) + count
@@ -952,25 +1199,196 @@ def run_indexing(args: argparse.Namespace, sqlite_index: Any, conn: sqlite3.Conn
     return 0 if not stats["errors"] else 2
 
 
-def run_search(args: argparse.Namespace, conn: sqlite3.Connection, store: ZvecStore) -> int:
-    init_db(conn)
-    store.init()
-    embedder = EmbeddingGemmaEmbedder(
+def resolve_embedding_binding(args: argparse.Namespace) -> dict[str, object]:
+    import agent_memory_embedding_worker as embedding_worker
+
+    model_manifest = Path(args.model_manifest).expanduser().resolve()
+    revision, model_manifest_sha = embedding_worker.resolve_model_binding(
         args.model,
+        args.model_revision,
         args.embedding_dim,
-        args.device,
-        args.cache_folder,
-        args.require_local_model,
+        model_manifest,
+    )
+    args.model_revision = revision
+    binding = {
+        "model": args.model,
+        "model_revision": revision,
+        "embedding_dim": int(args.embedding_dim),
+        "model_manifest_sha256": model_manifest_sha,
+        "binding_id": embedding_worker.model_binding_id(
+            args.model,
+            revision,
+            args.embedding_dim,
+            model_manifest_sha,
+        ),
+    }
+    setattr(args, "_embedding_binding", binding)
+    return binding
+
+
+def assert_index_binding(conn: sqlite3.Connection, binding_id: str) -> None:
+    """Reject a collection built by a different model/revision/manifest."""
+
+    import agent_memory_embedding_worker as embedding_worker
+
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS indexed_count,
+               SUM(CASE WHEN embedding_model=? THEN 1 ELSE 0 END) AS matching_count
+        FROM memory_vector_index_state
+        WHERE status='indexed'
+        """,
+        (binding_id,),
+    ).fetchone()
+    indexed_count = int(row["indexed_count"] or 0) if row is not None else 0
+    matching_count = int(row["matching_count"] or 0) if row is not None else 0
+    if indexed_count and matching_count != indexed_count:
+        raise embedding_worker.WorkerError("MODEL_BINDING_INDEX_MISMATCH")
+
+
+def run_search(args: argparse.Namespace, conn: sqlite3.Connection, store: ZvecStore) -> int:
+    assert_schema_ready(conn)
+    try:
+        binding = getattr(args, "_embedding_binding", {})
+        if not isinstance(binding, dict) or not binding.get("binding_id"):
+            binding = resolve_embedding_binding(args)
+        if isinstance(conn, sqlite3.Connection):
+            assert_index_binding(conn, str(binding["binding_id"]))
+        if args.embedding_worker:
+            import agent_memory_embedding_worker as embedding_worker
+
+            query_embedding, worker_status = embedding_worker.embed_query(
+                args.search,
+                model=args.model,
+                revision=args.model_revision,
+                embedding_dim=args.embedding_dim,
+                cold_timeout=args.worker_cold_timeout,
+                warm_timeout=args.worker_warm_timeout,
+                idle_seconds=args.worker_idle_seconds,
+                model_manifest=Path(args.model_manifest).expanduser().resolve(),
+            )
+        else:
+            import agent_memory_embedding_worker as embedding_worker
+
+            embedder = EmbeddingGemmaEmbedder(
+                args.model,
+                args.embedding_dim,
+                args.device,
+                args.cache_folder,
+                args.require_local_model,
+                args.model_revision,
+            )
+            query_embedding = embedder.embed_query(args.search)
+            manifest_sha = embedding_worker.runtime_manifest_sha256()
+            worker_status = {
+                "worker": "disabled",
+                "worker_status": "disabled",
+                "worker_restart_count": 0,
+                "worker_identity": embedding_worker.worker_identity(
+                    args.model,
+                    args.model_revision,
+                    args.embedding_dim,
+                    manifest_sha,
+                    str(binding["model_manifest_sha256"]),
+                ),
+                "model": args.model,
+                "model_revision": args.model_revision,
+                "embedding_dim": int(args.embedding_dim),
+                "runtime_manifest_sha256": manifest_sha,
+                "model_manifest_sha256": str(binding["model_manifest_sha256"]),
+                "model_binding_id": str(binding["binding_id"]),
+            }
+    except Exception as exc:
+        reason_code = str(getattr(exc, "code", "") or "SEMANTIC_EMBEDDING_UNAVAILABLE")
+        restart_count = int(getattr(exc, "restart_count", 0) or 0)
+        try:
+            import agent_memory_embedding_worker as embedding_worker
+
+            manifest_sha = embedding_worker.runtime_manifest_sha256()
+            identity = embedding_worker.worker_identity(
+                args.model,
+                args.model_revision,
+                args.embedding_dim,
+                manifest_sha,
+                str(
+                    getattr(args, "_embedding_binding", {}).get(
+                        "model_manifest_sha256", ""
+                    )
+                ),
+            )
+        except Exception:  # pragma: no cover - source runtime always provides it
+            manifest_sha = ""
+            identity = ""
+        payload = {
+            "query": args.search,
+            "error": reason_code,
+            "reason_code": reason_code,
+            "embedding": {
+                "worker_status": "failed",
+                "worker_restart_count": min(max(restart_count, 0), 1),
+                "worker_identity": identity,
+                "model": args.model,
+                "model_revision": args.model_revision,
+                "embedding_dim": int(args.embedding_dim),
+                "runtime_manifest_sha256": manifest_sha,
+                "model_manifest_sha256": str(
+                    getattr(args, "_embedding_binding", {}).get(
+                        "model_manifest_sha256", ""
+                    )
+                ),
+                "model_binding_id": str(
+                    getattr(args, "_embedding_binding", {}).get("binding_id", "")
+                ),
+            },
+            "results": [],
+        }
+        print(
+            json.dumps(payload, ensure_ascii=False, indent=2)
+            if args.json
+            else f"semantic_search=failed reason_code={reason_code}"
+        )
+        return 2
+    vector_candidate_limit = min(
+        max(args.limit * DEFAULT_CANDIDATE_POOL_FACTOR, DEFAULT_CANDIDATE_POOL_MIN),
+        DEFAULT_CANDIDATE_POOL_MAX,
     )
     try:
-        query_embedding = embedder.embed_query(args.search)
-    except Exception as exc:
-        payload = {"query": args.search, "error": str(exc), "results": []}
-        print(json.dumps(payload, ensure_ascii=False, indent=2) if args.json else f"query={args.search}\nerror: {exc}")
+        # Generating an embedding can cold-start a ~1 GB model. Keep that work
+        # entirely outside the native Zvec lock; only collection open/query is
+        # serialized with writers.
+        with zvec_lock(exclusive=True, timeout=args.lock_timeout):
+            try:
+                store.open_existing()
+                scored_ids = store.search(query_embedding, vector_candidate_limit)
+            finally:
+                # Native Zvec ownership lasts until its wrapper is released.
+                # Drop it while still holding our lock, including on errors,
+                # so the next writer cannot race a lingering native handle.
+                store.close()
+    except TimeoutError:
+        payload = {
+            "query": args.search,
+            "error": "ZVEC_LOCK_TIMEOUT",
+            "reason_code": "ZVEC_LOCK_TIMEOUT",
+            "embedding": worker_status,
+            "results": [],
+        }
+        print(
+            json.dumps(payload, ensure_ascii=False, indent=2)
+            if args.json
+            else "semantic_search=failed reason_code=ZVEC_LOCK_TIMEOUT"
+        )
         return 2
-    scored_ids = store.search(query_embedding, max(args.limit * 12, args.limit))
-    rows = vector_rows(conn, scored_ids, args.search)[: max(args.limit, 1)]
-    print_search_result(args.search, rows, args.json)
+    rows = vector_rows(
+        conn,
+        scored_ids,
+        args.search,
+        expected_embedding_binding=str(binding["binding_id"]),
+    )[: max(args.limit, 1)]
+    if args.json:
+        print(json.dumps({"query": args.search, "results": rows, "embedding": worker_status}, ensure_ascii=False, indent=2))
+    else:
+        print_search_result(args.search, rows, args.json)
     return 0
 
 
@@ -982,9 +1400,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", action="store_true", help="Report Markdown/SQLite/Zvec parity without embedding work.")
     parser.add_argument("--changed-file", action="append", default=[], help="Refresh one changed Markdown file. Repeatable.")
     parser.add_argument("--search", help="Semantic search query.")
+    parser.add_argument(
+        "--search-stdin",
+        action="store_true",
+        help="Read one private UTF-8 semantic query from stdin instead of process argv.",
+    )
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="Maximum search results.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Embedding model name or local path.")
+    parser.add_argument("--model-revision", default=DEFAULT_MODEL_REVISION, help="Pinned model revision bound to the worker identity.")
+    parser.add_argument("--model-manifest", default=str(DEFAULT_MODEL_MANIFEST), help=argparse.SUPPRESS)
     parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device for SentenceTransformer, default: cpu.")
     parser.add_argument("--cache-folder", default="", help="Optional Hugging Face/SentenceTransformers cache folder.")
     parser.add_argument(
@@ -994,11 +1419,45 @@ def parse_args() -> argparse.Namespace:
         help="Require an existing local model directory and disable remote model resolution.",
     )
     parser.add_argument("--embedding-dim", type=int, default=DEFAULT_EMBEDDING_DIM, help="Expected embedding dimension.")
+    parser.add_argument(
+        "--embedding-worker",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse the owner-only adaptive worker for query embeddings; document indexing remains in-process.",
+    )
+    parser.add_argument("--worker-cold-timeout", type=float, default=DEFAULT_WORKER_COLD_TIMEOUT, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-warm-timeout", type=float, default=DEFAULT_WORKER_WARM_TIMEOUT, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-idle-seconds", type=int, default=DEFAULT_WORKER_IDLE_SECONDS, help=argparse.SUPPRESS)
     parser.add_argument("--state-db", default=str(STATE_DB), help=argparse.SUPPRESS)
     parser.add_argument("--collection-path", default=str(DEFAULT_COLLECTION_PATH), help=argparse.SUPPRESS)
     parser.add_argument("--force", action="store_true", help="Re-index even when doc hashes are unchanged.")
-    parser.add_argument("--lock-timeout", type=float, default=60.0, help="Seconds to wait for concurrent Zvec readers or writers.")
-    return parser.parse_args()
+    parser.add_argument("--lock-timeout", type=float, default=DEFAULT_LOCK_TIMEOUT, help="Seconds to wait for concurrent Zvec readers or writers.")
+    args = parser.parse_args()
+    if args.search_stdin:
+        if args.search:
+            parser.error("--search-stdin cannot be combined with --search")
+        payload = sys.stdin.buffer.read(64 * 1024 + 1)
+        if len(payload) > 64 * 1024:
+            parser.error("stdin query is too large")
+        try:
+            args.search = payload.decode("utf-8", errors="strict").strip()
+        except UnicodeDecodeError:
+            parser.error("stdin query must be UTF-8")
+        if not args.search:
+            parser.error("stdin query is required")
+    return args
+
+
+def assert_installer_init_capability(args: argparse.Namespace) -> dict[str, object]:
+    status = getattr(args, "_runtime_status", None)
+    if not isinstance(status, dict):
+        status = assert_runtime_ready("zvec")
+    if (
+        status.get("maintenance_capability") is not True
+        or str(status.get("phase") or "") != "preflight"
+    ):
+        raise RuntimeError("ZVEC_INIT_CAPABILITY_REQUIRED")
+    return status
 
 
 def run_locked(args: argparse.Namespace) -> int:
@@ -1007,48 +1466,99 @@ def run_locked(args: argparse.Namespace) -> int:
     collection_path = Path(args.collection_path).expanduser().resolve()
     store = ZvecStore(collection_path, args.embedding_dim)
     try:
-        with connect(state_db) as conn:
-            init_db(conn)
+        if args.init:
+            assert_installer_init_capability(args)
+        if args.init or args.scan or args.changed_file or args.search:
+            resolve_embedding_binding(args)
+        maintenance = bool(args.init or args.scan or args.prune or args.changed_file)
+        with connect(state_db, read_only=not maintenance) as conn:
             if args.init:
-                store.init()
+                init_db(conn)
+            else:
+                assert_schema_ready(conn)
+            if args.init:
+                with zvec_lock(
+                    exclusive=True,
+                    timeout=args.lock_timeout,
+                    allow_create=True,
+                ):
+                    store.init()
                 if not (args.scan or args.prune or args.report or args.changed_file or args.search):
                     payload = {
                         "status": "ok",
                         "state_db": str(state_db),
                         "zvec_collection": str(collection_path),
                         "embedding_model": args.model,
+                        "model_revision": args.model_revision,
                         "embedding_dim": args.embedding_dim,
+                        "embedding_binding_id": str(args._embedding_binding["binding_id"]),
+                        "model_manifest_sha256": str(
+                            args._embedding_binding["model_manifest_sha256"]
+                        ),
                         "embedding_backend": "sentence-transformers",
                     }
                     print(json.dumps(payload, ensure_ascii=False, indent=2) if args.json else "\n".join(f"{k}={v}" for k, v in payload.items()))
             exit_code = 0
             if args.scan or args.prune or args.changed_file:
-                exit_code = max(exit_code, run_indexing(args, sqlite_index, conn, store))
+                with zvec_lock(exclusive=True, timeout=args.lock_timeout):
+                    exit_code = max(
+                        exit_code,
+                        run_indexing(args, sqlite_index, conn, store),
+                    )
             if args.report:
+                with zvec_lock(exclusive=False, timeout=args.lock_timeout):
+                    store.open_existing()
                 report = parity_report(conn, Path(sqlite_index.VAULT_ROOT))
                 print(json.dumps(report, ensure_ascii=False, indent=2) if args.json else "\n".join(f"{k}={v}" for k, v in report.items()))
             if args.search:
                 exit_code = max(exit_code, run_search(args, conn, store))
             return exit_code
     except Exception as exc:
+        detail = str(exc)
+        reason_code = (
+            detail
+            if re.fullmatch(r"[A-Z][A-Z0-9_]{2,80}", detail)
+            else "ZVEC_MAINTENANCE_FAILED"
+        )
         if args.json:
-            print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "reason_code": reason_code,
+                        "error": reason_code,
+                    },
+                    ensure_ascii=True,
+                    indent=2,
+                )
+            )
         else:
-            print(f"vector_index=error\nerror: {exc}", file=sys.stderr)
+            print(f"vector_index=error\nreason_code={reason_code}", file=sys.stderr)
         return 2
 
 
 def main() -> int:
     args = parse_args()
-    if not (args.init or args.scan or args.prune or args.report or args.changed_file or args.search):
-        args.init = True
     try:
-        # The current Zvec collection opens read-write even for queries and its
-        # native LOCK cannot be shared safely by separate processes.  Serialize
-        # readers and writers through the public lock to avoid transient probe
-        # and search failures under concurrent model loads.
-        with zvec_lock(exclusive=True, timeout=args.lock_timeout):
-            return run_locked(args)
+        runtime_status = assert_runtime_ready("zvec")
+        setattr(args, "_runtime_status", runtime_status)
+    except RuntimeTransitionError as exc:
+        if args.json:
+            print(json.dumps({"status": "error", "reason_code": "RUNTIME_TRANSITION_INCOMPLETE"}))
+        else:
+            print(str(exc), file=sys.stderr)
+        return 2
+    if not (args.init or args.scan or args.prune or args.report or args.changed_file or args.search):
+        if args.json:
+            print(json.dumps({"status": "error", "reason_code": "ZVEC_OPERATION_REQUIRED"}))
+        else:
+            print("ZVEC_OPERATION_REQUIRED", file=sys.stderr)
+        return 2
+    try:
+        # ``run_locked`` acquires the native collection lock only around actual
+        # collection operations. Query embedding and Worker cold start remain
+        # outside it so index writers are never blocked by model startup.
+        return run_locked(args)
     except TimeoutError as exc:
         if args.json:
             print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2))

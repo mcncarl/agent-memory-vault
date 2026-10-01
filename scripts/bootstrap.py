@@ -200,14 +200,40 @@ def main() -> int:
         print("  # Runtime TOML/.env is loaded by Python; no PowerShell import is required")
     else:
         print("  source .env")
-    print(f"  {sys.executable} scripts/agent_memory_evolution.py --init --scan --report")
-    print(f"  {sys.executable} scripts/agent_memory_index.py --init --scan --report")
-    print(f"  {sys.executable} scripts/agent_memory_closeout.py --dry-run")
-    print(f"  {sys.executable} scripts/agent_memory_check.py")
-    print(f"  {sys.executable} scripts/agent_memory_doctor.py")
+    print("  memoryctl --actor migration migrate config-plan --json")
+    print(
+        "  memoryctl --actor migration migrate config-apply "
+        "--backup-path /new/private/agent-memory-before-v2.toml --json  # only when plan says required"
+    )
+    state_path = expand_path(args.state_db).resolve()
+    if state_path.exists():
+        print("  memoryctl --actor migration migrate plan --json")
+        print(
+            "  memoryctl --actor migration migrate apply "
+            "--backup-path /new/private/state-before-v2.sqlite --json"
+        )
+    else:
+        print("  memoryctl --actor migration migrate init --json")
+    print("  memoryctl --actor migration migrate audit-plan --json")
+    print(
+        "  memoryctl --actor migration migrate audit-init "
+        "--json  # only when audit-plan says initialization_required"
+    )
+    print(
+        "  memoryctl --actor migration migrate audit-apply "
+        "--backup-path /new/private/audit-before-v4.sqlite --json  # only when audit-plan says migration_required"
+    )
+    print("  memoryctl --actor migration migrate generated-index-migrate --json")
+    print("  memoryctl --actor migration migrate verify --json")
+    print("  # Install the selected host hook now, or explicitly attest no host hooks")
+    print(
+        "  memoryctl --actor migration migrate verify "
+        "--publish-ready --require-host-hooks --json  # both Codex and Claude"
+    )
+    print("  # Or repeat --require-host-hook codex|claude; without hooks use --no-host-hooks")
     print("optional_semantic_retrieval:")
     print(f"  {sys.executable} -m pip install -r requirements-vector.lock")
-    print(f"  {sys.executable} scripts/agent_memory_zvec_index.py --init --scan --prune")
+    print("  memoryctl --actor migration zvec --init --scan --prune --json")
     return 0
 
 
