@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import contextlib
-import json
-import os
 import sqlite3
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,50 +10,48 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from tests.state_fixture import initialize_full_state
+import agent_memory_migrate as memory_migrate
+from agent_memory_state import (
+    SEARCH_LOG_CONTROL_TRIGGER_INSERT,
+    SEARCH_LOG_CONTROL_TRIGGER_UPDATE,
+    SEARCH_LOG_PRIVACY_TRIGGER_INSERT,
+    SEARCH_LOG_PRIVACY_TRIGGER_UPDATE,
+    install_search_log_privacy_guards,
+)
 
 
 class SearchLogRedactionTest(unittest.TestCase):
     def test_legacy_query_text_is_replaced_with_hash_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
-            tmp = Path(raw_tmp)
+            tmp = Path(raw_tmp).resolve()
             state_db = tmp / "state.sqlite"
-            config = tmp / "agent-memory.toml"
-            config.write_text(
-                f"memory_root = {json.dumps(str(REPO_ROOT / 'templates' / 'vault'))}\n"
-                f"state_db = {json.dumps(str(state_db))}\n",
-                encoding="utf-8",
-            )
-            env = os.environ.copy()
-            env["AGENT_MEMORY_CONFIG_FILE"] = str(config)
-            initialized = subprocess.run(
-                [sys.executable, str(SCRIPTS / "agent_memory_index.py"), "--init"],
-                cwd=REPO_ROOT,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            initialize_full_state(state_db)
             with contextlib.closing(sqlite3.connect(state_db)) as conn, conn:
+                conn.row_factory = sqlite3.Row
+                for trigger in (
+                    SEARCH_LOG_PRIVACY_TRIGGER_INSERT,
+                    SEARCH_LOG_PRIVACY_TRIGGER_UPDATE,
+                    SEARCH_LOG_CONTROL_TRIGGER_INSERT,
+                    SEARCH_LOG_CONTROL_TRIGGER_UPDATE,
+                ):
+                    conn.execute(f"DROP TRIGGER {trigger}")
                 conn.execute(
                     "INSERT INTO memory_search_log(query,result_count,created_at) VALUES (?,?,?)",
                     ("private legacy query", 0, "2026-07-11T00:00:00+00:00"),
                 )
-            redacted = subprocess.run(
-                [sys.executable, str(SCRIPTS / "agent_memory_search.py"), "--redact-legacy-logs", "--json"],
-                cwd=REPO_ROOT,
-                env=env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(redacted.returncode, 0, redacted.stderr)
-            self.assertEqual(json.loads(redacted.stdout), {"redacted": 1, "remaining_raw": 0})
+                redacted = memory_migrate._redact_legacy_search_rows(conn)
+                install_search_log_privacy_guards(conn)
+            self.assertEqual(redacted["query_rows_redacted"], 1)
+            self.assertEqual(redacted["path_rows_cleared"], 0)
             with contextlib.closing(sqlite3.connect(state_db)) as conn, conn:
                 query, digest, length = conn.execute(
                     "SELECT query, query_sha256, query_length FROM memory_search_log"
                 ).fetchone()
-            self.assertTrue(query.startswith("[redacted:"))
+            self.assertEqual(query, "")
             self.assertEqual(len(digest), 64)
             self.assertEqual(length, len("private legacy query"))
             self.assertNotIn("private legacy query", query)

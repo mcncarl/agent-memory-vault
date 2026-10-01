@@ -5,9 +5,11 @@ project_id: agent-memory-vault-index
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
+agent_scope: shared
 session_id: ""
 status: active
 sensitivity: normal
+temporal_policy: structural
 verified_at: 2026-06-20
 keywords:
   - index
@@ -41,7 +43,7 @@ keywords:
 
 - 根目录：`INDEX.md`、`README.md`、`STRUCTURE.md`。
 - 用户记忆：`用户记忆/README.md`。
-- 项目模板：`项目/_模板-项目.md`。
+- 项目模板：`项目/_模板-项目.md`；可变化原子事实：`项目/_模板-事实记录.md`。
 - 工作流模板：`工作流/_模板-工作流.md`。
 - 决策模板：`决策/_模板-决策.md`。
 - Agent 未闭环：`agent/open-loops.md`。

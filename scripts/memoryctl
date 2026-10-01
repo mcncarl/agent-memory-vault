@@ -1,17 +1,612 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 from __future__ import annotations
 
+import sys
+
+
+# The executable/shebang and managed re-exec are the supported launch forms.
+# ``python memoryctl`` is rejected before importing any path-searchable module,
+# so a manifest-external scripts/json.py cannot run before authentication.
+if __name__ == "__main__" and (not sys.flags.isolated or not sys.flags.no_site):
+    raise SystemExit("MEMORYCTL_ISOLATED_LAUNCH_REQUIRED: execute memoryctl directly")
+
 import argparse
+import contextlib
+import errno
+import hashlib
 import json
 import os
+import stat
 import subprocess
-import sys
+import time
+import uuid
 from pathlib import Path
 
-from agent_memory_env import env_value, expand_path
+try:  # pragma: no cover - exercised by native POSIX runtimes.
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - exercised by native Windows runtimes.
+    import msvcrt
+except ImportError:  # POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 
-SCRIPT_ROOT = Path(__file__).resolve().parent
+STATE_SCHEMA_REQUIRED = 4
+_PLATFORM_NAME = os.name
+_RUNTIME_RELEASE_VERSION = "2.1.0"
+_WRITE_GATEWAY_CAPABILITIES = {
+    "schema_version": 2,
+    "actions": ["read-target", "prepare", "apply", "cancel", "status", "list"],
+    "recovery_queries": ["status", "list"],
+    "receipt_first_terminal_replay": True,
+    "session_scoped_recovery": True,
+    "side_effect_free_recovery_queries": True,
+    "windows_mode": "read_only",
+}
+_WINDOWS_READ_ONLY_ACTIONS = frozenset({"read-target", "status", "list"})
+
+
+def _bootstrap_regular_file_sha256(
+    path: Path,
+    *,
+    descriptor: int | None = None,
+) -> str:
+    """Hash one stable regular file before trusting its Runtime location."""
+
+    opened_here = descriptor is None
+    if opened_here:
+        try:
+            before = path.lstat()
+        except FileNotFoundError as exc:
+            raise SystemExit("RUNTIME_BOOTSTRAP_AILU_ENTRYPOINT_UNREADABLE") from exc
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise SystemExit("RUNTIME_BOOTSTRAP_AILU_ENTRYPOINT_UNSAFE")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise SystemExit("RUNTIME_BOOTSTRAP_AILU_ENTRYPOINT_UNREADABLE") from exc
+    assert descriptor is not None
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise SystemExit("RUNTIME_BOOTSTRAP_AILU_ENTRYPOINT_UNSAFE")
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < before.st_size:
+            try:
+                block = os.pread(descriptor, min(1024 * 1024, before.st_size - offset), offset)
+            except (AttributeError, OSError) as exc:
+                raise SystemExit("RUNTIME_BOOTSTRAP_AILU_ENTRYPOINT_UNREADABLE") from exc
+            if not block:
+                raise SystemExit("RUNTIME_BOOTSTRAP_AILU_ENTRYPOINT_CHANGED")
+            digest.update(block)
+            offset += len(block)
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ):
+            raise SystemExit("RUNTIME_BOOTSTRAP_AILU_ENTRYPOINT_CHANGED")
+        if opened_here:
+            current = path.lstat()
+            if (
+                current.st_dev,
+                current.st_ino,
+                current.st_size,
+                current.st_mtime_ns,
+            ) != (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            ):
+                raise SystemExit("RUNTIME_BOOTSTRAP_AILU_ENTRYPOINT_CHANGED")
+        return digest.hexdigest()
+    finally:
+        if opened_here:
+            os.close(descriptor)
+
+
+def _ailu_snapshot_descriptor(path: str) -> int | None:
+    if os.name != "posix":
+        return None
+    for prefix in ("/dev/fd/", "/proc/self/fd/"):
+        suffix = path.removeprefix(prefix)
+        if suffix != path and suffix.isascii() and suffix.isdigit():
+            return int(suffix)
+    return None
+
+
+def _select_entry_identity(raw_entry: str) -> tuple[Path, Path]:
+    """Authenticate an Ailu-frozen entrypoint and recover its canonical root."""
+
+    runtime_root_raw = os.environ.get("AGENT_MEMORY_AILU_RUNTIME_ROOT")
+    expected_sha256 = os.environ.get("AGENT_MEMORY_AILU_ENTRYPOINT_SHA256")
+    if (runtime_root_raw is None) != (expected_sha256 is None):
+        raise SystemExit("RUNTIME_BOOTSTRAP_AILU_SNAPSHOT_ENV_INCOMPLETE")
+    raw_path = Path(os.path.abspath(raw_entry))
+    if runtime_root_raw is None:
+        return raw_path, raw_path.parent.parent
+
+    assert expected_sha256 is not None
+    runtime_root = Path(runtime_root_raw)
+    if (
+        not runtime_root.is_absolute()
+        or runtime_root.parent == runtime_root
+        or os.path.realpath(runtime_root_raw) != runtime_root_raw
+    ):
+        raise SystemExit("RUNTIME_BOOTSTRAP_AILU_RUNTIME_ROOT_INVALID")
+    try:
+        root_metadata = runtime_root.lstat()
+    except FileNotFoundError as exc:
+        raise SystemExit("RUNTIME_BOOTSTRAP_AILU_RUNTIME_ROOT_INVALID") from exc
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise SystemExit("RUNTIME_BOOTSTRAP_AILU_RUNTIME_ROOT_INVALID")
+    if (
+        len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise SystemExit("RUNTIME_BOOTSTRAP_AILU_ENTRYPOINT_SHA256_INVALID")
+
+    canonical_entry = runtime_root / "scripts" / "memoryctl"
+    descriptor = _ailu_snapshot_descriptor(str(raw_path))
+    if descriptor is None and os.path.normcase(str(raw_path)) != os.path.normcase(
+        str(canonical_entry)
+    ):
+        raise SystemExit("RUNTIME_BOOTSTRAP_AILU_ENTRYPOINT_PATH_INVALID")
+    raw_sha256 = _bootstrap_regular_file_sha256(raw_path, descriptor=descriptor)
+    canonical_sha256 = _bootstrap_regular_file_sha256(canonical_entry)
+    if raw_sha256 != expected_sha256 or canonical_sha256 != expected_sha256:
+        raise SystemExit("RUNTIME_BOOTSTRAP_AILU_ENTRYPOINT_INTEGRITY_MISMATCH")
+    return canonical_entry, runtime_root
+
+
+_ENTRY_PATH, _ENTRY_ROOT = _select_entry_identity(__file__)
+
+
+def _bootstrap_assert_path(path: Path, kind: str) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise SystemExit(f"RUNTIME_BOOTSTRAP_PATH_MISSING: {path}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SystemExit(f"RUNTIME_BOOTSTRAP_SYMLINK_FORBIDDEN: {path}")
+    if kind == "directory" and not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"RUNTIME_BOOTSTRAP_DIRECTORY_INVALID: {path}")
+    if kind == "file" and not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit(f"RUNTIME_BOOTSTRAP_FILE_INVALID: {path}")
+    return metadata
+
+
+for _bootstrap_path, _bootstrap_kind in (
+    (_ENTRY_ROOT, "directory"),
+    (_ENTRY_PATH.parent, "directory"),
+    (_ENTRY_PATH, "file"),
+    (_ENTRY_PATH.parent / "agent_memory_env.py", "file"),
+    (_ENTRY_PATH.parent / "agent_memory_state.py", "file"),
+):
+    _bootstrap_assert_path(_bootstrap_path, _bootstrap_kind)
+
+
+def _secure_bootstrap_read(relative: Path, *, optional: bool = False) -> bytes | None:
+    """Read one Runtime-owned file without following a redirected component."""
+
+    if relative.is_absolute() or ".." in relative.parts:
+        raise SystemExit("RUNTIME_BOOTSTRAP_PATH_INVALID")
+    current = _ENTRY_ROOT
+    for part in relative.parts[:-1]:
+        current = current / part
+        try:
+            _bootstrap_assert_path(current, "directory")
+        except SystemExit:
+            if optional and not current.exists() and not current.is_symlink():
+                return None
+            raise
+    target = _ENTRY_ROOT / relative
+    try:
+        before = target.lstat()
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise SystemExit(f"RUNTIME_BOOTSTRAP_PATH_MISSING: {target}")
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise SystemExit(f"RUNTIME_BOOTSTRAP_FILE_INVALID: {target}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except OSError as exc:
+        raise SystemExit(f"RUNTIME_BOOTSTRAP_FILE_UNREADABLE: {target}") from exc
+    with os.fdopen(descriptor, "rb", closefd=True) as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            before.st_dev,
+            before.st_ino,
+        ):
+            raise SystemExit(f"RUNTIME_BOOTSTRAP_FILE_CHANGED: {target}")
+        payload = handle.read()
+    after = target.lstat()
+    if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ):
+        raise SystemExit(f"RUNTIME_BOOTSTRAP_FILE_CHANGED: {target}")
+    return payload
+
+
+def _lexical_path(path: str | os.PathLike[str]) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _managed_python_launcher() -> Path:
+    return (
+        _ENTRY_ROOT / ".venv" / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else _ENTRY_ROOT / ".venv" / "bin" / "python"
+    )
+
+
+def _managed_bootstrap_attestation() -> dict[str, object] | None:
+    """Authenticate the installed entrypoint before selecting an interpreter.
+
+    A source checkout has neither managed marker nor manifest and remains
+    portable.  Any half-present or malformed managed identity fails closed.
+    Private TOML is intentionally outside this bootstrap trust decision.
+    """
+
+    anchor_raw = _secure_bootstrap_read(Path("config/runtime-anchor.json"), optional=True)
+    manifest_raw = _secure_bootstrap_read(Path("config/runtime-manifest.json"), optional=True)
+    marker_raw = _secure_bootstrap_read(Path("config/runtime-transition.json"), optional=True)
+    managed_layout = any(
+        path.exists() or path.is_symlink()
+        for path in (
+            _ENTRY_ROOT / ".venv",
+            _ENTRY_ROOT / "state.sqlite",
+            _ENTRY_ROOT / "config" / "agent-memory.toml",
+        )
+    )
+    if anchor_raw is None and manifest_raw is None and marker_raw is None:
+        # Source checkouts remain portable only when they also lack every fixed
+        # installed-runtime footprint.  Deleting both authenticated metadata
+        # files from a managed root must not downgrade it to source mode.
+        if managed_layout:
+            raise SystemExit("RUNTIME_BOOTSTRAP_IDENTITY_MISSING")
+        return None
+    if anchor_raw is None or manifest_raw is None or marker_raw is None:
+        raise SystemExit("RUNTIME_BOOTSTRAP_IDENTITY_INCOMPLETE")
+    try:
+        anchor = json.loads(anchor_raw.decode("utf-8"))
+        manifest = json.loads(manifest_raw.decode("utf-8"))
+        marker = json.loads(marker_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit("RUNTIME_BOOTSTRAP_IDENTITY_INVALID") from exc
+    if not isinstance(anchor, dict) or not isinstance(manifest, dict) or not isinstance(marker, dict):
+        raise SystemExit("RUNTIME_BOOTSTRAP_IDENTITY_INVALID")
+    anchor_sha256 = hashlib.sha256(anchor_raw).hexdigest()
+    install_id = anchor.get("install_id")
+    groups = ("files", "support_files", "template_files")
+    if (
+        anchor.get("schema_version") != 1
+        or anchor.get("managed_runtime") is not True
+        or _lexical_path(str(anchor.get("runtime_root", ""))) != _lexical_path(_ENTRY_ROOT)
+        or not isinstance(install_id, str)
+        or len(install_id) != 64
+        or any(character not in "0123456789abcdef" for character in str(install_id))
+        or manifest.get("schema_version") != 2
+        or manifest.get("release_version") != _RUNTIME_RELEASE_VERSION
+        or manifest.get("runtime_api_version") != 2
+        or manifest.get("writer_protocol_version") != 2
+        or manifest.get("state_schema_required") != STATE_SCHEMA_REQUIRED
+        or manifest.get("canonical_actors") != ["codex", "claude", "ailu"]
+        or manifest.get("capabilities")
+        != {"write_gateway": _WRITE_GATEWAY_CAPABILITIES}
+        or _lexical_path(str(manifest.get("runtime_root", ""))) != _lexical_path(_ENTRY_ROOT)
+        or manifest.get("install_id") != install_id
+        or manifest.get("runtime_anchor_sha256") != anchor_sha256
+        or any(not isinstance(manifest.get(group), dict) or not manifest[group] for group in groups)
+    ):
+        raise SystemExit("RUNTIME_BOOTSTRAP_MANIFEST_INVALID")
+    calculated_bundle = hashlib.sha256(
+        json.dumps(
+            {group: manifest[group] for group in groups},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    prefixes = {
+        "files": Path("scripts"),
+        "support_files": Path(),
+        "template_files": Path(),
+    }
+    all_files_ok = True
+    for group, prefix in prefixes.items():
+        expected = manifest[group]
+        for raw_name, raw_digest in expected.items():
+            relative = Path(str(raw_name))
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or not isinstance(raw_digest, str)
+                or len(raw_digest) != 64
+            ):
+                raise SystemExit("RUNTIME_BOOTSTRAP_MANIFEST_PATH_INVALID")
+            raw = _secure_bootstrap_read(prefix / relative)
+            if hashlib.sha256(raw or b"").hexdigest() != raw_digest:
+                all_files_ok = False
+    if (
+        calculated_bundle != manifest.get("bundle_sha256")
+        or not all_files_ok
+        or marker.get("schema_version") != 1
+        or marker.get("bundle_sha256") != calculated_bundle
+        or marker.get("install_id") != install_id
+        or marker.get("runtime_anchor_sha256") != anchor_sha256
+        or not isinstance(marker.get("phase"), str)
+        or not str(marker.get("phase", "")).strip()
+    ):
+        raise SystemExit("RUNTIME_BOOTSTRAP_INTEGRITY_MISMATCH")
+    attestation_container = (
+        marker.get("preflight_attestation")
+        if marker.get("phase") == "ready"
+        else marker.get("bootstrap_attestation")
+    )
+    python_identity = (
+        attestation_container.get("runtime_python")
+        if isinstance(attestation_container, dict)
+        else None
+    )
+    if not isinstance(python_identity, dict):
+        raise SystemExit("RUNTIME_BOOTSTRAP_PYTHON_ATTESTATION_INVALID")
+    return {"manifest": manifest, "marker": marker}
+
+
+def _stat_identity(metadata: os.stat_result) -> dict[str, int]:
+    return {
+        "device": int(metadata.st_dev),
+        "inode": int(metadata.st_ino),
+        "mode": int(stat.S_IMODE(metadata.st_mode)),
+        "size": int(metadata.st_size),
+        "mtime_ns": int(metadata.st_mtime_ns),
+    }
+
+
+def _static_launcher_attestation(path: Path) -> dict[str, object]:
+    """Pin the managed launcher chain immediately before exec.
+
+    The venv launcher may itself be a relative symlink.  Intermediate private
+    Runtime directories may not be redirected; the resolved base interpreter
+    must be a regular executable.  The ready marker's full attestation is
+    revalidated after exec by ``agent_memory_env``.
+    """
+
+    for parent in (path.parent.parent.parent, path.parent.parent, path.parent):
+        _bootstrap_assert_path(parent, "directory")
+    current = path
+    seen: set[str] = set()
+    chain: list[dict[str, object]] = []
+    in_bin_root = path.parent
+    for _ in range(16):
+        key = _lexical_path(current)
+        if key in seen:
+            raise SystemExit("RUNTIME_PYTHON_SYMLINK_CYCLE")
+        seen.add(key)
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError as exc:
+            raise SystemExit("RUNTIME_PYTHON_UNAVAILABLE") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            link = os.readlink(current)
+            chain.append({
+                "path": current.relative_to(_ENTRY_ROOT).as_posix(),
+                "kind": "symlink",
+                "link_target": link,
+                "link_sha256": hashlib.sha256(
+                    link.encode("utf-8", errors="surrogateescape")
+                ).hexdigest(),
+                "identity": _stat_identity(metadata),
+            })
+            next_path = Path(os.path.abspath(link if os.path.isabs(link) else current.parent / link))
+            try:
+                next_path.relative_to(in_bin_root)
+            except ValueError:
+                current = current.resolve(strict=True)
+                break
+            current = next_path
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SystemExit("RUNTIME_PYTHON_UNSAFE")
+        if os.name == "posix" and not (stat.S_IMODE(metadata.st_mode) & 0o111):
+            raise SystemExit("RUNTIME_PYTHON_NOT_EXECUTABLE")
+        chain.append({
+            "path": current.relative_to(_ENTRY_ROOT).as_posix(),
+            "kind": "regular",
+            "identity": _stat_identity(metadata),
+        })
+        break
+    else:
+        raise SystemExit("RUNTIME_PYTHON_SYMLINK_CHAIN_TOO_DEEP")
+    resolved = current.resolve(strict=True)
+    resolved_before = resolved.lstat()
+    if stat.S_ISLNK(resolved_before.st_mode) or not stat.S_ISREG(resolved_before.st_mode):
+        raise SystemExit("RUNTIME_PYTHON_UNSAFE")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(resolved, flags)
+    except OSError as exc:
+        raise SystemExit("RUNTIME_PYTHON_UNAVAILABLE") from exc
+    digest = hashlib.sha256()
+    with os.fdopen(descriptor, "rb", closefd=True) as handle:
+        pinned = os.fstat(handle.fileno())
+        if not stat.S_ISREG(pinned.st_mode) or (pinned.st_dev, pinned.st_ino) != (
+            resolved_before.st_dev,
+            resolved_before.st_ino,
+        ):
+            raise SystemExit("RUNTIME_PYTHON_CHANGED")
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    if os.name == "posix" and not (stat.S_IMODE(pinned.st_mode) & 0o111):
+        raise SystemExit("RUNTIME_PYTHON_NOT_EXECUTABLE")
+    return {
+        "launcher": str(path),
+        "launcher_chain": chain,
+        "resolved_path": str(resolved),
+        "resolved_sha256": digest.hexdigest(),
+        "resolved_identity": _stat_identity(pinned),
+    }
+
+
+def _expected_runtime_python(managed: dict[str, object]) -> dict[str, object]:
+    marker = managed.get("marker")
+    if not isinstance(marker, dict):
+        raise SystemExit("RUNTIME_BOOTSTRAP_PYTHON_ATTESTATION_INVALID")
+    container = (
+        marker.get("preflight_attestation")
+        if marker.get("phase") == "ready"
+        else marker.get("bootstrap_attestation")
+    )
+    expected = container.get("runtime_python") if isinstance(container, dict) else None
+    if not isinstance(expected, dict):
+        raise SystemExit("RUNTIME_BOOTSTRAP_PYTHON_ATTESTATION_INVALID")
+    return expected
+
+
+_STATIC_RUNTIME_PYTHON_KEYS = (
+    "launcher", "launcher_chain", "resolved_path", "resolved_sha256", "resolved_identity",
+)
+
+
+def _persistent_static_runtime_python_view(value: object) -> dict[str, object] | None:
+    if not isinstance(value, dict) or any(key not in value for key in _STATIC_RUNTIME_PYTHON_KEYS):
+        return None
+    view = {key: value[key] for key in _STATIC_RUNTIME_PYTHON_KEYS}
+    if sys.platform != "darwin":
+        return view
+    chain = view.get("launcher_chain")
+    resolved = view.get("resolved_identity")
+    if not isinstance(chain, list) or not isinstance(resolved, dict):
+        return None
+    normalized_chain: list[dict[str, object]] = []
+    for raw_entry in chain:
+        if not isinstance(raw_entry, dict) or not isinstance(raw_entry.get("identity"), dict):
+            return None
+        identity = dict(raw_entry["identity"])
+        if not isinstance(identity.get("device"), int) or isinstance(identity.get("device"), bool):
+            return None
+        identity.pop("device")
+        entry = dict(raw_entry)
+        entry["identity"] = identity
+        normalized_chain.append(entry)
+    normalized_resolved = dict(resolved)
+    if not isinstance(normalized_resolved.get("device"), int) or isinstance(
+        normalized_resolved.get("device"), bool
+    ):
+        return None
+    normalized_resolved.pop("device")
+    view["launcher_chain"] = normalized_chain
+    view["resolved_identity"] = normalized_resolved
+    return view
+
+
+def _validate_static_runtime_python(
+    expected: dict[str, object],
+    actual: dict[str, object],
+) -> None:
+    if expected.get("schema_version") != 1:
+        raise SystemExit("RUNTIME_BOOTSTRAP_PYTHON_ATTESTATION_INVALID")
+    expected_digest = expected.get("attestation_sha256")
+    unsigned = {key: value for key, value in expected.items() if key != "attestation_sha256"}
+    calculated_digest = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    version = expected.get("version")
+    probe_executable = expected.get("probe_executable")
+    if (
+        not isinstance(expected_digest, str)
+        or len(expected_digest) != 64
+        or expected_digest != calculated_digest
+        or not isinstance(version, list)
+        or len(version) != 3
+        or any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in version)
+        or tuple(version) < (3, 10, 0)
+        or expected.get("implementation") != "CPython"
+        or not isinstance(expected.get("base_prefix"), str)
+        or not str(expected.get("base_prefix", "")).strip()
+        or _lexical_path(str(probe_executable or "")) != _lexical_path(_managed_python_launcher())
+        or _persistent_static_runtime_python_view(expected)
+        != _persistent_static_runtime_python_view(actual)
+    ):
+        raise SystemExit("RUNTIME_BOOTSTRAP_PYTHON_ATTESTATION_MISMATCH")
+
+
+def _reexec_with_managed_runtime_python() -> None:
+    """Run an installed memoryctl with the interpreter attested for that Runtime.
+
+    The source checkout deliberately keeps a portable ``/usr/bin/env`` shebang.
+    A managed installation, however, can be launched from a shell whose
+    ``python3`` is older than the Runtime contract (or links an incompatible
+    SQLite build).  Authenticate the installer-owned manifest, transition
+    marker, bundle, Runtime root, and this entrypoint, then derive the launcher
+    from that root.  Private TOML never selects executable code.  The normal
+    transition check validates the full interpreter attestation immediately
+    after the re-exec.
+    """
+
+    managed = _managed_bootstrap_attestation()
+    if managed is None:
+        return
+    runtime_python = _managed_python_launcher()
+    expected = _expected_runtime_python(managed)
+    before = _static_launcher_attestation(runtime_python)
+    _validate_static_runtime_python(expected, before)
+    # Compare launchers lexically.  Resolving both paths would make a base
+    # interpreter look identical to its venv symlink and skip the required
+    # managed-runtime re-exec.
+    if _lexical_path(sys.executable) == _lexical_path(runtime_python):
+        return
+    if os.environ.get("AGENT_MEMORY_RUNTIME_REEXEC", "") == "1":
+        raise SystemExit("RUNTIME_PYTHON_REEXEC_LOOP")
+    child_env = os.environ.copy()
+    child_env["AGENT_MEMORY_RUNTIME_REEXEC"] = "1"
+    terminal = _static_launcher_attestation(runtime_python)
+    _validate_static_runtime_python(expected, terminal)
+    if terminal != before:
+        raise SystemExit("RUNTIME_PYTHON_CHANGED")
+    os.execve(
+        str(runtime_python),
+        [str(runtime_python), "-I", "-S", str(_ENTRY_PATH), *sys.argv[1:]],
+        child_env,
+    )
+
+
+_reexec_with_managed_runtime_python()
+
+# Isolated mode deliberately omits the script directory.  Add it only after a
+# managed bundle has passed full pre-exec authentication (or the source root
+# has been classified as an unambiguous checkout).
+if str(_ENTRY_PATH.parent) not in sys.path:
+    sys.path.append(str(_ENTRY_PATH.parent))
+
+from agent_memory_env import (
+    RuntimeTransitionError,
+    assert_runtime_ready,
+    env_value,
+    expand_path,
+)
+from agent_memory_state import StateSecurityError, assert_no_symlink_beneath
+
+
+SCRIPT_ROOT = _ENTRY_PATH.parent
 COMMANDS = {
     "search": SCRIPT_ROOT / "agent_memory_search.py",
     "retrieve": SCRIPT_ROOT / "agent_memory_retrieve.py",
@@ -25,28 +620,384 @@ COMMANDS = {
     "observe-deletion": SCRIPT_ROOT / "agent_memory_claim.py",
     "observe-committed": SCRIPT_ROOT / "agent_memory_claim.py",
     "doctor": SCRIPT_ROOT / "agent_memory_doctor.py",
+    "explain": SCRIPT_ROOT / "agent_memory_explain.py",
     "index": SCRIPT_ROOT / "agent_memory_index.py",
     "zvec": SCRIPT_ROOT / "agent_memory_zvec_index.py",
     "check": SCRIPT_ROOT / "agent_memory_check.py",
     "decision-outcomes": SCRIPT_ROOT / "agent_memory_decision_outcomes.py",
+    "observe": SCRIPT_ROOT / "agent_memory_observability.py",
     "policy-benchmark": SCRIPT_ROOT / "agent_memory_policy_benchmark.py",
+    "retrieval-benchmark": SCRIPT_ROOT / "agent_memory_retrieval_benchmark.py",
+    "shadow": SCRIPT_ROOT / "agent_memory_shadow.py",
     "intent": SCRIPT_ROOT / "agent_memory_intent.py",
+    "migrate": SCRIPT_ROOT / "agent_memory_migrate.py",
+    "content-migrate": SCRIPT_ROOT / "agent_memory_content_migrate.py",
+    "confirmation-capability": SCRIPT_ROOT / "agent_memory_confirmation_capability.py",
+    "bootstrap": SCRIPT_ROOT / "bootstrap.py",
+    "install-host-hooks": SCRIPT_ROOT / "install_host_hooks.py",
+    "install-audit-launchagent": SCRIPT_ROOT / "install_audit_launchagent.py",
+    "session-hook": SCRIPT_ROOT / "agent_memory_session_hook.py",
+    "stop-hook": SCRIPT_ROOT / "agent_memory_stop_hook.py",
 }
-STUDIO_ACTOR = "yichen-content-studio"
-STUDIO_COMMANDS = {"retrieve", "write", "version"}
+AILU_ACTOR = "ailu"
+AILU_COMMANDS = {"retrieve", "write", "version"}
+WIRE_SCHEMA_VERSION = 2
+PRIVATE_FILE_MODE = 0o600
+
+
+class ShadowActivityLockError(RuntimeError):
+    """A stable failure to join the supported Runtime activity lock."""
+
+
+@contextlib.contextmanager
+def runtime_shadow_activity_lock(*, enabled: bool = True):
+    """Hold the shared task side of the shadow cutover read/write lock.
+
+    The lock root uses the exact configured ``CONFIG_ROOT/SHADOW_STATE_DIR``
+    contract consumed by ``agent_memory_shadow.py``. This is required even for
+    a source entrypoint because it may be configured against an installed
+    Runtime/state database. Source checkouts without a managed or active
+    shadow remain non-mutating.
+    """
+
+    if not enabled:
+        yield None
+        return
+    config_root = expand_path(
+        env_value("CONFIG_ROOT", "$HOME/.config/agent-memory")
+    ).resolve()
+    shadow_root = expand_path(
+        env_value("SHADOW_STATE_DIR", str(config_root / "shadow"))
+    ).resolve()
+    try:
+        relative = shadow_root.relative_to(config_root)
+        if not relative.parts:
+            raise ValueError("shadow root cannot equal config root")
+        assert_no_symlink_beneath(
+            config_root,
+            shadow_root,
+            include_leaf=False,
+            allow_missing=True,
+        )
+    except (OSError, StateSecurityError, ValueError) as exc:
+        raise ShadowActivityLockError("SHADOW_ACTIVITY_LOCK_UNSAFE") from exc
+    runtime_identity_paths = (
+        config_root / "config" / "runtime-anchor.json",
+        config_root / "config" / "runtime-manifest.json",
+    )
+    runtime_identity_present = False
+    current_uid = os.geteuid() if hasattr(os, "geteuid") else None
+    for identity_path in runtime_identity_paths:
+        if not identity_path.exists() and not identity_path.is_symlink():
+            continue
+        try:
+            identity_metadata = identity_path.lstat()
+        except OSError as exc:
+            raise ShadowActivityLockError("SHADOW_ACTIVITY_LOCK_UNSAFE") from exc
+        if (
+            stat.S_ISLNK(identity_metadata.st_mode)
+            or not stat.S_ISREG(identity_metadata.st_mode)
+            or (
+                current_uid is not None
+                and identity_metadata.st_uid != current_uid
+            )
+        ):
+            raise ShadowActivityLockError("SHADOW_ACTIVITY_LOCK_UNSAFE")
+        runtime_identity_present = True
+    active_shadow = bool(
+        shadow_root.is_dir()
+        and not shadow_root.is_symlink()
+        and next(shadow_root.glob("shadow-start-*.json"), None) is not None
+    )
+    if not runtime_identity_present and not active_shadow:
+        yield None
+        return
+    descriptor: int | None = None
+    acquired = False
+    try:
+        shadow_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root_metadata = shadow_root.lstat()
+        current_uid = (
+            os.geteuid() if hasattr(os, "geteuid") else root_metadata.st_uid
+        )
+        if (
+            stat.S_ISLNK(root_metadata.st_mode)
+            or not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != current_uid
+            or (
+                os.name == "posix"
+                and stat.S_IMODE(root_metadata.st_mode) != 0o700
+            )
+        ):
+            raise ShadowActivityLockError("SHADOW_ACTIVITY_LOCK_UNSAFE")
+        path = shadow_root / ".shadow-activity.lock"
+        if path.exists() or path.is_symlink():
+            metadata = path.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != current_uid
+                or (
+                    os.name == "posix"
+                    and stat.S_IMODE(metadata.st_mode) != PRIVATE_FILE_MODE
+                )
+            ):
+                raise ShadowActivityLockError("SHADOW_ACTIVITY_LOCK_UNSAFE")
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags, PRIVATE_FILE_MODE)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != current_uid
+            or (
+                os.name == "posix"
+                and stat.S_IMODE(opened.st_mode) != PRIVATE_FILE_MODE
+            )
+        ):
+            raise ShadowActivityLockError("SHADOW_ACTIVITY_LOCK_UNSAFE")
+        if opened.st_size == 0:
+            os.write(descriptor, b"0")
+            os.fsync(descriptor)
+        try:
+            timeout_seconds = min(
+                30.0,
+                max(
+                    0.0,
+                    float(
+                        os.environ.get(
+                            "AGENT_MEMORY_SHADOW_ACTIVITY_LOCK_TIMEOUT_SECONDS",
+                            "15",
+                        )
+                    ),
+                ),
+            )
+        except ValueError as exc:
+            raise ShadowActivityLockError("SHADOW_ACTIVITY_LOCK_UNAVAILABLE") from exc
+        deadline = time.monotonic() + timeout_seconds
+        while not acquired:
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                if fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                elif msvcrt is not None:
+                    mode = getattr(msvcrt, "LK_NBRLCK", msvcrt.LK_NBLCK)
+                    msvcrt.locking(descriptor, mode, 1)
+                else:  # pragma: no cover - supported platforms provide one.
+                    raise ShadowActivityLockError("SHADOW_ACTIVITY_LOCK_UNAVAILABLE")
+                acquired = True
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise ShadowActivityLockError("SHADOW_ACTIVITY_LOCK_BUSY") from exc
+                time.sleep(0.01)
+    except ShadowActivityLockError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except (OSError, PermissionError) as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ShadowActivityLockError("SHADOW_ACTIVITY_LOCK_UNAVAILABLE") from exc
+    try:
+        # The descriptor is deliberately handed to the authenticated Runtime
+        # child.  Merely keeping the lock in this wrapper is insufficient: if
+        # the wrapper is killed while its child is still computing or about to
+        # commit observability, the child would otherwise become an unguarded
+        # writer.  subprocess ``pass_fds`` (or a Windows inherited handle)
+        # keeps the same locked open-file description alive through child exit.
+        yield descriptor
+    finally:
+        # Close, do not explicitly unlock.  The inherited child reference must
+        # remain authoritative if this wrapper unwinds before that child.  The
+        # OS releases the lock when the final shared open-file reference closes.
+        os.close(descriptor)
+
+
+def _run_with_shadow_activity_lock(
+    command: list[str],
+    *,
+    env: dict[str, str],
+    descriptor: int | None,
+) -> subprocess.CompletedProcess:
+    """Run a Runtime child without shortening the shared-lock lifetime.
+
+    POSIX ``pass_fds`` overrides close-on-exec for precisely this descriptor.
+    Windows receives a whitelist containing only the corresponding OS handle.
+    Thus an abrupt wrapper exit cannot release the activity boundary while the
+    authenticated child remains able to append shadow-observed state.
+    """
+
+    kwargs: dict[str, object] = {"env": env, "check": False}
+    if descriptor is None:
+        return subprocess.run(command, **kwargs)
+    if os.name == "posix":
+        kwargs["pass_fds"] = (descriptor,)
+        return subprocess.run(command, **kwargs)
+    if os.name == "nt" and msvcrt is not None:  # pragma: no cover - Windows CI
+        handle = msvcrt.get_osfhandle(descriptor)
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.lpAttributeList = {"handle_list": [handle]}
+        try:
+            os.set_handle_inheritable(handle, True)
+            return subprocess.run(
+                command,
+                **kwargs,
+                close_fds=True,
+                startupinfo=startupinfo,
+            )
+        finally:
+            os.set_handle_inheritable(handle, False)
+    raise ShadowActivityLockError("SHADOW_ACTIVITY_LOCK_UNAVAILABLE")
+
+
+def _isolated_script_command(
+    python: str,
+    target: Path,
+    forwarded: list[str],
+    *,
+    no_site: bool = True,
+) -> list[str]:
+    runner = (
+        "import runpy,sys;"
+        "target=sys.argv[1];sys.path.append(str(__import__('pathlib').Path(target).parent));"
+        "sys.argv=sys.argv[1:];runpy.run_path(target,run_name='__main__')"
+    )
+    flags = ["-I", "-S"] if no_site else ["-I"]
+    return [python, *flags, "-c", runner, str(target), *forwarded]
 
 
 def host_session_id(actor: str) -> str:
     keys = {
         "codex": ("AGENT_MEMORY_SESSION_ID", "CODEX_THREAD_ID"),
         "claude": ("AGENT_MEMORY_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"),
-        "yichen-content-studio": ("AGENT_MEMORY_SESSION_ID",),
+        "ailu": ("AGENT_MEMORY_SESSION_ID",),
     }.get(actor, ("AGENT_MEMORY_SESSION_ID",))
     for key in keys:
         value = os.environ.get(key, "").strip()
         if value:
             return value
     return ""
+
+
+def explicit_session_id(forwarded: list[str]) -> str:
+    """Return an exact ordinary ``--session-id`` value without abbreviations."""
+
+    values: list[str] = []
+    index = 0
+    while index < len(forwarded):
+        item = forwarded[index]
+        if item == "--session-id":
+            if index + 1 >= len(forwarded):
+                return ""
+            values.append(str(forwarded[index + 1]).strip())
+            index += 2
+            continue
+        if item.startswith("--session-id="):
+            values.append(item.split("=", 1)[1].strip())
+        index += 1
+    nonempty = [value for value in values if value]
+    return nonempty[0] if len(nonempty) == 1 else ""
+
+
+def invocation_task_id(actor: str, explicit_session: str = "") -> str:
+    """Return one raw task identity shared only within this wrapper process.
+
+    A real host session remains authoritative when available. Maintenance and
+    human CLI calls often have no host session, so they receive an ephemeral
+    nonce through ``AGENT_MEMORY_TASK_ID``. Child commands persist only the
+    purpose-bound task hash and never the nonce itself.
+    """
+
+    session = host_session_id(actor)
+    if session:
+        return session
+    existing = os.environ.get("AGENT_MEMORY_TASK_ID", "").strip()
+    if existing:
+        return existing
+    fallback = str(explicit_session or "").strip()
+    if fallback:
+        # Ordinary explicit-session maintenance commands run in separate
+        # wrapper processes.  Reusing this stable fallback keeps prepare,
+        # human issuance, and apply on one task binding when no host identity
+        # or explicit task identity exists.  A real host session above remains
+        # authoritative.
+        os.environ["AGENT_MEMORY_TASK_ID"] = fallback
+        return fallback
+    nonce = "memoryctl-invocation-" + uuid.uuid4().hex
+    os.environ["AGENT_MEMORY_TASK_ID"] = nonce
+    return nonce
+
+
+def canonical_search_scope(forwarded: list[str], actor: str) -> list[str]:
+    """Bind Search scope to the host actor and reject conflicting overrides."""
+
+    expected = actor if actor in {"codex", "claude"} else "shared"
+    normalized: list[str] = []
+    declared: list[str] = []
+    index = 0
+    while index < len(forwarded):
+        item = forwarded[index]
+        option = item.split("=", 1)[0]
+        if option == "--agent-scope":
+            if item == "--agent-scope":
+                if index + 1 >= len(forwarded):
+                    raise ValueError("search --agent-scope requires a value")
+                declared.append(str(forwarded[index + 1]).strip())
+                index += 2
+                continue
+            declared.append(item.split("=", 1)[1].strip())
+            index += 1
+            continue
+        if option.startswith("--agent-s") and "--agent-scope".startswith(option):
+            raise ValueError("search --agent-scope abbreviations are forbidden")
+        normalized.append(item)
+        index += 1
+    if len(declared) > 1:
+        raise ValueError("search --agent-scope may be supplied at most once")
+    if declared and declared[0] != expected:
+        raise ValueError(
+            f"search agent scope conflicts with --actor {actor}; expected {expected}"
+        )
+    return [*normalized, "--agent-scope", expected]
+
+
+SHADOW_ACTIONS = frozenset({"start", "restart", "status", "canary", "cutover", "rollback"})
+SHADOW_MUTATION_ACTIONS = frozenset({"start", "restart", "canary", "cutover", "rollback"})
+
+
+def canonical_shadow_args(forwarded: list[str]) -> tuple[str, list[str], bool]:
+    """Accept a bounded shadow grammar without a child-level actor override.
+
+    ``agent_memory_shadow.py`` also has a global ``--actor`` option.  Passing a
+    second actor through the remainder would let argparse's last value replace
+    the wrapper-authenticated actor.  Reject the exact option, ``=`` form, and
+    every argparse abbreviation before identifying the action, then return
+    arguments with the sole global JSON flag removed for canonical reinsertion.
+    """
+
+    normalized: list[str] = []
+    json_requested = False
+    for item in forwarded:
+        option = item.split("=", 1)[0]
+        if (
+            option == "--actor"
+            or (
+                option.startswith("--")
+                and len(option) > 2
+                and "--actor".startswith(option)
+            )
+        ):
+            raise ValueError("shadow actor override is forbidden")
+        if item == "--json":
+            json_requested = True
+            continue
+        normalized.append(item)
+    if normalized in (["--help"], ["-h"]):
+        return "help", normalized, json_requested
+    if not normalized or normalized[0] not in SHADOW_ACTIONS:
+        raise ValueError("shadow action is invalid")
+    return normalized[0], normalized, json_requested
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,7 +1007,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--actor",
-        choices=("codex", "claude", "human", "migration", "test", "yichen-content-studio"),
+        choices=("codex", "claude", "human", "migration", "test", "ailu"),
         default=os.environ.get("MEMORY_ACTOR", "codex"),
     )
     parser.add_argument("command", choices=(*COMMANDS.keys(), "prewrite", "version"))
@@ -66,9 +1017,129 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.actor == STUDIO_ACTOR and args.command not in STUDIO_COMMANDS:
+    raw_forwarded = list(args.args)
+    if raw_forwarded and raw_forwarded[0] == "--":
+        raw_forwarded = raw_forwarded[1:]
+    if (
+        _PLATFORM_NAME == "nt"
+        and args.command == "write"
+        and raw_forwarded
+        and raw_forwarded[0] not in _WINDOWS_READ_ONLY_ACTIONS
+    ):
+        print(json.dumps({
+            "schema_version": WIRE_SCHEMA_VERSION,
+            "ok": False,
+            "stage": raw_forwarded[0],
+            "status": "blocked",
+            "reason_code": "WINDOWS_READ_ONLY",
+            "message": "Agent Memory is read-only on Windows.",
+            "retryable": False,
+        }, separators=(",", ":")))
+        return 2
+    recovery_query = bool(
+        args.command == "write"
+        and raw_forwarded
+        and raw_forwarded[0] in {"status", "list"}
+    )
+    if args.command in {
+        "bootstrap",
+        "install-host-hooks",
+        "install-audit-launchagent",
+    } and args.actor != "migration":
+        print("installer maintenance commands require --actor migration", file=sys.stderr)
+        return 2
+    shadow_args: list[str] | None = None
+    shadow_json_requested = False
+    shadow_action = ""
+    if args.command == "shadow":
+        raw_shadow_args = list(args.args)
+        if raw_shadow_args and raw_shadow_args[0] == "--":
+            raw_shadow_args = raw_shadow_args[1:]
+        try:
+            shadow_action, shadow_args, shadow_json_requested = canonical_shadow_args(
+                raw_shadow_args
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if shadow_action in SHADOW_MUTATION_ACTIONS and args.actor != "migration":
+            print("shadow mutation commands require --actor migration", file=sys.stderr)
+            return 2
+    if args.command == "retrieval-benchmark" and args.actor != "migration":
+        print("retrieval benchmark requires --actor migration", file=sys.stderr)
+        return 2
+    if (
+        args.command == "zvec"
+        and any(
+            (
+                item == flag
+                or item.startswith(flag + "=")
+                or (
+                    len(item.split("=", 1)[0]) > 2
+                    and flag.startswith(item.split("=", 1)[0])
+                )
+            )
+            for item in args.args
+            for flag in ("--init", "--scan", "--prune", "--changed-file")
+        )
+        and args.actor != "migration"
+    ):
+        print("zvec index maintenance requires --actor migration", file=sys.stderr)
+        return 2
+    try:
+        transition = (
+            assert_runtime_ready(
+                args.command,
+                side_effect_free_state=True,
+            )
+            if recovery_query
+            else assert_runtime_ready(args.command)
+        )
+    except RuntimeTransitionError as exc:
+        if "--json" in args.args:
+            print(json.dumps({
+                "schema_version": WIRE_SCHEMA_VERSION,
+                "ok": False,
+                "ready": False,
+                "reason_code": "RUNTIME_TRANSITION_INCOMPLETE",
+            }, ensure_ascii=False))
+        else:
+            print(str(exc), file=sys.stderr)
+        return 2
+    task_seen_request: tuple[str, str] | None = None
+    if transition.get("ready") and not recovery_query and args.command not in {
+        "version",
+        "explain",
+        "migrate",
+        "bootstrap",
+        "install-host-hooks",
+        "install-audit-launchagent",
+        "retrieval-benchmark",
+    }:
+        task_fallback = (
+            explicit_session_id(args.args) if args.actor != AILU_ACTOR else ""
+        )
+        task_seen_request = (
+            invocation_task_id(args.actor, task_fallback),
+            args.actor,
+        )
+    if args.actor == AILU_ACTOR and args.command not in AILU_COMMANDS:
         print(
-            "yichen-content-studio may use only retrieve, write, or version",
+            "ailu may use only retrieve, write, or version",
+            file=sys.stderr,
+        )
+        return 2
+    if args.command == "content-migrate" and args.actor not in {"codex", "claude"}:
+        print("content-migrate requires a codex or claude actor", file=sys.stderr)
+        return 2
+    if args.command == "confirmation-capability" and args.actor != "human":
+        print("confirmation-capability requires --actor human", file=sys.stderr)
+        return 2
+    if args.actor in {"codex", "claude"} and args.command in {
+        "intent", "claim", "claims-expire", "observe-deletion", "observe-committed",
+    }:
+        print(
+            f"{args.actor} low-level mutation is forbidden; use write read-target/prepare/apply/cancel",
             file=sys.stderr,
         )
         return 2
@@ -79,28 +1150,46 @@ def main() -> int:
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             payload = {"status": "unmanaged", "manifest": str(manifest_path)}
+        payload = {
+            **payload,
+            "schema_version": WIRE_SCHEMA_VERSION,
+            "ok": bool(transition.get("ready")),
+            "ready": bool(transition.get("ready")),
+            "runtime_integrity_sha256": str(transition.get("runtime_integrity_sha256", "")),
+            "manifest_sha256": str(
+                transition.get("runtime_integrity", {}).get("manifest_sha256", "")
+                if isinstance(transition.get("runtime_integrity"), dict)
+                else ""
+            ),
+            "runtime_transition": transition,
+        }
         if "--json" in args.args:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
             print(f"agent-memory-runtime={payload.get('source_commit', payload.get('status', 'unknown'))}")
             print(f"manifest={manifest_path}")
-        return 0
+        return 0 if payload["ready"] else 2
 
     command_name = "closeout" if args.command == "prewrite" else args.command
     target = COMMANDS[command_name]
-    if not target.exists():
+    try:
+        target_metadata = target.lstat()
+    except FileNotFoundError:
         print(f"missing command target: {target}", file=sys.stderr)
+        return 2
+    if stat.S_ISLNK(target_metadata.st_mode) or not stat.S_ISREG(target_metadata.st_mode):
+        print(f"unsafe command target: {target}", file=sys.stderr)
         return 2
     forwarded = list(args.args)
     if forwarded and forwarded[0] == "--":
         forwarded = forwarded[1:]
-    if args.actor == STUDIO_ACTOR and args.command == "retrieve":
+    if args.actor == AILU_ACTOR and args.command == "retrieve":
         # The private query and its scope are accepted only as controlled JSON
         # on stdin.  Keeping the wrapper argv fixed also makes accidental query
         # leakage observable and fail closed before a child is started.
         if any(item != "--json" for item in forwarded):
             print(
-                "yichen-content-studio retrieve accepts request JSON on stdin only",
+                "ailu retrieve accepts request JSON on stdin only",
                 file=sys.stderr,
             )
             return 2
@@ -109,27 +1198,6 @@ def main() -> int:
         if not forwarded:
             print("prewrite requires a memory summary", file=sys.stderr)
             return 2
-        if args.actor == "yichen-content-studio":
-            asserted_values = [
-                forwarded[index + 1]
-                for index, item in enumerate(forwarded)
-                if item == "--asserted-by" and index + 1 < len(forwarded)
-            ]
-            if len(asserted_values) != 1:
-                print(
-                    "yichen-content-studio prewrite requires --asserted-by "
-                    "user|claude|codex|opencode; actor and factual asserter are separate",
-                    file=sys.stderr,
-                )
-                return 2
-            asserted_by = asserted_values[0]
-            if asserted_by not in {"user", "claude", "codex", "opencode"}:
-                print(
-                    "unsupported --asserted-by for yichen-content-studio; "
-                    "use user|claude|codex|opencode",
-                    file=sys.stderr,
-                )
-                return 2
         forwarded = ["--prewrite", forwarded[0], *forwarded[1:]]
     elif args.command in {"claim", "claims", "claims-expire", "observe-deletion", "observe-committed"}:
         action = {
@@ -162,25 +1230,68 @@ def main() -> int:
             forwarded = [item for item in forwarded if item != "--json"]
             global_options.append("--json")
         forwarded = [*global_options, *forwarded]
+    elif args.command == "observe":
+        global_options = ["--actor", args.actor]
+        if "--json" in forwarded:
+            forwarded = [item for item in forwarded if item != "--json"]
+            global_options.append("--json")
+        forwarded = [*global_options, *forwarded]
+    elif args.command == "session-hook":
+        forwarded = ["--actor", args.actor, *forwarded]
+    elif args.command == "stop-hook":
+        forwarded = ["--actor", args.actor, *forwarded]
     elif args.command == "retrieve":
         forwarded = ["--actor", args.actor, *forwarded]
+    elif args.command == "content-migrate":
+        forwarded = ["--actor", args.actor, *forwarded]
+    elif args.command == "confirmation-capability":
+        # The full request, including the human reference and proposal ID,
+        # exists only on stdin.  argv is a fixed, non-private grammar and the
+        # child returns a private handoff path rather than the bearer token.
+        if any(item not in {"issue", "--json"} for item in forwarded) or forwarded.count("issue") != 1:
+            print(
+                "confirmation-capability accepts only `issue [--json]`; request JSON must use stdin",
+                file=sys.stderr,
+            )
+            return 2
+        forwarded = [
+            "--issuer-actor",
+            "human",
+            *( ["--json"] if "--json" in forwarded else [] ),
+            "issue",
+        ]
+    elif args.command == "shadow":
+        global_options = ["--actor", args.actor]
+        # ``canonical_shadow_args`` rejected every forwarded actor spelling
+        # before Runtime checks and retained a controlled action-first grammar.
+        forwarded = list(shadow_args or [])
+        if shadow_json_requested:
+            global_options.append("--json")
+        forwarded = [*global_options, *forwarded]
     elif args.command == "write":
         current_session = host_session_id(args.actor)
         global_options = ["--actor", args.actor]
-        if args.actor == STUDIO_ACTOR:
+        if args.actor == AILU_ACTOR:
             # Keep the child argv to a small, non-private grammar.  In
             # particular, reject both ``--session-id=value`` and argparse-style
             # abbreviations such as ``--session`` before a child process is
-            # created.  The Studio session exists only in the inherited private
+            # created.  The Ailu session exists only in the inherited private
             # environment.
             if any(item.startswith("--session") for item in forwarded):
                 print(
-                    "yichen-content-studio write takes its private session from the environment only",
+                    "ailu write takes its private session from the environment only",
                     file=sys.stderr,
                 )
                 return 2
-            if not forwarded or forwarded[0] not in {"read-target", "prepare", "apply", "cancel"}:
-                print("yichen-content-studio write action is invalid", file=sys.stderr)
+            if not forwarded or forwarded[0] not in {
+                "read-target",
+                "prepare",
+                "apply",
+                "cancel",
+                "status",
+                "list",
+            }:
+                print("ailu write action is invalid", file=sys.stderr)
                 return 2
             normalized: list[str] = [forwarded[0]]
             index = 1
@@ -191,7 +1302,7 @@ def main() -> int:
                         normalized.append(item)
                 elif item in {"--lock-timeout", "--closeout-timeout"}:
                     if index + 1 >= len(forwarded):
-                        print("yichen-content-studio write option is incomplete", file=sys.stderr)
+                        print("ailu write option is incomplete", file=sys.stderr)
                         return 2
                     normalized.extend([item, forwarded[index + 1]])
                     index += 1
@@ -199,13 +1310,13 @@ def main() -> int:
                     normalized.append(item)
                 else:
                     print(
-                        "yichen-content-studio write accepts only controlled non-private options",
+                        "ailu write accepts only controlled non-private options",
                         file=sys.stderr,
                     )
                     return 2
                 index += 1
             forwarded = normalized
-        if args.actor != STUDIO_ACTOR and current_session and "--session-id" not in forwarded:
+        if args.actor != AILU_ACTOR and current_session and "--session-id" not in forwarded:
             global_options.extend(["--session-id", current_session])
         if "--json" in forwarded:
             forwarded = [item for item in forwarded if item != "--json"]
@@ -219,7 +1330,7 @@ def main() -> int:
         if not global_mode and args.command == "closeout" and args.actor in {
             "codex",
             "claude",
-            "yichen-content-studio",
+            "ailu",
         }:
             if not explicit_session and current_session:
                 forwarded.extend(["--session-id", current_session])
@@ -240,24 +1351,47 @@ def main() -> int:
             flag in forwarded for flag in ("--commit", "--dry-run", "--prewrite")
         ):
             forwarded.append("--commit")
-    elif (
-        command_name == "search"
-        and args.actor in {"codex", "claude", "yichen-content-studio"}
-        and "--agent-scope" not in forwarded
-    ):
-        forwarded.extend(
-            ["--agent-scope", args.actor if args.actor in {"codex", "claude"} else "shared"]
-        )
+    elif command_name == "search" and args.actor in {"codex", "claude"}:
+        try:
+            forwarded = canonical_search_scope(forwarded, args.actor)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     env = os.environ.copy()
     env["MEMORY_ACTOR"] = args.actor
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
-    command = [sys.executable, str(target), *forwarded]
-    if command_name == "zvec":
+    command = _isolated_script_command(sys.executable, target, forwarded)
+    if command_name in {"zvec", "retrieval-benchmark"}:
         # Zvec and the embedding stack live in the pinned semantic runtime,
-        # not necessarily in the Python that launched memoryctl.
-        command = [env_value("ZVEC_PYTHON", sys.executable), str(target), *forwarded]
-    return subprocess.run(command, env=env, check=False).returncode
+        # not necessarily in the Python that launched memoryctl. The benchmark
+        # imports that same stack, so it also keeps isolated mode while allowing
+        # only the configured interpreter's authenticated site packages.
+        command = _isolated_script_command(
+            env_value("ZVEC_PYTHON", sys.executable),
+            target,
+            forwarded,
+            no_site=False,
+        )
+    shared_activity = not (
+        args.command == "shadow" and shadow_action in SHADOW_MUTATION_ACTIONS
+    )
+    try:
+        with runtime_shadow_activity_lock(enabled=shared_activity) as activity_descriptor:
+            if task_seen_request is not None:
+                # Best effort and idempotent, but inside the same shared
+                # activity boundary as the child that may consume it.
+                from agent_memory_observability import record_task_seen
+
+                record_task_seen(*task_seen_request)
+            return _run_with_shadow_activity_lock(
+                command,
+                env=env,
+                descriptor=activity_descriptor,
+            ).returncode
+    except ShadowActivityLockError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -10,9 +10,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+if str(SCRIPT_ROOT := Path(__file__).resolve().parents[1] / "scripts") not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+from state_fixture import initialize_full_state
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_ROOT = REPO_ROOT / "scripts"
 
 
 def run(command: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -54,6 +58,7 @@ class AgentScopeTests(unittest.TestCase):
             (workflow / "claude.md").write_text(memory("Claude", "claude", "claude"), encoding="utf-8")
 
             state_db = root / "config" / "state.sqlite"
+            initialize_full_state(state_db)
             env = os.environ.copy()
             env.update(
                 {
@@ -79,7 +84,6 @@ class AgentScopeTests(unittest.TestCase):
             for actor in ("codex", "claude"):
                 result = run(
                     [
-                        sys.executable,
                         str(SCRIPT_ROOT / "memoryctl"),
                         "--actor",
                         actor,

@@ -10,6 +10,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts"
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+from state_fixture import initialize_full_state
 
 
 def run(command: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -50,6 +54,17 @@ class BootstrapIntegrationTests(unittest.TestCase):
             self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
             self.assertEqual(status.stdout, "")
 
+            closeout_rules = (
+                vault / "工作流" / "Agent记忆收尾决策规则.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("risk_class: ordinary\n", closeout_rules)
+            self.assertNotIn("verified_at:", closeout_rules)
+            self.assertIn(
+                "- 真实用户表达别名：对话结束、自动归档、记忆收尾、对话结束归档、"
+                "Codex 每次对话结束怎么自动归档。",
+                closeout_rules,
+            )
+
             env = os.environ.copy()
             env.update(
                 {
@@ -59,6 +74,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
                     "AGENT_MEMORY_STATE_DB": str(state_db),
                 }
             )
+            initialize_full_state(state_db)
 
             evolution = run(
                 [sys.executable, str(SCRIPT_ROOT / "agent_memory_evolution.py"), "--init", "--scan", "--report"],

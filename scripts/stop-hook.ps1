@@ -13,7 +13,7 @@ $ErrorActionPreference = 'Stop'
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$hookScript = Join-Path $scriptRoot 'agent_memory_stop_hook.py'
+$memoryctl = Join-Path $scriptRoot 'memoryctl'
 
 if (-not $Python) {
     $venvPython = Join-Path (Split-Path -Parent $scriptRoot) '.venv\Scripts\python.exe'
@@ -26,11 +26,11 @@ if (-not $Python) {
         $Python = $command.Source
     }
 }
-if (-not (Test-Path -LiteralPath $hookScript)) {
-    throw "Stop Hook implementation was not found: $hookScript"
+if (-not (Test-Path -LiteralPath $memoryctl)) {
+    throw "Agent Memory entrypoint was not found: $memoryctl"
 }
 
-$arguments = @($hookScript, '--actor', $Actor, '--protocol', $Protocol, '--timeout', $Timeout)
+$arguments = @('-I', '-S', $memoryctl, '--actor', $Actor, 'stop-hook', '--protocol', $Protocol, '--timeout', $Timeout)
 if ($AutoCloseout) { $arguments += '--auto-closeout' }
 $payload = [Console]::In.ReadToEnd()
 try {

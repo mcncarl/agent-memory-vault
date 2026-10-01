@@ -13,7 +13,7 @@
     },
     {
       "id": "sample-closeout-rules",
-      "query": "Agent记忆收尾决策规则",
+      "query": "Codex 每次对话结束怎么自动归档",
       "expected": ["工作流/Agent记忆收尾决策规则.md"],
       "required_at": 5,
       "tags": ["fake", "workflow"]

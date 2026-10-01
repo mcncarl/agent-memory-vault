@@ -8,6 +8,9 @@ import shlex
 import sys
 from pathlib import Path
 
+from agent_memory_env import RuntimeTransitionError, assert_runtime_ready
+from agent_memory_observability import record_task_seen
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bridge host session IDs into Agent Memory commands.")
@@ -25,8 +28,17 @@ def read_payload() -> dict[str, object]:
 
 def main() -> int:
     args = parse_args()
+    try:
+        assert_runtime_ready("session-hook")
+    except RuntimeTransitionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     payload = read_payload()
     session_id = str(payload.get("session_id") or "").strip()
+    # Idempotent with memoryctl and the Stop fallback.  Record the denominator
+    # as soon as the host exposes a session, even if its env bridge is broken.
+    if session_id:
+        record_task_seen(session_id, args.actor)
     raw_env_file = os.environ.get("CLAUDE_ENV_FILE", "").strip()
     if args.actor != "claude" or not session_id or not raw_env_file:
         print("agent memory session bridge requires session_id and CLAUDE_ENV_FILE", file=sys.stderr)

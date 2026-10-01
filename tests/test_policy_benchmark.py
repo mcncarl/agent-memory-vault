@@ -38,7 +38,7 @@ class PolicyBenchmarkTests(unittest.TestCase):
             {"ADD", "UPDATE", "NOOP", "MARK_OUTDATED", "MERGE_REQUIRED", "ASK_USER"},
         )
         outdated = next(record for record in by_kind["reconcile"]["records"] if record["result"] == "MARK_OUTDATED")
-        self.assertEqual(outdated["result_origin"], "benchmark_temporal_policy")
+        self.assertEqual(outdated["result_origin"], "annotate_result_policy")
         self.assertGreaterEqual(by_kind["safety"]["metrics"]["cases"], 5)
         self.assertEqual(by_kind["safety"]["metrics"]["accuracy"], 1.0)
         self.assertEqual(

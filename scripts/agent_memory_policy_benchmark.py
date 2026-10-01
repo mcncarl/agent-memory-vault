@@ -5,11 +5,13 @@ import argparse
 import hashlib
 import json
 import sys
+from argparse import Namespace
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 import agent_memory_closeout as closeout
+import agent_memory_search as memory_search
 import agent_memory_safety as safety
 
 
@@ -175,21 +177,22 @@ def assess_case(case: dict[str, Any]) -> dict[str, Any]:
 
 
 def should_mark_outdated(case: dict[str, Any]) -> bool:
-    """Evaluate the benchmark's explicit temporal/supersession layer.
-
-    `prewrite_recommendation` currently emits only ADD, UPDATE,
-    MERGE_REQUIRED, or NOOP. MARK_OUTDATED is therefore measured here as a
-    separate policy rule, never attributed to the prewrite classifier.
-    """
+    """Exercise the production time policy; never award a synthetic pass."""
     if str(case.get("current_status", "")) not in CURRENT_STATUSES:
         return False
     context = str(case.get("explicit_action_context", ""))
-    if context == "superseded":
-        return bool(case.get("rows"))
     if context == "expiry_review":
-        valid_until = str(case.get("valid_until", ""))
-        as_of = str(case.get("as_of", ""))
-        return bool(valid_until and as_of and date.fromisoformat(valid_until) < date.fromisoformat(as_of))
+        result = memory_search.SearchResult(
+            path="/benchmark/fact.md",
+            rel_path="决策/benchmark-fact.md",
+            status="active",
+            valid_until=str(case.get("valid_until", "")),
+        )
+        memory_search.annotate_result_policy(
+            result,
+            Namespace(as_of=str(case.get("as_of", "")), current_project=""),
+        )
+        return result.time_status == "expired"
     return False
 
 
@@ -201,7 +204,7 @@ def evaluate_case(kind: str, case: dict[str, Any]) -> tuple[str, str, str]:
     if decision != "ALLOW":
         return decision, str(assessment["reason_code"]), "assess_source"
     if should_mark_outdated(case):
-        return "MARK_OUTDATED", "EXPLICIT_TEMPORAL_OR_SUPERSESSION_CONTEXT", "benchmark_temporal_policy"
+        return "MARK_OUTDATED", "EXPLICIT_TEMPORAL_OR_SUPERSESSION_CONTEXT", "annotate_result_policy"
     result, _best_row, _metrics = closeout.prewrite_recommendation(
         str(case["input"]), list(case["rows"])
     )

@@ -6,32 +6,29 @@ param(
     [string]$TaskName = 'AgentMemoryVaultAudit',
     [string]$Python = '',
     [string]$RuntimeRoot = '',
-    [int]$DayOfWeek = 1,
+    [int]$DayOfWeek = 0,
     [string]$At = '10:30'
 )
 
 $ErrorActionPreference = 'Stop'
 if (-not $RuntimeRoot) { $RuntimeRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
 $scriptRoot = Join-Path $RuntimeRoot 'scripts'
-$auditScript = Join-Path $scriptRoot 'agent_memory_audit_autorun.py'
+$memoryctl = Join-Path $scriptRoot 'memoryctl'
 if (-not $Python) {
     $candidate = Join-Path $RuntimeRoot '.venv\Scripts\python.exe'
-    if (Test-Path -LiteralPath $candidate) { $Python = $candidate }
-    else {
-        $command = Get-Command python.exe -ErrorAction SilentlyContinue
-        if (-not $command) { $command = Get-Command py.exe -ErrorAction SilentlyContinue }
-        if (-not $command) { throw 'Python 3 was not found.' }
-        $Python = $command.Source
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        throw 'The managed Agent Memory Python was not found.'
     }
+    $Python = $candidate
 }
 
 switch ($Action) {
     'install' {
-        if (-not (Test-Path -LiteralPath $auditScript)) { throw "Audit script was not found: $auditScript" }
+        if (-not (Test-Path -LiteralPath $memoryctl -PathType Leaf)) { throw "Agent Memory entrypoint was not found: $memoryctl" }
         $days = @('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
         if ($DayOfWeek -lt 0 -or $DayOfWeek -gt 6) { throw 'DayOfWeek must be between 0 and 6.' }
         $taskAction = New-ScheduledTaskAction -Execute $Python `
-            -Argument ('-X utf8 "{0}" --reason task-scheduler --json' -f $auditScript) `
+            -Argument ('-I -S "{0}" --actor human audit-autorun --reason task-scheduler --json' -f $memoryctl) `
             -WorkingDirectory $RuntimeRoot
         $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $days[$DayOfWeek] -At $At
         $principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `

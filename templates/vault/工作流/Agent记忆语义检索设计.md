@@ -5,10 +5,13 @@ project_id: agent-memory-vault-semantic-retrieval
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
+agent_scope: shared
 session_id: ""
 status: active
 sensitivity: normal
+temporal_policy: reviewable
 verified_at: 2026-06-21
+review_after_days: 180
 keywords:
   - semantic retrieval
   - embedding
@@ -39,12 +42,11 @@ keywords:
 ## 常用命令
 
 ```bash
-python3 scripts/agent_memory_index.py --init --scan --report
-python3 scripts/agent_memory_zvec_index.py --init
-python3 scripts/agent_memory_zvec_index.py --scan --prune
-python3 scripts/agent_memory_zvec_index.py --report
-python3 scripts/agent_memory_zvec_index.py --search "只记得大概意思的问题" --limit 5
-python3 scripts/agent_memory_retrieval_benchmark.py --limit 5
+memoryctl --actor migration index --init --scan --report
+memoryctl --actor migration zvec --init --scan --prune --json
+memoryctl --actor migration zvec --report --json
+memoryctl --actor codex search "只记得大概意思的问题" --semantic-mode required --limit 5
+memoryctl --actor migration retrieval-benchmark --limit 5 --runs 3 --json
 ```
 
 ## 成本和隐私
@@ -56,5 +58,5 @@ python3 scripts/agent_memory_retrieval_benchmark.py --limit 5
 
 ## 下次优先看
 
-- 如果 SQLite 召回不全，先确认是否已跑 `agent_memory_zvec_index.py --scan`。
-- 如果换 embedding 模型，重新跑全量向量索引和 retrieval benchmark。
+- 如果 SQLite 召回不全，先用 `memoryctl --actor human doctor --json` 确认派生索引健康；需要重建时由明确的维护操作运行 `doctor --repair-derived`。
+- 如果换 embedding 模型，通过 `memoryctl --actor migration` 的 Zvec 维护与 retrieval benchmark 重新建立受管证据。

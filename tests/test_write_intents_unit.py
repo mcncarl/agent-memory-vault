@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
 import importlib.util
 import json
 import os
@@ -17,6 +18,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_ROOT = REPO_ROOT / "scripts"
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
+
+from tests.state_fixture import initialize_full_state
 
 
 def load_module():
@@ -58,6 +61,10 @@ class WriteIntentTests(unittest.TestCase):
         self.module.VAULT_ROOT = self.vault
         self.module.GIT_ROOT = self.root
         self.module.STATE_DB = self.root / "state.sqlite"
+        # Ordinary writer commands intentionally refuse to bootstrap or
+        # migrate state.  Disposable unit fixtures therefore model the
+        # installer boundary explicitly before exercising the writer API.
+        initialize_full_state(self.module.STATE_DB)
         self.module.MAX_PROPOSAL_BYTES = 4096
         self.module.MAX_TARGET_BYTES = 8192
         self.module.PROTECTED_PATHS = ("关键/*.md",)
@@ -117,6 +124,20 @@ class WriteIntentTests(unittest.TestCase):
             (self.vault / "linked").symlink_to(external, target_is_directory=True)
             with self.assertRaisesRegex(self.module.IntentError, "symlink"):
                 self.module.canonical_target("linked/note.md")
+
+    def test_create_intent_rejects_an_unknown_actor_generically(self) -> None:
+        with self.assertRaises(self.module.IntentError) as raised:
+            self.module.create_intent(
+                actor="retired-client",
+                raw_session_id=self.session,
+                target=self.note,
+                proposal_file=self.proposal,
+                approval_required=False,
+                source_class="user_direct",
+                knowledge_kind="fact",
+                asserted_by="codex-test",
+            )
+        self.assertEqual(raised.exception.reason_code, "ACTOR_UNSUPPORTED")
 
     def test_proposal_must_be_outside_vault_valid_utf8_and_bounded(self) -> None:
         inside = self.vault / "proposal.tmp"
@@ -263,6 +284,467 @@ class WriteIntentTests(unittest.TestCase):
         self.assertEqual(expired["intent"]["status"], "expired")
         self.assertEqual(expired["receipt"]["outcome"], "expired")
         self.assertEqual(expired["receipt"]["reason_code"], "INTENT_EXPIRED")
+
+    def test_expired_validated_recovery_is_exact_claim_bound_and_idempotent(self) -> None:
+        evidence_ref_sha256 = "e" * 64
+        read_token = "r" * 64
+        scope_app_id = "agent-memory"
+        scope_project_id = "rules"
+        created = self.module.create_intent(
+            actor="codex",
+            raw_session_id=self.session,
+            target=self.note,
+            proposal_file=self.proposal,
+            approval_required=True,
+            source_class="user_direct",
+            knowledge_kind="rule",
+            asserted_by="user",
+            evidence_ref_sha256=evidence_ref_sha256,
+            reconcile_action="UPDATE",
+            operation="governance_migration",
+            read_token=read_token,
+            scope_app_id=scope_app_id,
+            scope_project_id=scope_project_id,
+        )
+        canonical = self.module.canonical_target(self.note)
+        base_raw_sha256 = created["base_raw_sha256"]
+        base_canonical_sha256 = created["base_canonical_sha256"]
+        proposal_raw_sha256 = created["proposal_raw_sha256"]
+        proposal_canonical_sha256 = created[
+            "proposal_canonical_sha256"
+        ]
+        approval_ref_sha256 = "f" * 64
+        expired_at = "2000-01-01T00:00:00+00:00"
+        now = "2026-08-25T00:00:00+00:00"
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.row_factory = sqlite3.Row
+            stored = dict(
+                conn.execute(
+                    "SELECT * FROM memory_write_intents WHERE intent_id=?",
+                    (created["intent_id"],),
+                ).fetchone()
+            )
+            stored.update({
+                "approved_by": (
+                    self.module.HUMAN_CONFIRMATION_CAPABILITY_APPROVER
+                ),
+                "approval_ref_sha256": approval_ref_sha256,
+                "approval_proposal_raw_sha256": proposal_raw_sha256,
+                "approval_proposal_canonical_sha256": (
+                    proposal_canonical_sha256
+                ),
+            })
+            approval_binding = self.module._approval_binding(
+                stored,
+                self.module.HUMAN_CONFIRMATION_CAPABILITY_APPROVER,
+                proposal_raw_sha256,
+                proposal_canonical_sha256,
+                approval_ref_sha256,
+            )
+            conn.execute(
+                "UPDATE memory_write_intents SET status='validated', "
+                "approved_at=?, approved_by=?, "
+                "approval_proposal_raw_sha256=?, "
+                "approval_proposal_canonical_sha256=?, "
+                "approval_ref_sha256=?, approval_binding_sha256=?, "
+                "bound_at=?, claim_ref_sha256=?, "
+                "bound_base_raw_sha256=?, validated_at=?, "
+                "validation_mode='exact', final_raw_sha256=?, "
+                "final_canonical_sha256=?, validated_git_head=base_git_head, "
+                "early_commit=0, proposal_commit='', reason_code='', "
+                "expires_at=?, updated_at=? WHERE intent_id=?",
+                (
+                    now,
+                    self.module.HUMAN_CONFIRMATION_CAPABILITY_APPROVER,
+                    proposal_raw_sha256,
+                    proposal_canonical_sha256,
+                    approval_ref_sha256,
+                    approval_binding,
+                    now,
+                    "c" * 64,
+                    base_raw_sha256,
+                    now,
+                    proposal_raw_sha256,
+                    proposal_canonical_sha256,
+                    expired_at,
+                    now,
+                    created["intent_id"],
+                ),
+            )
+            conn.execute(
+                "INSERT INTO memory_session_claims ("
+                "session_hash, actor, path, rel_path, status, claimed_at, "
+                "updated_at, completed_at, intent_id, target_key, "
+                "fencing_token, claim_kind"
+                ") VALUES (?, 'codex', ?, ?, 'active', ?, ?, NULL, ?, ?, ?, 'intent')",
+                (
+                    self.module.session_hash(self.session),
+                    str(canonical.path),
+                    canonical.rel_path,
+                    now,
+                    now,
+                    created["intent_id"],
+                    canonical.target_key,
+                    created["fencing_token"],
+                ),
+            )
+
+        def recover(
+            expected_expires_at: str,
+            *,
+            generated_index_recovery: dict[str, object] | None = None,
+        ):
+            return self.module.recover_expired_validated_lease(
+                created["intent_id"],
+                actor="codex",
+                raw_session_id=self.session,
+                target=self.note,
+                fencing_token=created["fencing_token"],
+                expected_expires_at=expected_expires_at,
+                expected_base_raw_sha256=base_raw_sha256,
+                expected_base_canonical_sha256=base_canonical_sha256,
+                expected_base_git_head=created["base_git_head"],
+                expected_read_token=read_token,
+                expected_scope_app_id=scope_app_id,
+                expected_scope_project_id=scope_project_id,
+                expected_proposal_raw_sha256=proposal_raw_sha256,
+                expected_proposal_canonical_sha256=(
+                    proposal_canonical_sha256
+                ),
+                expected_proposal_size_bytes=created[
+                    "proposal_size_bytes"
+                ],
+                expected_final_raw_sha256=proposal_raw_sha256,
+                expected_final_canonical_sha256=(
+                    proposal_canonical_sha256
+                ),
+                expected_validated_git_head=created["base_git_head"],
+                expected_early_commit=False,
+                expected_proposal_commit="",
+                expected_evidence_ref_sha256=evidence_ref_sha256,
+                expected_operation="governance_migration",
+                expected_reconcile_action="UPDATE",
+                generated_index_recovery=generated_index_recovery,
+            )
+
+        recovered = recover(expired_at)
+        self.assertEqual(
+            recovered["reason_code"],
+            self.module.EXPIRED_VALIDATED_RECOVERY_REASON,
+        )
+        self.assertGreater(
+            self.module.parse_time(recovered["expires_at"]),
+            dt.datetime.now(dt.timezone.utc),
+        )
+        repeated = recover(recovered["expires_at"])
+        self.assertEqual(
+            repeated["reason_code"],
+            self.module.EXPIRED_VALIDATED_RECOVERY_REASON,
+        )
+        self.assertEqual(repeated["expires_at"], recovered["expires_at"])
+        with self.assertRaises(self.module.IntentError) as renew_recovery:
+            self.module.renew_lease(
+                created["intent_id"],
+                actor="codex",
+                raw_session_id=self.session,
+                fencing_token=created["fencing_token"],
+            )
+        self.assertEqual(
+            renew_recovery.exception.reason_code,
+            "EXPIRED_VALIDATED_RECOVERY_RENEW_FORBIDDEN",
+        )
+
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_intents SET expires_at='not-a-date' "
+                "WHERE intent_id=?",
+                (created["intent_id"],),
+            )
+        with self.assertRaises(self.module.IntentError) as invalid_expiry:
+            recover("not-a-date")
+        self.assertEqual(
+            invalid_expiry.exception.reason_code,
+            "EXPIRED_VALIDATED_RECOVERY_EXPIRY_INVALID",
+        )
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_intents SET expires_at=? "
+                "WHERE intent_id=?",
+                (repeated["expires_at"], created["intent_id"]),
+            )
+
+        oversized_window_expiry = (
+            dt.datetime.now(dt.timezone.utc)
+            + dt.timedelta(hours=1)
+        ).replace(microsecond=0).isoformat()
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_intents SET expires_at=? "
+                "WHERE intent_id=?",
+                (oversized_window_expiry, created["intent_id"]),
+            )
+        with self.assertRaises(self.module.IntentError) as oversized_window:
+            recover(oversized_window_expiry)
+        self.assertEqual(
+            oversized_window.exception.reason_code,
+            "EXPIRED_VALIDATED_RECOVERY_EXPIRY_INVALID",
+        )
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_intents SET expires_at=? "
+                "WHERE intent_id=?",
+                (repeated["expires_at"], created["intent_id"]),
+            )
+
+        elapsed_recovery_expiry = "2000-01-02T00:00:00+00:00"
+        elapsed_recovery_published = "2000-01-01T23:55:00+00:00"
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_intents SET expires_at=?, updated_at=? "
+                "WHERE intent_id=?",
+                (
+                    elapsed_recovery_expiry,
+                    elapsed_recovery_published,
+                    created["intent_id"],
+                ),
+            )
+        with self.assertRaises(self.module.IntentError) as elapsed_window:
+            recover(elapsed_recovery_expiry)
+        self.assertEqual(
+            elapsed_window.exception.reason_code,
+            "EXPIRED_VALIDATED_RECOVERY_WINDOW_ELAPSED",
+        )
+
+        # A generated-INDEX transaction from this exact actor/task/fence may
+        # fail after the first recovery marker is published.  Once the normal
+        # exact generated-index recovery has durably consumed that transaction,
+        # the intent receives one shorter repair window.  It is not a renewal:
+        # the transaction is bound to the first window and a third window is
+        # impossible.
+        repair_transaction_id = "d" * 32
+        repair_index_sha256 = "a" * 64
+        repair_full_vault_sha256 = "b" * 64
+        repair_lease_projection = [
+            (
+                created["intent_id"],
+                int(created["fencing_token"]),
+                hashlib.sha256(canonical.rel_path.encode("utf-8")).hexdigest(),
+                "live",
+            )
+        ]
+        repair_lease_sha256 = hashlib.sha256(
+            json.dumps(
+                repair_lease_projection,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        first_published_epoch = int(
+            dt.datetime.fromisoformat(elapsed_recovery_published).timestamp()
+        )
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "INSERT INTO generated_index_closeout_transactions ("
+                "transaction_id, actor, task_sha256, vault_root_sha256, "
+                "git_head, index_base_sha256, full_vault_inputs_sha256, "
+                "lease_fences_sha256, capability_sha256, issuer_pid, "
+                "consumer_pid, status, issued_at_epoch, expires_at_epoch, "
+                "claimed_at_epoch, consumed_at_epoch, generated_sha256, "
+                "closeout_git_commit, failure_reason, rollback_evidence_path"
+                ") VALUES (?, 'codex', ?, ?, ?, ?, ?, ?, ?, 999991, 999992, "
+                "'consumed', ?, ?, ?, ?, ?, ?, '', '')",
+                (
+                    repair_transaction_id,
+                    hashlib.sha256(self.session.encode("utf-8")).hexdigest(),
+                    hashlib.sha256(str(self.vault).encode("utf-8")).hexdigest(),
+                    created["base_git_head"],
+                    repair_index_sha256,
+                    repair_full_vault_sha256,
+                    repair_lease_sha256,
+                    "c" * 64,
+                    first_published_epoch + 1,
+                    first_published_epoch + 30,
+                    first_published_epoch + 2,
+                    int(dt.datetime.now(dt.timezone.utc).timestamp()),
+                    repair_index_sha256,
+                    created["base_git_head"],
+                ),
+            )
+        generated_index_recovery = {
+            "transaction_id": repair_transaction_id,
+            "git_head": created["base_git_head"],
+            "index_base_sha256": repair_index_sha256,
+            "generated_sha256": repair_index_sha256,
+            "closeout_git_commit": created["base_git_head"],
+            "lease_fences_sha256": repair_lease_sha256,
+            "status": "consumed",
+        }
+        wrong_generated_index_recovery = {
+            **generated_index_recovery,
+            "transaction_id": "e" * 32,
+        }
+        with self.assertRaises(self.module.IntentError) as wrong_repair_row:
+            recover(
+                elapsed_recovery_expiry,
+                generated_index_recovery=wrong_generated_index_recovery,
+            )
+        self.assertEqual(
+            wrong_repair_row.exception.reason_code,
+            "EXPIRED_VALIDATED_RECOVERY_REPAIR_EVIDENCE_INVALID",
+        )
+        repaired = recover(
+            elapsed_recovery_expiry,
+            generated_index_recovery=generated_index_recovery,
+        )
+        self.assertEqual(
+            repaired["reason_code"],
+            self.module.EXPIRED_VALIDATED_RECOVERY_REPAIR_REASON,
+        )
+        repaired_again = recover(
+            repaired["expires_at"],
+            generated_index_recovery=generated_index_recovery,
+        )
+        self.assertEqual(repaired_again["expires_at"], repaired["expires_at"])
+        with self.assertRaises(self.module.IntentError) as repair_renew:
+            self.module.renew_lease(
+                created["intent_id"],
+                actor="codex",
+                raw_session_id=self.session,
+                fencing_token=created["fencing_token"],
+            )
+        self.assertEqual(
+            repair_renew.exception.reason_code,
+            "EXPIRED_VALIDATED_RECOVERY_RENEW_FORBIDDEN",
+        )
+        repair_elapsed_expiry = "2000-01-03T00:05:00+00:00"
+        repair_elapsed_published = "2000-01-03T00:00:00+00:00"
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_intents SET expires_at=?, updated_at=? "
+                "WHERE intent_id=?",
+                (
+                    repair_elapsed_expiry,
+                    repair_elapsed_published,
+                    created["intent_id"],
+                ),
+            )
+        with self.assertRaises(self.module.IntentError) as third_window:
+            recover(
+                repair_elapsed_expiry,
+                generated_index_recovery=generated_index_recovery,
+            )
+        self.assertEqual(
+            third_window.exception.reason_code,
+            "EXPIRED_VALIDATED_RECOVERY_REPAIR_WINDOW_ELAPSED",
+        )
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_intents SET reason_code=?, expires_at=?, updated_at=? "
+                "WHERE intent_id=?",
+                (
+                    self.module.EXPIRED_VALIDATED_RECOVERY_REASON,
+                    repeated["expires_at"],
+                    repeated["updated_at"],
+                    created["intent_id"],
+                ),
+            )
+
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_session_claims SET status='expired' "
+                "WHERE intent_id=?",
+                (created["intent_id"],),
+            )
+        with self.assertRaises(self.module.IntentError) as missing_claim:
+            recover(repeated["expires_at"])
+        self.assertEqual(
+            missing_claim.exception.reason_code,
+            "EXPIRED_VALIDATED_RECOVERY_CLAIM_CHANGED",
+        )
+
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_session_claims SET status='active' "
+                "WHERE intent_id=?",
+                (created["intent_id"],),
+            )
+            conn.execute(
+                "UPDATE memory_path_fences SET last_fence=last_fence+1 "
+                "WHERE target_key=?",
+                (canonical.target_key,),
+            )
+        with self.assertRaises(self.module.IntentError) as stale_fence:
+            recover(repeated["expires_at"])
+        self.assertEqual(stale_fence.exception.reason_code, "LEASE_FENCED")
+
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_path_fences SET last_fence=? "
+                "WHERE target_key=?",
+                (created["fencing_token"], canonical.target_key),
+            )
+            conn.execute(
+                "UPDATE memory_write_intents SET approved_by='user' "
+                "WHERE intent_id=?",
+                (created["intent_id"],),
+            )
+        with self.assertRaises(self.module.IntentError) as approval_changed:
+            recover(repeated["expires_at"])
+        self.assertEqual(
+            approval_changed.exception.reason_code,
+            "EXPIRED_VALIDATED_RECOVERY_BINDING_CHANGED",
+        )
+
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_intents SET approved_by=?, "
+                "reason_code='', expires_at=? WHERE intent_id=?",
+                (
+                    self.module.HUMAN_CONFIRMATION_CAPABILITY_APPROVER,
+                    (
+                        dt.datetime.now(dt.timezone.utc)
+                        + dt.timedelta(hours=1)
+                    ).replace(microsecond=0).isoformat(),
+                    created["intent_id"],
+                ),
+            )
+            future_expiry = conn.execute(
+                "SELECT expires_at FROM memory_write_intents WHERE intent_id=?",
+                (created["intent_id"],),
+            ).fetchone()[0]
+        with self.assertRaises(self.module.IntentError) as not_expired:
+            recover(future_expiry)
+        self.assertEqual(
+            not_expired.exception.reason_code,
+            "EXPIRED_VALIDATED_RECOVERY_NOT_EXPIRED",
+        )
 
     def test_create_rejects_a_dirty_or_untracked_base(self) -> None:
         self.note.write_text("# Rules\n\nAlready dirty.\n", encoding="utf-8")
@@ -503,6 +985,84 @@ class WriteIntentTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.reason_code, "INTENT_SESSION_MISMATCH")
 
+    def test_expired_validated_recovery_completion_keeps_terminal_marker(self) -> None:
+        intent = self.create()
+        self.bind(intent)
+        self.note.write_bytes(self.proposal.read_bytes())
+        validation = self.module.validate_closeout(
+            intent["intent_id"],
+            actor="codex",
+            raw_session_id=self.session,
+            target=self.note,
+        )
+        self.assertTrue(validation["ok"])
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_intents SET reason_code=? WHERE intent_id=?",
+                (
+                    self.module.EXPIRED_VALIDATED_RECOVERY_REASON,
+                    intent["intent_id"],
+                ),
+            )
+        git(self.root, "add", "Agent记忆/关键/Rules.md")
+        git(self.root, "commit", "-qm", "recovered validated update")
+
+        receipt = self.module.finalize_receipt(
+            intent["intent_id"],
+            actor="codex",
+            raw_session_id=self.session,
+            outcome="completed",
+            reason_code="WRITE_COMPLETED",
+            git_commit="HEAD",
+        )
+
+        expected = self.module.EXPIRED_VALIDATED_RECOVERY_COMPLETED_REASON
+        self.assertEqual(receipt["reason_code"], expected)
+        shown = self.module.show_intent(intent["intent_id"])
+        self.assertEqual(shown["intent"]["reason_code"], expected)
+        self.assertEqual(shown["receipt"]["reason_code"], expected)
+
+    def test_expired_validated_repair_completion_uses_the_same_terminal_marker(self) -> None:
+        intent = self.create()
+        self.bind(intent)
+        self.note.write_bytes(self.proposal.read_bytes())
+        validation = self.module.validate_closeout(
+            intent["intent_id"],
+            actor="codex",
+            raw_session_id=self.session,
+            target=self.note,
+        )
+        self.assertTrue(validation["ok"])
+        with contextlib.closing(
+            sqlite3.connect(self.module.STATE_DB)
+        ) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_intents SET reason_code=? WHERE intent_id=?",
+                (
+                    self.module.EXPIRED_VALIDATED_RECOVERY_REPAIR_REASON,
+                    intent["intent_id"],
+                ),
+            )
+        git(self.root, "add", "Agent记忆/关键/Rules.md")
+        git(self.root, "commit", "-qm", "repaired validated update")
+
+        receipt = self.module.finalize_receipt(
+            intent["intent_id"],
+            actor="codex",
+            raw_session_id=self.session,
+            outcome="completed",
+            reason_code="WRITE_COMPLETED",
+            git_commit="HEAD",
+        )
+
+        expected = self.module.EXPIRED_VALIDATED_RECOVERY_COMPLETED_REASON
+        self.assertEqual(receipt["reason_code"], expected)
+        shown = self.module.show_intent(intent["intent_id"])
+        self.assertEqual(shown["intent"]["reason_code"], expected)
+        self.assertEqual(shown["receipt"]["reason_code"], expected)
+
     def test_completed_receipt_rejects_uncommitted_or_wrong_commit_blob_and_unsafe_codes(self) -> None:
         intent = self.create()
         self.bind(intent)
@@ -620,6 +1180,10 @@ class WriteIntentTests(unittest.TestCase):
     def test_early_commit_of_the_proposal_is_accepted_with_version_chain(self) -> None:
         intent = self.create()
         self.bind(intent)
+        unrelated = self.root / "unrelated.txt"
+        unrelated.write_text("unrelated linear commit\n", encoding="utf-8")
+        git(self.root, "add", "unrelated.txt")
+        git(self.root, "commit", "-qm", "unrelated linear commit")
         self.note.write_bytes(self.proposal.read_bytes())
         git(self.root, "add", "Agent记忆/关键/Rules.md")
         git(self.root, "commit", "-qm", "early memory commit")
@@ -631,6 +1195,76 @@ class WriteIntentTests(unittest.TestCase):
         self.assertTrue(validation["early_commit"])
         self.assertEqual(validation["proposal_commit"], head)
         self.assertEqual([row["commit"] for row in validation["version_chain"]], [head])
+
+    def test_ours_merge_cannot_hide_a_side_branch_target_version(self) -> None:
+        intent = self.create()
+        self.bind(intent)
+        base = git(self.root, "rev-parse", "HEAD")
+        main_branch = git(self.root, "branch", "--show-current")
+        git(self.root, "switch", "-qc", "side-target-version")
+        side_bytes = b"# Rules\n\nUnsafe side branch version.\n"
+        self.note.write_bytes(side_bytes)
+        git(self.root, "add", "Agent记忆/关键/Rules.md")
+        git(self.root, "commit", "-qm", "side target version")
+        side_commit = git(self.root, "rev-parse", "HEAD")
+        git(self.root, "switch", "-q", main_branch)
+        unrelated = self.root / "main-only.txt"
+        unrelated.write_text("force a real merge\n", encoding="utf-8")
+        git(self.root, "add", "main-only.txt")
+        git(self.root, "commit", "-qm", "main unrelated change")
+        git(
+            self.root,
+            "merge",
+            "-q",
+            "-s",
+            "ours",
+            "side-target-version",
+            "-m",
+            "retain main target tree",
+        )
+        merge_commit = git(self.root, "rev-parse", "HEAD")
+        self.assertEqual(self.note.read_text(encoding="utf-8"), "# Rules\n\nOriginal.\n")
+        self.note.write_bytes(self.proposal.read_bytes())
+
+        validation = self.module.validate_closeout(
+            intent["intent_id"],
+            actor="codex",
+            raw_session_id=self.session,
+            target=self.note,
+            mutate=False,
+        )
+
+        self.assertFalse(validation["ok"], validation)
+        self.assertEqual(validation["reason_code"], "STALE_BASE")
+        versions = {row["commit"]: row for row in validation["version_chain"]}
+        self.assertIn(side_commit, versions)
+        self.assertIn(merge_commit, versions)
+        self.assertEqual(
+            versions[side_commit]["raw_sha256"],
+            self.module.sha256_bytes(side_bytes),
+        )
+        self.assertNotEqual(base, merge_commit)
+
+    def test_git_version_chain_handles_option_like_path_and_invalid_revision(self) -> None:
+        option_like = self.vault / "关键" / "--full-history.md"
+        option_like.write_text("# Safe path\n\nBase.\n", encoding="utf-8")
+        git(self.root, "add", "--", "Agent记忆/关键/--full-history.md")
+        git(self.root, "commit", "-qm", "option-like path baseline")
+        base = git(self.root, "rev-parse", "HEAD")
+        option_like.write_text("# Safe path\n\nUpdated.\n", encoding="utf-8")
+        git(self.root, "add", "--", "Agent记忆/关键/--full-history.md")
+        git(self.root, "commit", "-qm", "option-like path update")
+        head = git(self.root, "rev-parse", "HEAD")
+        target = self.module.canonical_target(option_like)
+
+        history = self.module.git_version_chain(base, head, target)
+        invalid = self.module.git_version_chain("not-a-commit", head, target)
+
+        self.assertTrue(history["ok"], history)
+        self.assertEqual([row["commit"] for row in history["versions"]], [head])
+        self.assertFalse(invalid["ok"], invalid)
+        self.assertEqual(invalid["reason_code"], "BASE_GIT_HEAD_DIVERGED")
+        self.assertEqual(invalid["versions"], [])
 
     def test_commit_after_validation_is_recovered_after_closeout_crash(self) -> None:
         intent = self.create()

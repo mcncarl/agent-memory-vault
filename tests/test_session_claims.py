@@ -19,6 +19,7 @@ if str(SCRIPTS_PATH) not in sys.path:
 
 from agent_memory_claim import session_value
 from agent_memory_stop_hook import session_key
+from tests.state_fixture import initialize_full_state
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -49,9 +50,9 @@ class ActorSessionIsolationTest(unittest.TestCase):
 
 
 class SessionClaimConcurrencyTest(unittest.TestCase):
-    def test_two_sessions_commit_only_their_claimed_files(self) -> None:
+    def test_two_dirty_sessions_fail_closed_before_generated_index_commit(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
-            tmp = Path(raw_tmp)
+            tmp = Path(raw_tmp).resolve()
             git_root = tmp / "git"
             vault = git_root / "AgentMemory"
             runtime = tmp / "runtime"
@@ -87,6 +88,7 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
             )
             env = os.environ.copy()
             env["AGENT_MEMORY_CONFIG_FILE"] = str(config_path)
+            initialize_full_state(runtime / "state.sqlite")
 
             evolved = run(
                 [sys.executable, str(SCRIPTS / "agent_memory_evolution.py"), "--init", "--scan"],
@@ -107,8 +109,8 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
             claude_file.write_text(claude_file.read_text(encoding="utf-8") + "\nClaude session change.\n", encoding="utf-8")
 
             for actor, session_id, path in (
-                ("codex", "codex-session-1", codex_file),
-                ("claude", "claude-session-1", claude_file),
+                ("human", "human-session-1", codex_file),
+                ("migration", "migration-session-1", claude_file),
             ):
                 claimed = run(
                     [
@@ -131,13 +133,12 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
 
             listed = run(
                 [
-                    sys.executable,
                     str(SCRIPTS / "memoryctl"),
                     "--actor",
-                    "claude",
+                    "migration",
                     "claims",
                     "--session-id",
-                    "claude-session-1",
+                    "migration-session-1",
                     "--json",
                 ],
                 cwd=REPO_ROOT,
@@ -174,7 +175,7 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
                 ]
 
             first = subprocess.Popen(
-                closeout_command("codex", "codex-session-1"),
+                closeout_command("human", "human-session-1"),
                 cwd=REPO_ROOT,
                 env=env,
                 text=True,
@@ -182,7 +183,7 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
                 stderr=subprocess.PIPE,
             )
             second = subprocess.Popen(
-                closeout_command("claude", "claude-session-1"),
+                closeout_command("migration", "migration-session-1"),
                 cwd=REPO_ROOT,
                 env=env,
                 text=True,
@@ -191,37 +192,17 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
             )
             first_stdout, first_stderr = first.communicate(timeout=120)
             second_stdout, second_stderr = second.communicate(timeout=120)
-            self.assertEqual(first.returncode, 0, first_stderr + first_stdout)
-            self.assertEqual(second.returncode, 0, second_stderr + second_stdout)
+            self.assertEqual(first.returncode, 2, first_stderr + first_stdout)
+            self.assertEqual(second.returncode, 2, second_stderr + second_stdout)
 
             payloads = [json.loads(first_stdout), json.loads(second_stdout)]
             by_actor = {payload["actor"]: payload for payload in payloads}
-            self.assertEqual(by_actor["codex"]["processed_files"], ["项目/_模板-项目.md"])
-            self.assertEqual(by_actor["claude"]["processed_files"], ["工作流/Agent记忆收尾决策规则.md"])
-            self.assertNotIn("工作流/Agent记忆收尾决策规则.md", by_actor["codex"]["processed_files"])
-            self.assertNotIn("项目/_模板-项目.md", by_actor["claude"]["processed_files"])
-
-            changed_commits = run(
-                ["git", "-C", str(git_root), "log", "-2", "--format=%H"],
-                cwd=REPO_ROOT,
-                env=env,
-            )
-            commits = [line for line in changed_commits.stdout.splitlines() if line]
-            self.assertEqual(len(commits), 2)
-            committed_paths = []
-            for commit in commits:
-                shown = run(
-                    ["git", "-C", str(git_root), "-c", "core.quotepath=false", "show", "--pretty=", "--name-only", commit],
-                    cwd=REPO_ROOT,
-                    env=env,
-                )
-                paths = [line for line in shown.stdout.splitlines() if line]
-                self.assertEqual(len(paths), 1)
-                committed_paths.extend(paths)
-            self.assertEqual(
-                set(committed_paths),
-                {"AgentMemory/项目/_模板-项目.md", "AgentMemory/工作流/Agent记忆收尾决策规则.md"},
-            )
+            self.assertEqual(by_actor["human"]["processed_files"], ["项目/_模板-项目.md"])
+            self.assertEqual(by_actor["migration"]["processed_files"], ["工作流/Agent记忆收尾决策规则.md"])
+            for payload in payloads:
+                self.assertEqual(payload["status"], "error")
+                self.assertEqual(payload["ownership_error"], "GENERATED_INDEX_OTHER_SESSION_DIRTY")
+                self.assertEqual(payload["commit"], "skipped")
 
             with contextlib.closing(sqlite3.connect(runtime / "state.sqlite")) as conn, conn:
                 active = conn.execute(
@@ -233,89 +214,9 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
                 observations = conn.execute(
                     "SELECT COUNT(*) FROM memory_file_observations"
                 ).fetchone()[0]
-            self.assertEqual(active, 0)
-            self.assertEqual(completed, 2)
-            self.assertEqual(observations, 2)
-
-            clean_noop_command = closeout_command("claude", "claude-clean-noop")
-            clean_noop_command[clean_noop_command.index("--commit")] = "--dry-run"
-            clean_noop = run(
-                clean_noop_command,
-                cwd=REPO_ROOT,
-                env=env,
-            )
-            self.assertEqual(clean_noop.returncode, 0, clean_noop.stderr + clean_noop.stdout)
-            clean_payload = json.loads(clean_noop.stdout)
-            self.assertEqual(clean_payload["status"], "ok")
-            self.assertEqual(clean_payload["ownership_error"], "")
-            self.assertEqual(clean_payload["processed_files"], [])
-            self.assertIn("dry_run: no index refresh", "\n".join(clean_payload["info"]))
-
-            codex_file.write_text(
-                codex_file.read_text(encoding="utf-8") + "\nOther session owned change.\n",
-                encoding="utf-8",
-            )
-            other_claim = run(
-                [
-                    sys.executable,
-                    str(SCRIPTS / "agent_memory_claim.py"),
-                    "--actor",
-                    "codex",
-                    "--session-id",
-                    "codex-other-session",
-                    "--json",
-                    "claim",
-                    "--file",
-                    str(codex_file),
-                ],
-                cwd=REPO_ROOT,
-                env=env,
-            )
-            self.assertEqual(other_claim.returncode, 0, other_claim.stderr)
-
-            other_owned_command = closeout_command("claude", "claude-with-no-claim")
-            other_owned_command[other_owned_command.index("--commit")] = "--dry-run"
-            other_owned = run(other_owned_command, cwd=REPO_ROOT, env=env)
-            self.assertEqual(other_owned.returncode, 0, other_owned.stderr + other_owned.stdout)
-            other_payload = json.loads(other_owned.stdout)
-            self.assertEqual(other_payload["status"], "ok")
-            self.assertEqual(other_payload["ownership_error"], "")
-            self.assertEqual(other_payload["unclaimed_files"], [])
-            self.assertEqual(
-                other_payload["other_session_files"],
-                ["AgentMemory/项目/_模板-项目.md"],
-            )
-
-            other_closeout = run(
-                closeout_command("codex", "codex-other-session"),
-                cwd=REPO_ROOT,
-                env=env,
-            )
-            self.assertEqual(
-                other_closeout.returncode,
-                0,
-                other_closeout.stderr + other_closeout.stdout,
-            )
-
-            codex_file.write_text(
-                codex_file.read_text(encoding="utf-8") + "\nUnclaimed change.\n",
-                encoding="utf-8",
-            )
-            dirty_no_claim_command = closeout_command("claude", "claude-dirty-no-claim")
-            dirty_no_claim_command[dirty_no_claim_command.index("--commit")] = "--dry-run"
-            dirty_without_claim = run(
-                dirty_no_claim_command,
-                cwd=REPO_ROOT,
-                env=env,
-            )
-            self.assertEqual(
-                dirty_without_claim.returncode,
-                2,
-                dirty_without_claim.stderr + dirty_without_claim.stdout,
-            )
-            dirty_payload = json.loads(dirty_without_claim.stdout)
-            self.assertEqual(dirty_payload["status"], "error")
-            self.assertIn("no active memory claims", dirty_payload["ownership_error"])
+            self.assertEqual(active, 2)
+            self.assertEqual(completed, 0)
+            self.assertEqual(observations, 0)
 
 
 if __name__ == "__main__":

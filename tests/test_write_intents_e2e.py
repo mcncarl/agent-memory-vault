@@ -14,6 +14,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from state_fixture import initialize_full_state
+
 MEMORYCTL = SCRIPTS / "memoryctl"
 
 
@@ -181,16 +186,20 @@ class IntentSandbox:
         )
 
     def _initialize_state(self) -> None:
-        for script in ("agent_memory_evolution.py", "agent_memory_index.py"):
-            completed = run(
-                [sys.executable, str(SCRIPTS / script), "--init", "--scan"],
-                cwd=REPO_ROOT,
-                env=self.base_env,
-            )
-            if completed.returncode != 0:
-                raise AssertionError(completed.stderr + completed.stdout)
+        initialize_full_state(self.state_db)
+        completed = run(
+            [sys.executable, str(SCRIPTS / "agent_memory_index.py"), "--scan"],
+            cwd=REPO_ROOT,
+            env=self.base_env,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr + completed.stdout)
 
     def env(self, actor: str, session: str) -> dict[str, str]:
+        # Canonical host actors must mutate through the Write Gateway.  These
+        # tests exercise the internal intent/claim durability machinery, so
+        # route the historical host labels through the reserved test actors.
+        actor = {"codex": "test", "claude": "migration"}.get(actor, actor)
         payload = self.base_env.copy()
         if actor == "codex":
             payload["CODEX_THREAD_ID"] = session
@@ -201,7 +210,17 @@ class IntentSandbox:
         return payload
 
     def ctl_command(self, actor: str, command: str, *args: str) -> list[str]:
-        return [sys.executable, str(MEMORYCTL), "--actor", actor, command, *args]
+        actor = {"codex": "test", "claude": "migration"}.get(actor, actor)
+        return [
+            sys.executable,
+            "-I",
+            "-S",
+            str(MEMORYCTL),
+            "--actor",
+            actor,
+            command,
+            *args,
+        ]
 
     def ctl(
         self,
@@ -374,6 +393,28 @@ class WriteIntentEndToEndTests(unittest.TestCase):
         expired = self.box.ctl("codex", session, "intent", "expire", "--apply", "--json")
         self.assertEqual(expired.returncode, 0, expired.stderr + expired.stdout)
         self.assertEqual(self.box.json_payload(expired)["applied"], 1)
+        # This fixture models a pre-Gateway canonical-host intent.  Low-level
+        # creation now uses the reserved test actor, then the durable audit
+        # chain is relabelled to its historical Codex identity.
+        with contextlib.closing(sqlite3.connect(self.box.state_db)) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_intents SET actor='codex' WHERE intent_id=?",
+                (intent_id,),
+            )
+            conn.execute(
+                "UPDATE memory_write_receipts SET actor='codex' WHERE intent_id=?",
+                (intent_id,),
+            )
+            conn.execute(
+                "UPDATE memory_safety_log SET actor='codex' WHERE run_id=?",
+                (f"write-intent:{intent_id}",),
+            )
+            conn.execute(
+                "UPDATE memory_session_claims SET actor='codex', status='active', completed_at=NULL "
+                "WHERE intent_id=?",
+                (intent_id,),
+            )
+            conn.commit()
 
         observe_args = (
             "--file",
@@ -617,7 +658,10 @@ raise SystemExit(3)
         closed, closeout_payload = self.box.closeout(actor="codex", session=session)
         self.assertEqual(closed.returncode, 0, closed.stderr + closed.stdout)
         self.assertEqual(closeout_payload["status"], "ok")
-        self.assertEqual(closeout_payload["processed_files"], ["工作流/NewProtected.md"])
+        self.assertEqual(
+            closeout_payload["processed_files"],
+            ["工作流/NewProtected.md", "INDEX.md"],
+        )
         self.assertEqual(len(closeout_payload["write_intent_receipts"]), 1)
 
         head = git(self.box.git_root, "rev-parse", "HEAD")
@@ -740,7 +784,17 @@ raise SystemExit(3)
         receipt = payload["write_intent_receipts"][0]
         self.assertEqual(receipt["outcome"], "completed")
         self.assertEqual(receipt["git_commit"], external_commit)
-        self.assertEqual(git(self.box.git_root, "rev-parse", "HEAD"), external_commit)
+        head = git(self.box.git_root, "rev-parse", "HEAD")
+        self.assertNotEqual(head, external_commit)
+        self.assertEqual(git(self.box.git_root, "rev-parse", f"{head}^"), external_commit)
+        self.assertEqual(
+            git(self.box.git_root, "log", "-1", "--format=%H", "--", "AgentMemory/工作流/Early.md"),
+            external_commit,
+        )
+        self.assertEqual(
+            git(self.box.git_root, "log", "-1", "--format=%H", "--", "AgentMemory/INDEX.md"),
+            head,
+        )
 
     def test_approval_is_bound_to_intent_path_raw_canonical_hash_and_reference(self) -> None:
         session = "codex-approval"

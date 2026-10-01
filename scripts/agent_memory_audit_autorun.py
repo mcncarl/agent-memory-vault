@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from agent_memory_env import env_value, expand_path
+from agent_memory_env import RuntimeTransitionError, assert_runtime_ready, env_value, expand_path
 from agent_memory_lock import try_lock, unlock
 from agent_memory_state import (
     ensure_private_directory,
@@ -327,6 +327,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    try:
+        assert_runtime_ready("audit-autorun")
+    except RuntimeTransitionError:
+        payload = {
+            "ok": False,
+            "status": "blocked",
+            "reason_code": "RUNTIME_TRANSITION_INCOMPLETE",
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print("audit_autorun=blocked reason=RUNTIME_TRANSITION_INCOMPLETE")
+        return 2
     with audit_lock() as acquired:
         if not acquired:
             payload = {

@@ -8,4 +8,12 @@
 2. `INDEX.md`
 3. 根据任务关键词读取最相关的 1-3 个文件
 
-普通记忆直接写入正式目录，不设置候选池。Agent 自我进化相关内容单独放在 `agent/`。
+正式记忆位于 `用户记忆/`、`项目/`、`工作流/`、`决策/` 和 `agent/`。所有自动写入均通过
+Write Gateway v2 的 `read-target → prepare → apply`，不允许直接编辑后补 claim。
+`codex`、`claude`、`ailu` 共用同一套路径租约、单调 fencing token、CAS、Git 回执和
+closeout；未知 actor 统一拒绝。人工/Obsidian 外部编辑必须
+重新基于当前文件准备提案，或由 Codex/Claude 在明确用户授权下显式 adopt，不能静默覆盖。
+
+首次使用或升级 Runtime 前必须执行显式状态迁移：fresh state 用 `migrate init`；旧库先
+`migrate plan`，再用新的私有备份路径执行 `migrate apply`；其后 `migrate verify`，完成
+索引、Doctor 和 Hook 检查后再以 `migrate verify --publish-ready` 提交切换。

@@ -5,9 +5,11 @@ project_id: example-agent-case
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
+agent_scope: shared
 session_id: ""
 status: active
 sensitivity: normal
+temporal_policy: reviewable
 case_key: example-case
 task_type: example-task
 promotion_state: active

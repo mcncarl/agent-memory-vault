@@ -17,6 +17,7 @@ if str(SCRIPTS) not in sys.path:
 import agent_memory_closeout as closeout
 from agent_memory_check import scan_for_secrets
 from agent_memory_safety import assess_source
+from tests.state_fixture import initialize_full_state
 
 
 class SummaryExtractionTests(unittest.TestCase):
@@ -49,7 +50,7 @@ class PrivateSearchTransportTests(unittest.TestCase):
             rows, warnings, backend_status = closeout.search_memory(
                 private_summary,
                 read_only=True,
-                app_id="yichen-content-studio",
+                app_id="retired-app",
                 agent_scope="shared",
             )
         self.assertEqual(rows, [])
@@ -105,7 +106,7 @@ class RawSemanticDistanceTests(unittest.TestCase):
         action, _, _ = closeout.prewrite_recommendation("completely separate topic", [row])
         self.assertEqual(action, "ADD")
 
-    def test_search_keeps_deprecated_score_as_rank_distance(self) -> None:
+    def test_search_uses_raw_distance_for_every_vector_distance_field(self) -> None:
         row = {
             "raw_distance": 0.635,
             "rank_distance": 0.435,
@@ -136,12 +137,12 @@ class RawSemanticDistanceTests(unittest.TestCase):
             rows, warnings = search.zvec_search(args)
         self.assertEqual(warnings, [])
         details = rows[0].source_details
-        self.assertEqual(details["zvec_score"], 0.435)
+        self.assertEqual(details["zvec_score"], 0.635)
         self.assertEqual(details["zvec_raw_distance"], 0.635)
-        self.assertEqual(details["zvec_rank_distance"], 0.435)
-        self.assertEqual(details["zvec_score_semantics"], "deprecated_rank_distance")
+        self.assertEqual(details["zvec_rank_distance"], 0.635)
+        self.assertEqual(details["zvec_score_semantics"], "raw_cosine_distance")
 
-    def test_adjusted_only_legacy_search_result_does_not_invent_raw_distance(self) -> None:
+    def test_adjusted_only_legacy_search_result_is_rejected(self) -> None:
         row = {
             "score": 0.20,
             "path": "/vault/项目/legacy.md",
@@ -169,10 +170,7 @@ class RawSemanticDistanceTests(unittest.TestCase):
             import agent_memory_search as search
             rows, warnings = search.zvec_search(args)
         self.assertEqual(warnings, [])
-        details = rows[0].source_details
-        self.assertEqual(details["zvec_score"], 0.20)
-        self.assertNotIn("zvec_raw_distance", details)
-        self.assertIsNone(closeout.raw_semantic_distance(rows[0].to_dict()))
+        self.assertEqual(rows, [])
 
 
 class SourceSafetyTests(unittest.TestCase):
@@ -297,6 +295,7 @@ class SourceSafetyTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as raw_tmp:
             state_db = Path(raw_tmp) / "state.sqlite"
+            initialize_full_state(state_db)
             with mock.patch.object(closeout, "STATE_DB", state_db), mock.patch.object(closeout, "search_memory") as search_mock:
                 payload = closeout.run_prewrite(args)
             with contextlib.closing(sqlite3.connect(state_db)) as conn, conn:
