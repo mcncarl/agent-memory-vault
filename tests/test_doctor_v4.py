@@ -113,6 +113,39 @@ class DoctorV4ReadOnlyGatesTests(unittest.TestCase):
                 )
                 self.assertFalse(detail["table_projection_digests_match"])
 
+    def test_markdown_parity_accepts_current_crlf_document_and_flags_real_edits(self) -> None:
+        def write_crlf(path: Path, text: str) -> None:
+            path.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            vault = Path(raw_root).resolve()
+            note = vault / "Windows.md"
+            write_crlf(note, self._note("Windows", "windows"))
+            with (
+                mock.patch.object(memory_index, "VAULT_ROOT", vault),
+                mock.patch.object(doctor, "VAULT_ROOT", vault),
+                contextlib.closing(sqlite3.connect(":memory:")) as conn,
+            ):
+                conn.row_factory = sqlite3.Row
+                memory_index.init_db(conn)
+                memory_index.scan(conn)
+                actual_by_path = {str(path.resolve()): path for path in sorted(vault.rglob("*.md"))}
+                docs = conn.execute("SELECT * FROM memory_docs").fetchall()
+                db_by_path = {str(row["path"]): row for row in docs}
+                stored = str(db_by_path[str(note.resolve())]["sha256"])
+
+                # The fixture really is CRLF on disk, so raw bytes differ from the index.
+                self.assertIn(b"\r\n", note.read_bytes())
+                self.assertNotEqual(doctor.file_sha256(note), stored)
+                self.assertEqual(memory_index.markdown_sha256(note), stored)
+                self.assertEqual(doctor.markdown_hash_mismatches(actual_by_path, db_by_path), [])
+
+                write_crlf(note, self._note("Windows", "windows").replace("Body.", "Edited body."))
+                self.assertEqual(
+                    doctor.markdown_hash_mismatches(actual_by_path, db_by_path),
+                    ["Windows.md"],
+                )
+
     def test_generated_index_is_exact_and_never_lists_itself(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             vault = Path(raw_root).resolve()

@@ -153,6 +153,20 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def read_markdown_text(path: Path) -> str:
+    """Decode Markdown the way the index parses and hashes it.
+
+    Universal-newline decoding turns CRLF and CR into LF, so the stored
+    ``memory_docs.sha256`` is a digest of this text, not of the raw bytes.
+    """
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def markdown_sha256(path: Path) -> str:
+    """Return the ``memory_docs.sha256`` value ``load_doc`` records for ``path``."""
+    return sha256_text(read_markdown_text(path))
+
+
 def _canonical_projection_sha256(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -763,7 +777,7 @@ def extract_open_loops(path: Path, title: str, rel_path: str, text: str, indexed
 
 
 def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, str, str, str, str, str]]]:
-    text = path.read_text(encoding="utf-8", errors="replace")
+    text = read_markdown_text(path)
     meta = parse_frontmatter(text)
     stat = path.stat()
     rel_path = path.relative_to(VAULT_ROOT).as_posix()
