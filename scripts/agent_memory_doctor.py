@@ -2496,6 +2496,24 @@ def search_observability_hygiene(conn: sqlite3.Connection) -> dict[str, int]:
     return counts
 
 
+def markdown_hash_mismatches(
+    actual_by_path: dict[str, Path],
+    db_by_path: dict[str, sqlite3.Row],
+) -> list[str]:
+    """List indexed Markdown whose current text differs from ``memory_docs``.
+
+    Use the index's own text digest; a raw-byte digest reports every CRLF
+    document as changed even when the index is current.
+    """
+
+    return sorted(
+        str(row["rel_path"])
+        for raw, row in db_by_path.items()
+        if raw in actual_by_path
+        and memory_index.markdown_sha256(actual_by_path[raw]) != str(row["sha256"])
+    )
+
+
 def fts_exact_parity_health(
     conn: sqlite3.Connection,
     actual_by_path: dict[str, Path],
@@ -3091,7 +3109,7 @@ def collect_checks(
     db_by_path = {str(row["path"]): row for row in docs}
     missing_db = sorted(path.relative_to(VAULT_ROOT).as_posix() for raw, path in actual_by_path.items() if raw not in db_by_path)
     stale_db = sorted(str(row["rel_path"]) for raw, row in db_by_path.items() if raw not in actual_by_path)
-    mismatch = sorted(str(row["rel_path"]) for raw, row in db_by_path.items() if raw in actual_by_path and file_sha256(actual_by_path[raw]) != str(row["sha256"]))
+    mismatch = markdown_hash_mismatches(actual_by_path, db_by_path)
     add(checks, "markdown_sqlite_parity", "pass" if not (missing_db or stale_db or mismatch) else "fail", f"Markdown={len(actual)}, SQLite={len(docs)}.", {"missing": missing_db, "stale": stale_db, "hash_mismatch": mismatch})
     fts_ok, fts_detail = fts_exact_parity_health(conn, actual_by_path, db_by_path)
     add(

@@ -298,7 +298,7 @@ An upgrade that does not preserve an already verified identical bundle remains i
 
 ## Project status
 
-Agent Memory Vault is actively maintained. Continuous validation is local-only: isolated Python tests cover the shared logic, cross-platform static checks cover platform boundaries, and native Windows behavior is revalidated on a local Windows 10/11 host when required. The public template is intentionally free of personal memory and generated state.
+Agent Memory Vault is actively maintained. For every pull request and push to `main`, GitHub Actions runs the isolated Python tests, which cover the shared logic and the cross-platform static checks, on Ubuntu and macOS, and parses the PowerShell adapters on Windows. Native Windows behavior is still revalidated on a local Windows 10/11 host when required. The public template is intentionally free of personal memory and generated state.
 
 Created and primarily maintained by [Yichen (@mcncarl)](https://github.com/mcncarl).
 

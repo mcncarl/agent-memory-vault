@@ -769,6 +769,7 @@ class RuntimeInstallTests(unittest.TestCase):
             self.assertIn('"event": "recovery_required"', journal)
             self.assertEqual(target.read_bytes(), b"old-runtime\n")
 
+    @unittest.skipUnless(sys.platform == "darwin", "installs the macOS-only audit LaunchAgent")
     def test_installed_runtime_can_retrieve_revalidated_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root).resolve()
@@ -1061,6 +1062,7 @@ class RuntimeInstallTests(unittest.TestCase):
                 original_identity,
             )
 
+    @unittest.skipUnless(sys.platform == "darwin", "installs the macOS-only audit LaunchAgent")
     def test_install_is_idempotent_and_preserves_local_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root).resolve()

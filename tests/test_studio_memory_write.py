@@ -849,6 +849,7 @@ class AiluMemoryWriteTests(unittest.TestCase):
         sys.version_info < (3, 10),
         "the managed Runtime installer requires Python 3.10 or newer",
     )
+    @unittest.skipUnless(sys.platform == "darwin", "installs the macOS-only audit LaunchAgent")
     def test_installed_runtime_prepare_and_apply_end_to_end(self) -> None:
         installed = run(
             [

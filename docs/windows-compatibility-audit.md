@@ -14,7 +14,7 @@
 | 语义检索开关 | disabled 路径仍可能调用 Zvec | closeout 在入口处短路，完全不启动 Zvec |
 | Obsidian 状态 | `.obsidian/` 会污染 Git 识别 | Vault 模板内置 `.gitignore` |
 | 自动化 | 仅有 macOS `launchd` 路径 | Windows 提供 Stop Hook wrapper 与 Task Scheduler 管理脚本 |
-| 持续验证 | 托管 CI 会引入外部 runner 依赖 | 使用本地隔离测试、跨平台静态检查与源码/Runtime/manifest 哈希对账；需要时在本地 Windows 10/11 环境完成原生验收 |
+| 持续验证 | 托管 CI 会引入外部 runner 依赖 | GitHub Actions 以只读权限和固定 SHA 的官方 actions，在 Ubuntu、macOS 上运行隔离测试与跨平台静态检查，并在 Windows 上解析 PowerShell 适配脚本；源码/Runtime/manifest 哈希对账和 Windows 10/11 原生验收仍按需在本地完成 |
 
 ## 有意保留的边界
 
