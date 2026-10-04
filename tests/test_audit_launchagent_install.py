@@ -15,6 +15,9 @@ import agent_memory_host_automation as automation
 import install_audit_launchagent as installer
 
 
+# These tests simulate macOS by patching sys.platform, which also routes atomic
+# plist writes in agent_memory_state to the macOS-only renameatx_np primitive.
+@unittest.skipUnless(sys.platform == "darwin", "the audit LaunchAgent installer is macOS-only")
 class AuditLaunchAgentInstallTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

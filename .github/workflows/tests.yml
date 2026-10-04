@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.11"]
         include:
           - os: ubuntu-latest
@@ -45,8 +45,18 @@ jobs:
       - name: Run isolated tests
         run: python scripts/run_tests_isolated.py
 
+  powershell:
+    # The Python suite assumes POSIX hosts; on Windows, check the adapters parse.
+    if: ${{ !github.event.repository.private }}
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
       - name: Parse PowerShell adapters
-        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $errorsFound = @()
