@@ -178,6 +178,8 @@ Use the returned full content and `read_token` to create one exact final proposa
 
 The unified search combines Unicode FTS, trigram FTS, and the optional Zvec sidecar with fixed Hybrid RRF, deduplicates candidates by stable `memory_id`, and applies orthogonal filters such as project, memory type, track, scope, and status. Search and Canonical Retrieve use the same production candidate path.
 
+Before accepting a write, prewrite reconciliation reduces long input to a bounded search query while keeping the full input for safety and similarity checks. If the primary SQLite search is unhealthy, it returns `status=blocked` and `recommendation_unavailable_reason=RECONCILE_SEARCH_UNHEALTHY`, without a recommendation or a new write intent. This is not a “no candidates” result: restore search health before retrying. An optional Zvec backend warning alone does not block a healthy SQLite search.
+
 ```bash
 scripts/memoryctl --actor codex search "project closeout" --limit 5
 scripts/memoryctl --actor codex search "preferences" --track user
