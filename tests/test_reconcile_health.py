@@ -265,6 +265,21 @@ class ReconcileHealthTests(unittest.TestCase):
         self.assertEqual(action, "ADD")
         self.assertFalse(metrics["title_match"])
 
+    def test_specific_chinese_title_matches_existing_memory(self) -> None:
+        candidate = {
+            "title": "示例图像转换项目",
+            "rel_path": "项目/example-image-converter.md",
+            "summary": "示例项目正在验证编码输出。",
+            "hit": "",
+        }
+        action, target, metrics = closeout.prewrite_recommendation(
+            "示例图像转换项目已经完成编码验证，下一步复核默认参数。",
+            [candidate],
+        )
+        self.assertEqual(action, "UPDATE")
+        self.assertIs(target, candidate)
+        self.assertTrue(metrics["title_match"])
+
     def test_postwrite_search_failure_is_a_blocking_finding(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             vault = Path(raw_tmp) / "vault"

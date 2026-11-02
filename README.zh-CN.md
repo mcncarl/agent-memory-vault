@@ -420,6 +420,8 @@ scripts/memoryctl --actor codex prewrite "准备写入的记忆摘要" \
 
 `prewrite` 先过来源与敏感信息闸门，再做查重对账。`--source-class` 说明信息从哪里来，`--knowledge-kind` 说明它是事实、偏好、规则、推断还是假设；`--asserted-by` 记录主张者，`--evidence-ref` 只以哈希进入安全日志。外部不可信内容、Agent 自己推断的权威事实，以及来源不明的内容，不能悄悄升级成正式事实。
 
+长输入会压缩成有界检索查询，但完整输入仍用于安全与相似度检查。主 SQLite 搜索不健康时，`prewrite` 返回 `status=blocked` 和 `recommendation_unavailable_reason=RECONCILE_SEARCH_UNHEALTHY`，不提供写入建议，也不创建新的写入意图。这不是“没有候选”：应先恢复搜索，再重试。可选 Zvec 后端的单独告警不会阻塞健康的 SQLite 搜索。
+
 `zvec_raw_distance` 始终是模型返回的原始距离，向量层不再混入词面奖励。生产候选由 Zvec、Unicode FTS 与 trigram FTS 经过固定权重 RRF 合并；RRF 只决定召回顺序，不能单独触发 `UPDATE` 或 `MERGE_REQUIRED`。
 
 ### 全库写入网关与并发边界
